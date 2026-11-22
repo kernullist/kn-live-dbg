@@ -5,6 +5,7 @@
 #include "EtlDiskIo.h"
 #include "EtlFaultSchedule.h"
 #include "EtlActivitySchedule.h"
+#include "EtlReadyOrigin.h"
 #include "EtlCaptureStatement.h"
 #include "EtlClrEvidence.h"
 #include "EtlReferenceImage.h"
@@ -57,7 +58,7 @@ namespace
         bool threads = false, images = false, processes = false;
         bool intervals = false, haveTid = false, builds = false, settings = false, clr = false;
         uint32_t tid = 0;
-        uint32_t scheduleOf = 0;
+        uint32_t scheduleOf = 0, readyOrigin = 0;
         uint32_t activityStart = 0, activityStop = 0;
         bool activityMarkers = false;
         bool Switches() const { return family == Family::Switches; }
@@ -67,11 +68,15 @@ namespace
         const FamilyFields& Fields() const { return activityMarkers ? MarkerFields : EventFamilies[static_cast<size_t>(family)]; }
         bool WithIntervals() const { return Switches() && (intervals || haveTid); }
         bool WithThreads() const { return threads || images || processes; }
-        bool NeedsThreadIndex() const { return WithThreads() || scheduleOf || activityStart; }
+        bool NeedsThreadIndex() const { return WithThreads() || scheduleOf || activityStart || readyOrigin; }
         std::wstring ActivitySelectorJson() const
         {
             return activityStart ? L",\"requested_start_record\":" + std::to_wstring(activityStart) +
                 L",\"requested_stop_record\":" + std::to_wstring(activityStop) : L"";
+        }
+        std::wstring ReadySelectorJson() const
+        {
+            return readyOrigin ? L",\"requested_ready_record\":" + std::to_wstring(readyOrigin) : L"";
         }
         std::wstring ActivityPagingJson() const
         {
@@ -81,6 +86,7 @@ namespace
         {
             if (activityMarkers) { return L"{\"schema\":\"kn.etl_activity_markers.v1\",\"status\":"; }
             if (DiskIo()) { return L"{\"schema\":\"kn.etl_disk_io.v1\",\"status\":"; }
+            if (readyOrigin) { return L"{\"schema\":\"kn.etl_switches.v5\",\"status\":"; }
             if (SchedulingActivity()) { return L"{\"schema\":\"kn.etl_switches.v4\",\"status\":"; }
             if (activityStart) { return L"{\"schema\":\"kn.etl_hard_faults.v3\",\"status\":"; }
             if (HardFaults()) { return scheduleOf ? L"{\"schema\":\"kn.etl_hard_faults.v2\",\"status\":" : L"{\"schema\":\"kn.etl_hard_faults.v1\",\"status\":"; }
@@ -152,6 +158,10 @@ namespace
             }
             else if (args[i] == L"--thread-id" && (options.Switches() || options.HardFaults()) && !options.haveTid && Decimal(args[i + 1], UINT32_MAX, options.tid))
             { options.haveTid = true; }
+            else if (args[i] == L"--ready-origin" && options.Switches() && !options.readyOrigin)
+            {
+                if (!Decimal(args[i + 1], MaxRecords, options.readyOrigin) || !options.readyOrigin) { return false; }
+            }
             else if (args[i] == L"--schedule-of" && options.HardFaults() && !options.scheduleOf)
             {
                 if (!Decimal(args[i + 1], MaxRecords, options.scheduleOf) || !options.scheduleOf) { return false; }
@@ -165,6 +175,11 @@ namespace
             }
             else { return false; }
             ++i;
+        }
+        if (options.readyOrigin)
+        {
+            if (haveAfter || haveLimit || options.haveTid || options.intervals || options.settings || options.activityStart) { return false; }
+            options.limit = 1;
         }
         if (options.HardFaults() && options.haveTid && !options.activityMarkers) { return false; }
         if (options.activityMarkers && (options.activityStart || options.scheduleOf)) { return false; }
@@ -210,6 +225,8 @@ namespace
         etl_profile::HardFaultTotals faultTotals;
         etl_profile::ActivityWindow activity;
         etl_profile::ActivitySchedule residency;
+        etl_profile::ReadyOrigin origin;
+        uint32_t decodedReady = 0, unsupportedReady = 0, unassignedReady = 0;
         std::vector<std::pair<uint32_t, etl_profile::ActivityMarker>> markers;
         etl_profile::FaultSchedule faultSchedule;
         std::array<etl_profile::HardFault, MaxPage> faultPage{};
@@ -257,6 +274,12 @@ namespace
             ReplayActivityMarker(event, scan);
             if (scan.options.HardFaults()) { ReplayActivityFault(event, scan); return; }
         }
+        if (scan.options.readyOrigin && scan.records == scan.options.readyOrigin)
+        {
+            scan.replayMismatch |= !scan.origin.SameReady(event, scan.records);
+            scan.origin.ObserveContext(scan.history);
+            ++scan.replayedRows;
+        }
         const bool faultQuery = scan.options.scheduleOf != 0;
         if (faultQuery && IsEqualGUID(event.EventHeader.ProviderId, etl_profile::PageFaultProvider))
         {
@@ -299,6 +322,11 @@ namespace
             return;
         }
         point.ordinal = ++scan.decoded;
+        if (scan.options.readyOrigin)
+        {
+            scan.origin.ReplaySwitch(scan.history, point, scan.replayedRows, scan.replayMismatch);
+            return;
+        }
         if (scan.options.SchedulingActivity())
         {
             scan.residency.Observe(scan.history, point, scan.activity, scan.options.after, scan.options.limit);
@@ -352,6 +380,33 @@ namespace
             return;
         }
         if (scan.options.NeedsThreadIndex()) { scan.threadIndex.Observe(*event, scan.records); }
+        if (scan.options.readyOrigin)
+        {
+            if (scan.records == scan.options.readyOrigin) { scan.origin.Select(*event, scan.records); }
+            if (!IsEqualGUID(event->EventHeader.ProviderId, etl_profile::ThreadProvider)) { return; }
+            if (event->EventHeader.EventDescriptor.Opcode == 50)
+            {
+                etl_profile::ReadyPoint ready;
+                const auto match = etl_profile::DecodeReady(*event, scan.records, ready);
+                if (match == etl_profile::Match::Unsupported) { ++scan.unsupportedReady; }
+                if (match == etl_profile::Match::Decoded)
+                {
+                    ++scan.decodedReady;
+                    if (!ready.tid || ready.tid == UINT32_MAX) { ++scan.unassignedReady; }
+                }
+                return;
+            }
+            etl_profile::SwitchEvent row{};
+            const auto match = etl_profile::DecodeSwitch(*event, &row);
+            if (match == etl_profile::Match::Unsupported) { ++scan.unsupported; }
+            if (match == etl_profile::Match::Decoded)
+            {
+                row.record = scan.records;
+                row.ordinal = ++scan.decoded;
+                scan.origin.SelectSwitch(row);
+            }
+            return;
+        }
         if (scan.options.activityStart)
         {
             if (scan.records == scan.options.activityStart) { scan.activity.start = etl_profile::ActivityMarker::Read(*event, scan.records); }
@@ -889,6 +944,43 @@ namespace
         return measured ? Quote(std::to_wstring(etl_profile::TickDistance(begin, end))) : L"null";
     }
 
+    std::wstring ReadyOriginJson(const Scan& scan, bool qpc, bool gap)
+    {
+        const auto& o = scan.origin;
+        const auto& r = o.ready;
+        const auto& h = scan.history;
+        const auto& cpu = o.source;
+        const auto& target = o.target;
+        const auto sourcePair = o.Bracket(scan.threadIndex, cpu.end.record ? cpu.end.fields.oldTid : o.cpuAtReady.tid, qpc, gap);
+        const auto targetPair = o.Bracket(scan.threadIndex, r.tid, qpc, gap);
+        const auto running = o.Assess(h, sourcePair, true, qpc, gap);
+        const auto off = o.Assess(h, targetPair, false, qpc, gap);
+        const auto dispatch = o.Dispatch(h, off);
+        const auto edge = o.Relationship(running, dispatch, sourcePair);
+        const auto& sequence = target.witnesses.ready;
+        const auto end = [](const etl_profile::ReadyOrigin::Span& span, bool running) {
+            return EdgeJson(etl_profile::ScheduleSlice{span.end, span.witnesses, running, 0, 0}.End());
+        };
+        return L",\"ready_records\":" + std::to_wstring(h.readyCount) + L",\"unsupported_ready_records\":" + std::to_wstring(h.unsupportedReady) +
+            L",\"unassigned_ready_records\":" + std::to_wstring(h.unassignedReady) + L",\"thread_boundary_records\":" + std::to_wstring(h.boundaries) +
+            L",\"unsupported_thread_boundaries\":" + std::to_wstring(h.unsupportedBoundaries) +
+            L",\"selected_ready\":" + ReadyJson(r) + L",\"header_thread_id\":" + std::to_wstring(o.headerTid) +
+            L",\"header_process_id\":" + std::to_wstring(o.headerPid) + L",\"header_flags\":" + std::to_wstring(o.headerFlags) +
+            L",\"executing_dpc\":" + (r.flags & etl_profile::ReadyDpc ? L"true" : L"false") + L",\"direct_switch_attempt\":" + (r.flags & etl_profile::ReadyDirectSwitchAttempt ? L"true" : L"false") +
+            L",\"source_cpu_context\":{\"relation\":" + Quote(running.relation) + L",\"switch_in\":" + EdgeJson(o.cpuAtReady) +
+            L",\"switch_out\":" + end(cpu, true) + L",\"header_binding\":" + Quote(o.HeaderBinding(sourcePair).relation) + ThreadPairJson(sourcePair, true) +
+            L"},\"target_dispatch\":{\"relation\":" + Quote(dispatch.relation) + L",\"off_cpu_relation\":" + Quote(off.relation) +
+            L",\"preceding_thread_event\":" + EdgeJson(o.targetAtReady) + L",\"switch_out\":" +
+            (o.targetAtReady.kind == etl_profile::EdgeKind::Out ? EdgeJson(o.targetAtReady) : L"null") + L",\"switch_in\":" + end(target, false) +
+            L",\"ready_records\":" + std::to_wstring(sequence.count) + L",\"dispatchable_records\":" + std::to_wstring(sequence.dispatchable) +
+            L",\"first_ready\":" + ReadyJson(sequence.first) + L",\"last_ready\":" + (sequence.count > 1 ? ReadyJson(sequence.last) : L"null") +
+            L",\"switch_out_to_ready_ticks\":" + Elapsed(dispatch.measured, target.witnesses.previousIncomingThread.at.tick, r.at.tick) +
+            L",\"ready_to_switch_in_ticks\":" + Elapsed(dispatch.measured, r.at.tick, target.end.timestamp) + ThreadPairJson(targetPair, true) +
+            L"},\"relationship\":{\"relation\":" + Quote(edge.relation) + L",\"readying_tid\":" +
+            (edge.measured ? std::to_wstring(cpu.end.fields.oldTid) : L"null") + L",\"readying_pid\":" +
+            (edge.measured ? std::to_wstring(sourcePair.before->pid) : L"null") + L"}";
+    }
+
     std::wstring IntervalsJson(const Scan& scan, size_t index, bool clock, bool gap)
     {
         const auto& e = scan.switchPage[index];
@@ -940,7 +1032,7 @@ namespace
             L",\"replayed_page_sha256\":" + (replayed.empty() ? L"null" : Quote(replayed)) +
             L",\"page_bytes_match\":" + (replayed.empty() ? L"null" : replayed == o.expectedPage ? L"true" : L"false") +
             L",\"source_status\":" + (sourceStatus ? Quote(sourceStatus) : L"null") +
-            (o.scheduleOf ? L",\"requested_fault_ordinal\":" + std::to_wstring(o.scheduleOf) : L"") + o.ActivitySelectorJson() +
+            (o.scheduleOf ? L",\"requested_fault_ordinal\":" + std::to_wstring(o.scheduleOf) : L"") + o.ActivitySelectorJson() + o.ReadySelectorJson() +
             (o.activityMarkers ? L",\"thread_filter\":" + (o.haveTid ? std::to_wstring(o.tid) : L"null") : L"") +
             L",\"after\":" + std::to_wstring(o.after) + L",\"limit\":" + std::to_wstring(o.limit) +
             (withStatement ? L",\"capture_statement\":" + statement.Json(o.statementAuthority, replayed == o.expectedPage) : L"") +
@@ -957,7 +1049,7 @@ namespace
             (digest.empty() ? L"null" : Quote(digest)) + L",\"win32_status\":" +
             (error ? std::to_wstring(error) : L"null") + (options.referencePath.empty() ? L"" :
                 L",\"reference_sha256\":" + (referenceDigest.empty() ? L"null" : Quote(referenceDigest))) +
-            (options.SchedulingActivity() ? options.ActivitySelectorJson() + options.ActivityPagingJson() : L"") + L"}";
+            (options.SchedulingActivity() ? options.ActivitySelectorJson() + options.ActivityPagingJson() : options.ReadySelectorJson()) + L"}";
         return WriteCapabilityJson(report) ? 1 : 2;
     }
 
@@ -968,7 +1060,8 @@ namespace
 
     bool Partial(const Scan& scan, BufferAccounting accounting, const TRACE_LOGFILE_HEADER& h)
     {
-        if (scan.options.SchedulingActivity())
+        if (scan.options.readyOrigin && (scan.unsupportedReady || scan.unassignedReady || scan.threadIndex.unsupported)) { return true; }
+        if (scan.options.SchedulingActivity() || scan.options.readyOrigin)
         {
             return CaptureGap(scan, accounting, h) ||
                 scan.unsupported || !scan.threadIndex.Complete();
@@ -1172,7 +1265,8 @@ namespace
         const auto comparison = etl_profile::BufferComparisonName(accounting);
         auto result = std::wstring(scan.options.Prefix()) + Quote(partial ? L"partial" : L"read") + L",\"source_sha256\":" + Quote(source.Sha256) +
             L",\"source_bytes\":" + std::to_wstring(source.Bytes()) +
-            scan.options.Fields().descriptor +
+            (scan.options.readyOrigin ? L",\"provider_guid\":\"3d6fa8d1-fe05-11d0-9dda-00c04fd7ba7c\",\"event_id\":0,"
+                L"\"ready_opcode\":50,\"ready_version\":2,\"switch_opcode\":36,\"switch_versions\":[2,3,4]" : scan.options.Fields().descriptor) +
             L",\"clock\":{\"raw_type\":" + std::to_wstring(h.ReservedFlags) + L",\"kind\":" + Quote(clock) +
             L",\"header_perf_frequency\":" + Quote(std::to_wstring(h.PerfFreq.QuadPart)) + L"}" +
             L",\"log_header\":{\"pointer_bytes\":" + std::to_wstring(h.PointerSize) + L",\"processors\":" + std::to_wstring(h.NumberOfProcessors) +
@@ -1180,7 +1274,9 @@ namespace
             L",\"end_filetime\":" + Quote(std::to_wstring(h.EndTime.QuadPart)) +
             L",\"log_mode\":" + std::to_wstring(h.LogFileMode) + L",\"events_lost\":" + std::to_wstring(h.EventsLost) +
             L",\"buffers_lost\":" + std::to_wstring(h.BuffersLost) + L",\"buffers_written\":" + std::to_wstring(h.BuffersWritten) + L"}" +
-            (scan.options.activityMarkers ?
+            (scan.options.readyOrigin ?
+                L",\"qualification\":{\"evidence\":\"reported_readying_cpu_context\",\"producer_authenticity\":\"unverified\","
+                L"\"wait_object\":null,\"wait_cause\":null,\"critical_path\":null}" : scan.options.activityMarkers ?
                 L",\"qualification\":{\"evidence\":\"reported_activity_boundary\",\"producer_authenticity\":\"unverified\",\"logical_task_identity\":null}" : scan.options.SchedulingActivity() ?
                 L",\"qualification\":{\"evidence\":\"reported_activity_thread_scheduling\",\"producer_authenticity\":\"unverified\","
                 L"\"logical_task_identity\":null,\"wait_object\":null,\"wait_cause\":null,\"cross_thread_critical_path\":null}" : scan.options.activityStart ?
@@ -1208,12 +1304,15 @@ namespace
             L",\"buffers_processed\":" + std::to_wstring(scan.processedBuffers) + L",\"buffer_comparison\":" + Quote(comparison) +
             L",\"loss_marker_records\":" + std::to_wstring(scan.lossMarkers) +
             scan.options.Fields().unsupported + std::to_wstring(scan.unsupported) +
-            (scan.options.SchedulingActivity() ? scan.options.ActivitySelectorJson() + scan.options.ActivityPagingJson() :
+            (scan.options.readyOrigin ? scan.options.ReadySelectorJson() :
+                scan.options.SchedulingActivity() ? scan.options.ActivitySelectorJson() + scan.options.ActivityPagingJson() :
                 L",\"after\":" + std::to_wstring(scan.options.after)) +
             L",\"next_after\":";
         const auto pageEnd = scan.options.after + (scan.options.SchedulingActivity() ? scan.residency.page.size() : scan.used);
         const auto matches = scan.options.SchedulingActivity() ? scan.residency.count : scan.matched;
         result += !scan.options.scheduleOf && pageEnd > scan.options.after && pageEnd < matches ? std::to_wstring(pageEnd) : L"null";
+        if (scan.options.readyOrigin)
+        { return result + ReadyOriginJson(scan, h.ReservedFlags == 1 && h.PerfFreq.QuadPart > 0, partial) + L"}"; }
         if (scan.options.SchedulingActivity()) { return result + ActivityScheduleJson(scan, partial) + L"}"; }
         if (scan.options.DiskIo()) { return result + DiskResultsJson(scan, h); }
         if (scan.options.activityMarkers)
@@ -1417,8 +1516,11 @@ namespace
         const auto status = ProcessTrace(&replay.handle, 1, nullptr, nullptr);
         if (status != ERROR_SUCCESS) { return status; }
         const auto& h = log.LogfileHeader;
-        if (scan.replayMismatch || scan.replayedRows != (scan.options.activityStart ? 2 : scan.used) || scan.budgetExceeded ||
-            ((scan.options.scheduleOf || scan.options.SchedulingActivity()) && (scan.threadIndex.decoded != scan.history.boundaries ||
+        const auto expectedRows = scan.options.readyOrigin ? scan.origin.ReplayRows() : scan.options.activityStart ? 2 : scan.used;
+        if (scan.replayMismatch || scan.replayedRows != expectedRows || scan.budgetExceeded ||
+            (scan.options.readyOrigin && (scan.decodedReady != scan.history.readyCount || scan.unsupportedReady != scan.history.unsupportedReady ||
+                scan.unassignedReady != scan.history.unassignedReady)) ||
+            ((scan.options.scheduleOf || scan.options.SchedulingActivity() || scan.options.readyOrigin) && (scan.threadIndex.decoded != scan.history.boundaries ||
                 scan.threadIndex.unsupported != scan.history.unsupportedBoundaries)) ||
             scan.records != first.records || scan.decoded != first.decoded || scan.unsupported != first.unsupported ||
             scan.processedBuffers != first.processedBuffers || scan.lossMarkers != first.lossMarkers ||
@@ -1509,6 +1611,18 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     const auto accounting = etl_profile::AccountBuffers(log.LogfileHeader.LogFileMode, log.LogfileHeader.BuffersWritten, scan.processedBuffers);
     const bool partial = Partial(scan, accounting, log.LogfileHeader);
     if (scan.options.NeedsThreadIndex() && scan.threadIndex.Complete()) { scan.threadIndex.Sort(); }
+    if (scan.options.readyOrigin && scan.origin.match != etl_profile::Match::Decoded)
+    {
+        const auto status = !scan.origin.observed ? L"ready_record_not_observed" :
+            scan.origin.match == etl_profile::Match::Unsupported ? L"unsupported_ready_record" : L"not_ready_thread";
+        const auto sourceStatus = partial ? L"partial" : L"read";
+        const auto diagnostic = scan.options.expectedPage.empty() ?
+            std::wstring(scan.options.Prefix()) + Quote(status) + L",\"source_status\":" + Quote(sourceStatus) +
+                L",\"source_sha256\":" + Quote(source.Sha256) + scan.options.ReadySelectorJson() +
+                L",\"records_seen\":" + std::to_wstring(scan.records) + L"}" :
+            ReplayReceipt(scan.options, status, source.Sha256, {}, sourceStatus);
+        return WriteCapabilityJson(diagnostic) ? 1 : 2;
+    }
     if (scan.options.activityStart && !scan.activity.stop.record)
     {
         const auto sourceStatus = partial ? L"partial" : L"read";
@@ -1530,7 +1644,7 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
         return WriteCapabilityJson(diagnostic) ? 1 : 2;
     }
     if (!scan.options.SchedulingActivity() && !partial && scan.options.after > scan.matched) { return Failure(scan.options, L"cursor_out_of_range", source.Sha256); }
-    if (scan.options.WithIntervals() || scan.options.scheduleOf || scan.options.activityStart)
+    if (scan.options.WithIntervals() || scan.options.scheduleOf || scan.options.activityStart || scan.options.readyOrigin)
     {
         try
         {
@@ -1544,6 +1658,11 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
                     scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.activity.start.tid);
                     scan.residency.Prepare(scan.activity.start.tick, scan.options.limit);
                 }
+            }
+            else if (scan.options.readyOrigin)
+            {
+                scan.history.allowDirectSwitch = true;
+                scan.history.Prepare(log.LogfileHeader.NumberOfProcessors, scan.origin.ready.tid, scan.origin.source.end.fields.oldTid);
             }
             else if (scan.options.scheduleOf)
             {

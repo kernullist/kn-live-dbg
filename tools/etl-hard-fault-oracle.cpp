@@ -51,7 +51,12 @@ namespace
         {
             uint8_t flags = 0;
             if (!Property(e, counts, L"TThreadId", tid) || !Property(e, counts, L"Flag", flags)) { return; }
-            std::printf("{\"payload_tid\":%u,\"ready_flags\":%u", tid, static_cast<unsigned>(flags));
+            int8_t reason = 0, increment = 0, reserved = 0;
+            if (!Property(e, counts, L"AdjustReason", reason) || !Property(e, counts, L"AdjustIncrement", increment) ||
+                !Property(e, counts, L"Reserved", reserved)) { return; }
+            std::printf("{\"payload_tid\":%u,\"ready_flags\":%u,\"adjust_reason\":%d,\"adjust_increment\":%d,"
+                "\"reserved_field\":%d,\"header_thread_id\":%lu,\"header_process_id\":%lu,\"header_flags\":%u",
+                tid, static_cast<unsigned>(flags), reason, increment, reserved, h.ThreadId, h.ProcessId, static_cast<unsigned>(h.Flags));
         }
         else if (op >= 1 && op <= 4 && version == 3)
         {

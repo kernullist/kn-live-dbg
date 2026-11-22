@@ -10,6 +10,7 @@
 #include "etl-disk-io-selftest.h"
 #include "../user/EtlFaultSchedule.h"
 #include "../user/EtlActivitySchedule.h"
+#include "../user/EtlReadyOrigin.h"
 #include "etl-activity-window-selftest.h"
 
 #include <array>
@@ -769,6 +770,103 @@ static bool CheckSchedulerScopes()
     return IsSpan(AssessSpan(duplicate, b, earlier, true, true, false), L"thread_transition_conflict");
 }
 
+static bool CheckReadyOrigin()
+{
+    using namespace etl_profile;
+    std::array<uint8_t, 8> payload{42, 0, 0, 0, 1, 2, 8, 0};
+    auto ready = SchedulerRecord(payload.data(), 8, 50, 2, 250);
+    ready.EventHeader.ThreadId = 73;
+    ready.EventHeader.ProcessId = 177;
+    const auto targetOut = SwitchAt(3, 100, 0, 42, 77);
+    const auto sourceIn = SwitchAt(4, 150, 1, 99, 73);
+    const auto close = SwitchAt(6, 300, 1, 73, 42);
+    ReadyOrigin o;
+    auto unavailable = ready;
+    ++unavailable.EventHeader.EventDescriptor.Version;
+    o.Select(unavailable, 5);
+    if (!o.observed || o.match != Match::Unsupported) { return false; }
+    unavailable.EventHeader.ProviderId = {};
+    o.Select(unavailable, 5);
+    if (o.match != Match::Other) { return false; }
+    o.Select(ready, 5);
+    o.SelectSwitch(close);
+    ScheduleHistory h;
+    h.allowDirectSwitch = true;
+    h.Prepare(2, 73, 42);
+    h.Observe(targetOut, nullptr);
+    h.Observe(sourceIn, nullptr);
+    o.ObserveContext(h);
+    h.OtherThreadEvent(ready, 5);
+    size_t rows = 1;
+    bool mismatch = false;
+    o.ReplaySwitch(h, close, rows, mismatch);
+    if (o.ReplayRows() != 3 || rows != 3 || mismatch || !o.SameReady(ready, 5)) { return false; }
+    auto changed = ready;
+    ++changed.EventHeader.ThreadId;
+    if (o.SameReady(changed, 5)) { return false; }
+    auto wrongEnd = close;
+    ++wrongEnd.fields.oldWaitReason;
+    auto altered = o;
+    auto changedHistory = h;
+    altered.ReplaySwitch(changedHistory, wrongEnd, rows, mismatch);
+    if (!mismatch) { return false; }
+    ThreadIndex i;
+    i.events = {{1, 101, 42, 20, 1, false, false, 7}, {2, 177, 73, 25, 3, false, false, 7},
+                {7, 101, 42, 500, 2, false, false, 7}, {8, 177, 73, 550, 4, false, false, 7}};
+    i.decoded = 4;
+    i.Sort();
+    const auto source = o.Bracket(i, 73, true, false);
+    const auto target = o.Bracket(i, 42, true, false);
+    const auto cpu = o.Assess(h, source, true, true, false);
+    const auto off = o.Assess(h, target, false, true, false);
+    const auto split = o.Dispatch(h, off);
+    if (!source.pairedPid || !target.pairedPid || !IsSpan(cpu, L"running_on_cpu", true) ||
+        !IsSpan(split, L"waiting_ready_switch_in", true) || !IsSpan(o.Relationship(cpu, split, source), L"readying_thread_context", true)) { return false; }
+
+    const auto relation = [&](ReadyOrigin copy, const wchar_t* expected) {
+        return IsSpan(copy.Relationship(cpu, copy.Dispatch(h, off), source), expected);
+    };
+    altered = o;
+    ++altered.headerPid;
+    if (!relation(altered, L"ready_header_unqualified")) { return false; }
+    altered.headerPid = UINT32_MAX;
+    if (!relation(altered, L"ready_header_unqualified")) { return false; }
+    altered = o;
+    altered.ready.flags |= 1;
+    if (!relation(altered, L"dpc_context")) { return false; }
+    altered = o;
+    ++altered.target.witnesses.ready.last.at.record;
+    if (!relation(altered, L"selected_record_not_dispatchable")) { return false; }
+    altered = o;
+    altered.target.witnesses.ready.invalidProcessorScope = true;
+    if (!relation(altered, L"ready_scope_unqualified")) { return false; }
+    altered = o;
+    altered.target.witnesses.previousIncomingThread.state = 1;
+    if (!relation(altered, L"target_not_reported_waiting")) { return false; }
+    altered = o;
+    ++altered.targetAtReady.at.record;
+    if (!IsSpan(altered.Assess(h, target, false, true, false), L"intervening_transition")) { return false; }
+    altered = o;
+    altered.target.end = {};
+    if (!IsSpan(altered.Assess(h, target, false, true, false), L"no_following_target_switch_in")) { return false; }
+    altered = o;
+    altered.source.end = {};
+    if (!IsSpan(altered.Assess(h, source, true, true, false), L"no_following_cpu_switch")) { return false; }
+    auto conflicting = i;
+    conflicting.events.back().logger = 1;
+    conflicting.Sort();
+    if (o.Bracket(conflicting, 73, true, false).pairedPid) { return false; }
+    ReadySequence legacy, current;
+    legacy.Append(o.ready);
+    current.Append(o.ready, true);
+    if (!legacy.unknownFlags || legacy.dispatchable || current.unknownFlags || current.dispatchable != 1) { return false; }
+    auto reserved = o.ready;
+    reserved.reserved = 1;
+    current.Append(reserved, true);
+    return current.unknownFlags && IsSpan(o.Assess(h, target, false, true, true), L"coverage_unqualified") &&
+        IsSpan(o.Assess(h, source, true, false, false), L"clock_unqualified");
+}
+
 static bool CheckActivitySchedule()
 {
     using namespace etl_profile;
@@ -918,7 +1016,7 @@ int wmain(int argc, wchar_t** argv)
     if (argc == 2 && std::wstring(argv[1]) == L"--etl-record-check")
     {
         return CheckProfileRecord() && CheckThreadEvidence() && CheckImageLayout() && CheckImageEvidence() &&
-            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckActivitySchedule() && CheckFaultSchedule() && etl_activity_test::Check() &&
+            CheckSwitchRecord() && etl_disk_test::Check() && CheckHardFaultRecord() && CheckReadyLayout() && CheckSchedulingIntervals() && CheckSchedulerScopes() && CheckReadyOrigin() && CheckActivitySchedule() && CheckFaultSchedule() && etl_activity_test::Check() &&
             etl_settings_test::Layout(4) && etl_settings_test::Layout(8) && etl_settings_test::Brackets() && etl_settings_test::Budgets() &&
             etl_build_test::CheckDecoder(4) && etl_build_test::CheckDecoder(8) && etl_build_test::CheckJoin() && etl_build_test::CheckBudget() &&
             etl_clr_test::Check() && etl_process_test::Check() && etl_reference_test::Check() && etl_reference_test::CheckOwnedFile(argv[0]) ? 0 : 1;

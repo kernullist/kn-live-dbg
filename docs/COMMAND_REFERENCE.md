@@ -1461,6 +1461,32 @@ Exit 0 means the file was read. Inspect `activity_schedule.status` for
 timing coverage. Exit 1 includes partial sources and replay mismatches.
 [Timing fields and source requirements](TRACE_IMPORT.md#thread-scheduling-inside-an-activity)
 
+### Find the CPU context of a ReadyThread event
+
+Choose a ReadyThread record from a saved scheduling page. In the public
+TaskbarLatency recording, record 369897 belongs to the first off-CPU
+interval of the activity above. The command accepts the original ETW
+record ordinal. The context-switch and TraceProcessor tables have their
+own row numbers.
+
+```powershell
+$etl = (Get-Item .\TaskbarLatency.etl).FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$pin = (Get-FileHash -LiteralPath $etl -Algorithm SHA256).Hash
+$query = @('--etl-switches', $etl, '--sha256', $pin, '--ready-origin', '369897')
+$page = & $reader @query | ConvertFrom-Json
+$page.relationship
+$page.source_cpu_context
+$page.target_dispatch | Select-Object relation, switch_out_to_ready_ticks, ready_to_switch_in_ticks
+```
+
+Inspect the source and target relations independently. A DPC can ready a
+thread while another thread occupies the CPU. In that case the target
+timing can still be measured and the readying PID and TID are null. Exit 1
+covers an unavailable selector, a partial source, or a page replay
+mismatch. Use the same selector with `--check-page` to verify exact output
+bytes. [ReadyThread evidence and timing](TRACE_IMPORT.md#cpu-context-at-a-readythread-event)
+
 ## Whole-host hunt
 
 ```text

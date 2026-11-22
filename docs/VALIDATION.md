@@ -7,6 +7,53 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## ReadyThread CPU context on 2026-11-22
+
+The x64 Release reader (SHA-256 prefix `232bcf3ffd0e`) was checked on
+Windows `10.0.28000` against the public TaskbarLatency ETL. The native
+reader and a separate Windows TDH reader counted 1,093,447 ETW records,
+62,025 context switches, 33,493 ReadyThread events and 5,086 thread
+boundaries. Microsoft TraceProcessor CPU 1.12.10 produced 33,491
+ReadyThread rows and 62,017 ThreadActivity rows. The comparison joined
+events by target TID, CPU and raw QPC timestamp and retained each table's
+one-based row number. [Original recording](https://github.com/randomascii/blogstuff/blob/138aae8b20e78183894612a1a7e98e2c8f293b29/TaskbarLatency/2019-09-08_22-34-56%20explorer%20jumplist%20delays.etl) · [Microsoft CPU reader](https://www.nuget.org/packages/Microsoft.Windows.EventTracing.Cpu/1.12.10)
+
+| Original ready records | Observed result |
+| --- | --- |
+| 369897, 373233, 373294, 738362, 738466 | The source switch pair and lifetime identified five readying contexts. Both Microsoft CPU tables agreed on source PID and TID. The last two events carried the direct-switch attempt flag. |
+| 373207, 373271, 88389, 9013, 1065544, 1093290 | All six events carried the DPC flag. At record 88389 the CPU carried a non-idle thread. The first and last parts of the capture also exercised missing switch endpoints. The attributed source PID and TID were null in all six cases. |
+| 104979, 105005 | The Microsoft table named a thread whose recorded exit preceded the ready event. TDH found the same exit and no following lifetime boundary. The reader retained target timing and withheld source attribution. |
+
+Ten target waits had qualified timings. Their switch-out and switch-in
+timestamps and destination CPU matched the Microsoft ThreadActivity
+table. Original record 369897 matched ReadyThread row 744 and
+ThreadActivity row 11385. It fell between switches of TID 24036 on CPU 0.
+Target TID 39452 spent 598,311 ticks off CPU before the ready event and
+resumed on CPU 5 another 84 ticks later, on a 10 MHz clock.
+[Record checks](../tools/test-etl-ready-origin.py) · [Query example](COMMAND_REFERENCE.md#find-the-cpu-context-of-a-readythread-event)
+
+Changing the trace clock or introducing reported loss withheld attribution.
+Exact page replay and archive-witness signature checks passed for complete
+and partial sources. Eleven earlier query pages, their eleven replay
+receipts and one signed v4 receipt matched the preceding Release binary
+byte for byte. The activity regression covered 157 switch intervals in
+three windows. The hard-fault regression checked all 17 original faults.
+The execution-trace suite, V8 controls and MSVC `/RTC1` record checks
+passed. This validation covers one saved Windows recording and the
+named regression fixtures.
+
+To repeat the comparison from an x64 Visual Studio Developer PowerShell,
+set `$etl` to the recording above. The test checks its published digest.
+Pass `--openssl` with a local OpenSSL executable to include the archive
+witness signature checks.
+
+```powershell
+New-Item -ItemType Directory -Force .\.build\ready-origin-test | Out-Null
+cl /nologo /EHsc /std:c++17 /O2 /W4 /WX tools\etl-hard-fault-oracle.cpp /Fo".\.build\ready-origin-test\oracle.obj" /Fe:".\.build\ready-origin-test\oracle.exe"
+MSBuild tools\TraceProcessorReadyTest\TraceProcessorReadyTest.csproj /restore /t:Build /p:Configuration=Release
+python -B tools\test-etl-ready-origin.py --exe .\x64\Release\KnLiveDbg.exe --etl $etl --oracle .\.build\ready-origin-test\oracle.exe --sdk .\.build\traceprocessor-ready-test\bin\TraceProcessorReadyTest.exe
+```
+
 ## Application activity scheduling on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix

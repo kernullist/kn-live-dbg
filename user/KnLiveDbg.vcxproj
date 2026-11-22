@@ -481,6 +481,7 @@
     <ClInclude Include="EtlHardFault.h" />
     <ClInclude Include="EtlFaultSchedule.h" />
     <ClInclude Include="EtlActivitySchedule.h" />
+    <ClInclude Include="EtlReadyOrigin.h" />
     <ClInclude Include="EtlActivityWindow.h" />
     <ClInclude Include="EtlProfileRecord.h" />
     <ClInclude Include="EtlThreadEvidence.h" />

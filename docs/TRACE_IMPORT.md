@@ -778,6 +778,36 @@ totals. The markers describe one emitting thread. Identifying a wait
 object or a dependency on another thread requires separate evidence.
 [CSwitch fields](https://learn.microsoft.com/en-us/windows/win32/etw/cswitch) · [ReadyThread fields](https://learn.microsoft.com/en-us/windows/win32/etw/readythread) · [Query example](COMMAND_REFERENCE.md#measure-scheduling-inside-an-activity)
 
+### CPU context at a ReadyThread event
+
+The `--ready-origin` selector follows one classic Thread/ReadyThread v2
+event in a SHA-256-pinned ETL. Its payload identifies the thread that
+became ready. The `kn.etl_switches.v5` page preserves that event and the
+original header PID and TID, including unreported values. Replay locates
+the switches immediately before and after the event on its CPU, the
+target's most recent transition, and its next switch-in on any CPU.
+Each endpoint retains its original record ordinal, logger, CPU and raw
+timestamp. The source and target include their own thread-lifetime
+witnesses. [Microsoft ReadyThread event fields](https://learn.microsoft.com/en-us/windows/win32/etw/readythread)
+
+A `readying_thread_context` relationship requires a single scheduler
+context between the source switches and a target that switched out in
+state 5 (Waiting). Both intervals must fit inside their recorded thread
+lifetimes on the same logger and a comparable QPC clock. The selected
+event must be the final, uniquely dispatchable ready event between
+switch-out and switch-in. With both header IDs unreported, the switch
+and lifetime records can still identify the CPU context. A conflicting
+or partly populated header withholds attribution. Capture loss, an
+unresolved transition, an unknown ready flag or a nonzero reserved field
+also withholds the relationship.
+
+The two target durations cover the elapsed ticks before and after this
+ready event. They cover the whole off-CPU interval, including time
+outside any selected application marker. DPCs and idle contexts have no
+attributed source thread. The direct-switch bit records an attempt.
+The page leaves wait-object identity, the reason for the wait and its
+contribution to application latency unresolved. [Microsoft CPU analysis](https://learn.microsoft.com/en-us/windows-hardware/test/wpt/cpu-analysis) · [Direct-switch event flag](https://learn.microsoft.com/en-us/dotnet/api/microsoft.windows.eventtracing.cpu.readythreadevent.isdirectswitchattempt?view=trace-processor-dotnet-1.0) · [Reader command](COMMAND_REFERENCE.md#find-the-cpu-context-of-a-readythread-event)
+
 ## Saved V8 CPU profiles
 
 The trace query reads the Windows V8 profiler log emitted by Node.js

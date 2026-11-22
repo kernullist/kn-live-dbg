@@ -96,7 +96,7 @@ FAULT_QUERY_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2", "kn.etl
 ETL_ROTATION_SCHEMAS = ("kn.etl_rotation_inventory.v1", "kn.etl_rotation_set.v1")
 HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", *(f"kn.etl_handoff_{kind}{receipt}.v1" for kind in ("plan", "capture", "study")
                                                for receipt in ("", "_receipt")))
-TRACE_QUERY_SCHEMAS = ("kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
+TRACE_QUERY_SCHEMAS = ("kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
                            r"code-(?:move|delete|source-info|disassemble),0x[0-9a-fA-F]+(?:,|$))")
@@ -203,7 +203,14 @@ DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 ETL_ROTATION_MARKERS = (*ETL_ROTATION_SCHEMAS, '"expected_inventory_sha256"', '"closed_controller_inventory_verified"',
                         '"final_ordinal"', '"etl_bytes"', '"observed_bytes"')
-ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *DISK_IO_MARKERS, *HARD_FAULT_MARKERS, *HANDOFF_MARKERS, *ETL_ROTATION_MARKERS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
+READY_ORIGIN_FIELDS = tuple(frozenset(keys) for keys in (
+    ("requested_ready_record", "source_sha256"), ("source_cpu_context", "target_dispatch"),
+    ("readying_tid", "readying_pid"), ("switch_in", "header_binding"), ("preceding_thread_event", "off_cpu_relation"),
+    ("ready_total", "activity_total"), ("key", "source_tid", "direct"), ("previous_out", "switch_in_cpu"),
+))
+READY_ORIGIN_MARKERS = ('"requested_ready_record"', '"source_cpu_context"', '"readying_pid"', '"header_binding"',
+                        '"off_cpu_relation"', '"ready_total"', '"source_tid"', '"switch_in_cpu"')
+ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *READY_ORIGIN_MARKERS, *DISK_IO_MARKERS, *HARD_FAULT_MARKERS, *HANDOFF_MARKERS, *ETL_ROTATION_MARKERS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
                    '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v', 'kn.etl_profile.v4', 'kn.etl_profile.v5', 'kn.etl_profile.v6', 'kn.etl_profile.v7', 'kn.etl_profile.v8',
@@ -230,7 +237,7 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
     ("ordinal", "expected_bytes", "observed_bytes"), ("win32_status", "final_ordinal", "log_buffers_lost"),
     ("contiguous_inventory_verified", "closed_controller_inventory_verified"),
 ))
-DETACHED_FIELD_SETS = WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + ETL_ROTATION_FIELDS + tuple(frozenset(fields) for fields in (
+DETACHED_FIELD_SETS = READY_ORIGIN_FIELDS + WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + ETL_ROTATION_FIELDS + tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
     ("observation", "decoded", "unsupported", "first_decoded_record"),
     ("first_payload_bytes", "first_payload_sha256"),
@@ -340,6 +347,8 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
 
 def detached_evidence_line(text: str) -> int | None:
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
+    if any(tag in text for tag in READY_ORIGIN_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, READY_ORIGIN_FIELDS, ("kn.etl_switches.v5",)))
     if any(tag in text for tag in DISK_IO_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, DISK_IO_FIELDS, (DISK_IO_SCHEMA,)))
     if any(tag in text for tag in HARD_FAULT_MARKERS):

@@ -56,23 +56,32 @@ namespace etl_profile
         int8_t state = 0, reason = 0;
     };
 
+    inline constexpr unsigned ReadyDpc = 1, ReadyDeferredFlags = 6, ReadyDirectSwitchAttempt = 8;
+
+    inline unsigned DispatchableReadyFlags(bool allowDirectSwitch)
+    {
+        return ReadyDpc | (allowDirectSwitch ? ReadyDirectSwitchAttempt : 0u);
+    }
+
     struct ReadySequence
     {
         ReadyPoint first, last;
         uint32_t count = 0, dispatchable = 0;
-        bool unknownFlags = false, badClock = false, mixedLogger = false;
+        bool unknownFlags = false, badClock = false, mixedLogger = false, invalidProcessorScope = false;
 
-        void Append(const ReadyPoint& p)
+        void Append(const ReadyPoint& p, bool allowDirectSwitch = false)
         {
             if (!count) { first = p; }
             else
             {
                 badClock |= last.at.tick >= p.at.tick;
                 mixedLogger |= last.at.logger != p.at.logger;
+                invalidProcessorScope |= last.at.indexed != p.at.indexed;
             }
             ++count;
-            unknownFlags |= (p.flags & ~7u) != 0;
-            if ((p.flags & ~1u) == 0) { ++dispatchable; }
+            const auto dispatchMask = DispatchableReadyFlags(allowDirectSwitch);
+            unknownFlags |= (p.flags & ~(ReadyDeferredFlags | dispatchMask)) != 0 || (allowDirectSwitch && p.reserved != 0);
+            if ((p.flags & ~dispatchMask) == 0) { ++dispatchable; }
             last = p;
         }
     };
@@ -126,7 +135,7 @@ namespace etl_profile
         uint32_t cpuConflicts = 0, cpuClockConflicts = 0;
         uint16_t logger = 0;
         bool seenSwitch = false, indexed = false, ambiguousScope = false, unknownSwitchTid = false;
-        bool seenTick = false, reversedClock = false;
+        bool seenTick = false, reversedClock = false, allowDirectSwitch = false;
         int64_t lastTick = 0;
 
         void ObserveClock(int64_t tick)
@@ -161,10 +170,12 @@ namespace etl_profile
             for (const auto tid : ids) { threads.push_back({tid, {}, {}}); }
         }
 
-        void Prepare(uint32_t processors, uint32_t tid)
+        void Prepare(uint32_t processors, uint32_t tid, uint32_t second = 0)
         {
             PrepareProcessors(processors);
+            if (second < tid) { std::swap(tid, second); }
             if (tid && tid != UINT32_MAX) { threads.push_back({tid, {}, {}}); }
+            if (second && second != tid && second != UINT32_MAX) { threads.push_back({second, {}, {}}); }
         }
 
         auto Find(uint32_t tid) const
@@ -192,7 +203,11 @@ namespace etl_profile
                 if (!ready.tid || ready.tid == UINT32_MAX) { ++unassignedReady; }
                 ObserveClock(ready.at.tick);
                 auto* thread = Watch(ready.tid);
-                if (thread && thread->last.kind == EdgeKind::Out) { thread->ready.Append(ready); }
+                if (thread && thread->last.kind == EdgeKind::Out)
+                {
+                    thread->ready.Append(ready, allowDirectSwitch);
+                    thread->ready.invalidProcessorScope |= ready.at.cpu >= cpus.size() || (!ready.at.indexed && cpus.size() > 64);
+                }
                 return;
             }
             ThreadEvent e{};
@@ -278,7 +293,7 @@ namespace etl_profile
     }
 
     inline ReportedSpan AssessReady(const ReadySequence& ready, const ScheduleEdge& out, const SwitchEvent& in,
-        bool offCpuMeasured, uint32_t unsupportedReady)
+        bool offCpuMeasured, uint32_t unsupportedReady, bool allowDirectSwitch = false)
     {
         if (!offCpuMeasured) { return {L"off_cpu_unqualified"}; }
         if (unsupportedReady) { return {L"ready_coverage_unqualified"}; }
@@ -288,7 +303,7 @@ namespace etl_profile
         { return {L"ready_clock_unqualified"}; }
         if (ready.unknownFlags) { return {L"ready_flags_unqualified"}; }
         if (!ready.dispatchable) { return {L"ready_deferred"}; }
-        if (ready.dispatchable != 1 || (ready.last.flags & ~1u)) { return {L"ready_sequence_conflict"}; }
+        if (ready.dispatchable != 1 || (ready.last.flags & ~DispatchableReadyFlags(allowDirectSwitch))) { return {L"ready_sequence_conflict"}; }
         return {out.state == 5 ? L"waiting_ready_switch_in" : L"ready_switch_in", true};
     }
 
