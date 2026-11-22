@@ -81,13 +81,20 @@ def locations(f, d):
     return f["begin_record"], d["init_record"], d["complete_record"], f["end_record"]
 
 
-def check_page(query, records, common):
+def check_page(query, records, common, *, fault_page=None):
+    extended = fault_page is not None
     p = query["page"]
     if p is None or query["reader"]["exit_code"] != 0 or p["status"] != "read":
-        raise Unavailable("file_native_records_unavailable")
+        raise Unavailable("fault_io_records_unavailable" if extended else "file_native_records_unavailable")
+    extra = " fault_provider_guid decoded_hard_faults unsupported_hard_fault_records" if extended else ""
     fields(p, "schema status source_sha256 source_bytes file_provider_guid disk_provider_guid clock log_header records_seen buffers_processed "
-           "buffer_comparison loss_marker_records requested_operation_records next_after operation_records", "Windows operation page")
-    check(p["schema"] == "kn.etl_operation_records.v1" and p["requested_operation_records"] == records and
+           "buffer_comparison loss_marker_records requested_operation_records next_after operation_records" + extra, "Windows operation page")
+    if extended:
+        check(p["fault_provider_guid"] == fault_page["provider_guid"] and
+              uint(p["decoded_hard_faults"]) == fault_page["decoded_hard_faults"] and uint(p["unsupported_hard_fault_records"]) == 0,
+              "TDH fault coverage differs from the activity reader")
+    schema = "kn.etl_fault_file_records.v1" if extended else "kn.etl_operation_records.v1"
+    check(p["schema"] == schema and p["requested_operation_records"] == records and
           p["file_provider_guid"] == "90cbdc39-4a3e-11d1-84f4-0000f80464e3" and
           p["disk_provider_guid"] == "3d6fa8d4-fe05-11d0-9dda-00c04fd7ba7c" and
           all(p[k] == common[k] for k in ("source_sha256", "source_bytes", "clock", "log_header", "records_seen", "buffers_processed",
@@ -95,17 +102,31 @@ def check_page(query, records, common):
           [r["record_ordinal"] for r in p["operation_records"]] == records, "native operation page differs")
     rows = {}
     for r in p["operation_records"]:
-        fields(r, "record_ordinal status layer opcode version pointer_bytes logger_id raw_timestamp packet_label file_object_label "
-               "issuing_tid file_offset requested_bytes io_flags ntstatus extra_info", "decoded operation record")
+        envelope = "record_ordinal status layer opcode version pointer_bytes logger_id raw_timestamp file_object_label "
+        fault = extended and r["layer"] == "hard_fault"
+        if fault:
+            fields(r, envelope + "faulting_tid initial_qpc read_offset byte_count", "decoded hard fault")
+            check(uint(r["opcode"]) == 32, "unknown hard fault opcode")
+            uint(r["faulting_tid"], 0xffffffff)
+            uint(r["byte_count"], 0xffffffff)
+            decimal(r["read_offset"])
+            tick(r["initial_qpc"])
+        else:
+            transfer = extended and r["layer"] == "disk" and r["opcode"] in (10, 11)
+            fields(r, envelope + "packet_label issuing_tid file_offset requested_bytes io_flags ntstatus extra_info" +
+                   (" transfer_bytes" if transfer else ""), "decoded operation record")
+            if transfer:
+                uint(r["transfer_bytes"], 0xffffffff)
+            if r["issuing_tid"] is not None:
+                uint(r["issuing_tid"], 0xffffffff)
         n = uint(r["record_ordinal"], common["records_seen"])
-        check(r["status"] == "decoded" and uint(r["version"]) == 3 and uint(r["pointer_bytes"]) in (4, 8), "unqualified native record")
+        check(r["status"] == "decoded" and uint(r["version"]) == (2 if fault else 3) and
+              uint(r["pointer_bytes"]) in (4, 8), "unqualified native record")
         uint(r["logger_id"], 0xffff)
         uint(r["opcode"], 255)
-        if r["issuing_tid"] is not None:
-            uint(r["issuing_tid"], 0xffffffff)
         rows[n] = r
         for key in ("packet_label", "file_object_label"):
-            label = r[key]
+            label = r.get(key)
             if label is not None:
                 peer = rows[uint(label, n)]
                 check(peer[key] == label and all(peer[k] == r[k] for k in ("logger_id", "pointer_bytes")), "invalid local identity label")

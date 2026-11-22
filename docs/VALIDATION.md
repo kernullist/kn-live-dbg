@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Hard faults and reads during marked waits on 2026-11-23
+
+The public TaskbarLatency recording (`8a59fa63479e`, 10 MHz QPC) had 17
+decoded hard faults. Six intersected disk reads in four tested marker
+windows. The existing x64 reader (`2bda0417bff9`) and the packaged TDH
+helper (`f5b02c59112d`) agreed on their original record numbers, faulting
+threads, timestamps, offsets and byte counts. An independent source
+reader decoded the fault payloads and replayed the switches and ReadyThread
+events to calculate the intersections. [Source recording](#readythread-cpu-context-on-2026-11-22) · [Regression test](../tools/test-etl-fault-io.py)
+
+| Marker records | Hard-fault records | Disk rows | Disk object and byte count | Fault and logical file range | Disk overlap while waiting before ready (ms) |
+| --- | --- | --- | --- | --- | ---: |
+| 339732, 374019 | 373241, 373299 | 42, 46 | Both differ | Disjoint | 0.8752 |
+| 397312, 398477 | 398309, 398375 | 52, 53 | Both match | Equal | 3.8512 |
+| 418372, 418976 | 418389 | 55 | Both match | Equal | 3.9345 |
+| 451991, 452304 | 452145 | 56 | Both differ | Disjoint | 3.8509 |
+
+All six reads fit inside their respective fault intervals. Of 13.7015 ms
+of observed fault time across the four windows, 0.9834 ms fell outside
+the marked thread's pending disk reads. The three disk
+reads with matching fields overlapped the faults for 7.8750 ms in total,
+including 7.7857 ms waiting before ready. The logical file reads reported
+different file-object values from the faults in all six cases. A separate
+marker window returned zero faults and zero disk reads. An intervening
+marker withheld the measurement. The wait object and the effect on
+application latency remain open.
+
+On the two PerfView samples the TDH helper reproduced the recorded
+thread, QPC endpoints, offset, byte count and pointer width for 394 and
+153 faults respectively. Both selected marker windows lacked switch
+records. Each retained its independently measured zero-fault window and
+reported scheduler overlap as unavailable.
+
+The v4 file report reproduced its previous SHA-256 using its original
+adapter. With that older helper, requesting the new comparison preserved
+the independently measured disk and file results. [File operation validation](#file-operations-enclosing-disk-requests-on-2026-11-23) · [Fault and I/O query](TRACE_IMPORT.md#hard-faults-and-reads-during-a-thread-activity)
+
 ## File operations enclosing disk requests on 2026-11-23
 
 The x64 Release reader (`2bda0417bff9`), TraceProcessor Disk 1.12.10

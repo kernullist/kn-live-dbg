@@ -30,7 +30,7 @@ namespace
     {
         unsigned records = 0, faults = 0, diskRows = 0;
         ULONG error = 0;
-        bool scheduler = false, activities = false, payloads = false, interrupts = false, disk = false;
+        bool scheduler = false, activities = false, payloads = false, interrupts = false, disk = false, faultIo = false;
         unsigned first = 0, last = 0;
         std::unordered_map<uint64_t, unsigned> firstPacket, firstObject;
     };
@@ -57,6 +57,30 @@ namespace
         const auto op = h.EventDescriptor.Opcode;
         const bool file = IsEqualGUID(h.ProviderId, FileIo) != 0;
         const bool disk = IsEqualGUID(h.ProviderId, DiskIo) != 0;
+        if (c.faultIo && IsEqualGUID(h.ProviderId, PageFault) && op == 32)
+        {
+            // Read the original v2 payload independently of the production TDH field lookups.
+            const unsigned width = h.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER ? 4 : 8;
+            if (h.EventDescriptor.Id || h.EventDescriptor.Version != 2 || !e->UserData || e->UserDataLength != 24+2*width)
+            { c.error = ERROR_INVALID_DATA; return; }
+            const auto* bytes = static_cast<const uint8_t*>(e->UserData);
+            int64_t initial;
+            uint64_t offset, object = 0;
+            uint32_t tid, count;
+            std::memcpy(&initial, bytes, 8);
+            std::memcpy(&offset, bytes+8, 8);
+            std::memcpy(&object, bytes+16+width, width);
+            std::memcpy(&tid, bytes+16+2*width, 4);
+            std::memcpy(&count, bytes+20+2*width, 4);
+            try
+            {
+                auto label = object ? c.firstObject.emplace(object, c.records).first->second : 0;
+                std::printf("{\"record\":%u,\"op\":32,\"tick\":%lld,\"initial\":%lld,\"tid\":%u,\"object\":%u,\"offset\":%llu,\"size\":%u}\n",
+                    c.records, h.TimeStamp.QuadPart, initial, tid, label, offset, count);
+            }
+            catch (const std::bad_alloc&) { c.error = ERROR_NOT_ENOUGH_MEMORY; }
+            return;
+        }
         if (!(file && (op == 67 || op == 68 || op == 73 || op == 76)) && !(disk && op >= 10 && op <= 15)) { return; }
         if (h.EventDescriptor.Id != 0 || h.EventDescriptor.Version != 3) { c.error = ERROR_INVALID_DATA; return; }
         const bool narrow = (h.Flags & EVENT_HEADER_FLAG_32_BIT_HEADER) != 0;
@@ -80,6 +104,7 @@ namespace
             if ((file || op == 10 || op == 11) && !pointer(L"FileObject", object)) { return; }
             if ((op == 67 || op == 68) && (!Property(e, c, L"IoFlags", flags) || !Property(e, c, L"IoSize", size) ||
                 !Property(e, c, L"Offset", offset))) { return; }
+            if (c.faultIo && disk && (op == 10 || op == 11) && !Property(e, c, L"TransferSize", size)) { return; }
         }
         try
         {
@@ -254,10 +279,12 @@ int wmain(int argc, wchar_t** argv)
     const bool payloads = argc == 3 && std::wcscmp(argv[2], L"--marker-data") == 0;
     const bool interrupts = argc == 3 && std::wcscmp(argv[2], L"--interrupts") == 0;
     const bool disk = argc == 3 && std::wcscmp(argv[2], L"--disk-requests") == 0;
-    const bool files = argc == 5 && std::wcscmp(argv[2], L"--file-window") == 0;
+    const bool faultIo = argc == 5 && std::wcscmp(argv[2], L"--fault-file-window") == 0;
+    const bool files = faultIo || (argc == 5 && std::wcscmp(argv[2], L"--file-window") == 0);
     if ((!files && argc != 2 && (argc != 3 || (!payloads && !interrupts && !disk && std::wcscmp(argv[2], L"--scheduler") != 0 && std::wcscmp(argv[2], L"--activities") != 0))) ||
         GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) != FILE_TYPE_PIPE) { return 2; }
     Counts counts;
+    counts.faultIo = faultIo;
     if (files)
     {
         auto number = [](PCWSTR s) -> unsigned {

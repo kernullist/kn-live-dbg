@@ -1702,6 +1702,28 @@ the reason for incomplete evidence or a replay mismatch. Exit 2 covers an
 invalid package pin, a package missing the native helper or an occupied
 output path. [Fields and limits](TRACE_IMPORT.md#file-operations-enclosing-disk-requests)
 
+### Compare hard faults with disk and file reads
+
+Use the same `$query` and `$disk` from the activity wait examples. Build
+the current disk adapter for this query. `--fault-io` also collects the
+enclosing file operations. The v5 report measures overlap in QPC ticks
+and keeps the original fault, disk and file record numbers.
+
+```powershell
+$faultReport = Join-Path $PWD 'private-activity-fault-io.json'
+$receipt = python -B tools\measure-etl-activity-waits.py @query @disk --fault-io --output $faultReport | ConvertFrom-Json
+$io = (Get-Content -Raw -LiteralPath $faultReport | ConvertFrom-Json).result.fault_io
+$io.summary.comparisons | Format-Table fault_record, disk_table_row, fault_disk_object_value, disk_read_fields_match
+$io.summary.matching_disk_ticks | Format-List total, on_cpu, waiting_before_ready, ready_to_dispatch, other_off_cpu
+python -B tools\measure-etl-activity-waits.py @query @disk --fault-io --check-report $receipt.report_sha256
+```
+
+In the public TaskbarLatency recording, records 339732 and 374019 bound
+two overlapping reads with different object values. Records 397312 and
+398477 bound two reads with matching disk fields. A qualified window can
+also return zero overlaps. The receipt retains each query's status when
+a reader or evidence source is unavailable. [Fields and limits](TRACE_IMPORT.md#hard-faults-and-reads-during-a-thread-activity)
+
 ## Whole-host hunt
 
 ```text

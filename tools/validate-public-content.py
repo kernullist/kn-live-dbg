@@ -91,7 +91,7 @@ def text_views(data: bytes) -> list[str]:
 
 DISK_IO_SCHEMA = "kn.etl_disk_io.v1"
 DISK_REQUEST_SCHEMA = "kn.traceprocessor_disk_requests.v1"
-FILE_OPERATION_SCHEMAS = ("kn.traceprocessor_file_operations.v1", "kn.etl_operation_records.v1")
+FILE_OPERATION_SCHEMAS = ("kn.traceprocessor_file_operations.v1", "kn.etl_operation_records.v1", "kn.etl_fault_file_records.v1")
 FAULT_QUERY_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2", "kn.etl_hard_faults.v3", "kn.etl_activity_markers.v1",
                        "kn.etl_activity_comparison.v1", "kn.etl_activity_comparison_receipt.v1",
                        "kn.etl_activity_comparison.v2", "kn.etl_activity_comparison_receipt.v2", "kn.traceprocessor_activity_rows.v1")
@@ -103,7 +103,8 @@ HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2", "kn.own
                      for receipt in ("", "_receipt") for version in (1, 2, 3)))
 ACTIVITY_WAITS_SCHEMAS = ("kn.etl_activity_waits.v1", "kn.etl_activity_waits_receipt.v1", "kn.etl_activity_waits.v2",
                           "kn.etl_activity_waits_receipt.v2", "kn.etl_activity_waits.v3", "kn.etl_activity_waits_receipt.v3",
-                          "kn.etl_activity_waits.v4", "kn.etl_activity_waits_receipt.v4", *FILE_OPERATION_SCHEMAS,
+                          "kn.etl_activity_waits.v4", "kn.etl_activity_waits_receipt.v4", "kn.etl_activity_waits.v5", "kn.etl_activity_waits_receipt.v5",
+                          *FILE_OPERATION_SCHEMAS,
                           DISK_REQUEST_SCHEMA, "kn.traceprocessor_interrupt_window.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
 TRACE_QUERY_SCHEMAS = (*ACTIVITY_WAITS_SCHEMAS, "kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
@@ -170,7 +171,8 @@ DISK_IO_MARKERS = (DISK_IO_SCHEMA, DISK_REQUEST_SCHEMA, *FILE_OPERATION_SCHEMAS,
                    '"request_union_ticks"', '"switch_start_record"', '"gap_ticks"', '"matched_activities"', '"disk_requests_status"',
                    '"disk_scope"', '"native_pages"', '"packet_label"', '"begin_matches"', '"disk_table_row"', '"file_start_record"',
                    '"disk_rows_without_file_context"', '"matched_links"', '"file_operations_status"', '"file_record_reader_sha256"',
-                   '"table_row"', '"packet"')
+                   '"table_row"', '"packet"', '"fault_io_status"', '"fault_query"', '"fault_file_object_value"', '"fault_disk_object_value"',
+                   '"disk_overlap_ticks"', '"matching_disk_ticks"', '"waiting_before_ready"', '"faulting_tid"', '"initial"')
 HARD_FAULT_FIELDS = tuple(frozenset(keys) for keys in (
     ("fault_ordinal", "record_ordinal"), ("initial_time_raw", "faulting_thread_id"),
     ("waiting_before_ready_ticks", "unclassified_off_cpu_ticks"), ("off_cpu_intervals", "split_off_cpu_intervals"),
@@ -233,7 +235,10 @@ DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
     ("disk_rows_without_file_context", "contexts"), ("file_start_record", "disk_completion_record"),
     ("operation_ends", "matched_links"), ("file_operations_status", "report_sha256"),
     ("file_record_reader_sha256", "package_sha256"), ("table_row", "operation", "start_ns", "stop_ns"),
-    ("record", "tick", "tid", "packet", "object"),
+    ("record", "tick", "tid", "packet", "object"), ("record", "tick", "tid", "initial", "object"),
+    ("fault_io_status", "report_sha256"), ("fault_query", "native_pages"), ("disk_overlap_ticks", "matching_disk_ticks"),
+    ("fault_disk_object_value", "disk_read_fields_match"), ("fault_file_object_value", "file_byte_range"),
+    ("waiting_before_ready", "ready_to_dispatch", "on_cpu"), ("faulting_tid", "file_object_label", "initial_qpc"),
 ))
 ETL_ROTATION_MARKERS = (*ETL_ROTATION_SCHEMAS, '"expected_inventory_sha256"', '"closed_controller_inventory_verified"',
                         '"final_ordinal"', '"etl_bytes"', '"observed_bytes"')
@@ -546,7 +551,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[1234]|etl_operation_records\.v1|traceprocessor_(?:interrupt_window|disk_requests|file_operations)\.v1|owned_etl_handoff\.v[123]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[123]|etl_handoff_study(?:_receipt)?\.v4|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12345]|etl_(?:operation|fault_file)_records\.v1|traceprocessor_(?:interrupt_window|disk_requests|file_operations)\.v1|owned_etl_handoff\.v[123]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[123]|etl_handoff_study(?:_receipt)?\.v4|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

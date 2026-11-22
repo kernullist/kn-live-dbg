@@ -11,6 +11,7 @@ import tempfile
 
 from etl_activity_waits import ActivityWaits, MAX_RECORDS, candidate
 import etl_disk_waits
+import etl_fault_io
 import etl_file_operations
 import etl_interrupt_overlap
 from etl_ready_correspondence import TableBindings, correlate, key
@@ -215,11 +216,20 @@ def analyze(args, path, pin, size, reader, sdk, disk, directory, files, emit):
                 flags = [str(path), "--file-operations", str(a["header_process_id"]), str(a["header_thread_id"]), a["raw_timestamp"], b["raw_timestamp"]]
                 return read(disk[0], disk[1], flags, directory, args.timeout_ms, files)
 
-            def file_records(records):
-                flags = [str(path), pin, ",".join(map(str, records))]
+            def file_records(records, *, faults=False):
+                flags = [str(path), pin, ",".join(map(str, records)) or "-"]
+                if faults:
+                    flags.append("--include-hard-faults")
                 return read(*disk[3], flags, directory, args.timeout_ms, files)
 
             result["file_operations"] = etl_file_operations.measure(file_sdk, file_records, metadata, disk_result, aggregate.header if aggregate else None)
+            if args.fault_io:
+                def fault_window():
+                    flags = ["--etl-hard-faults", str(path), "--sha256", pin, "--activity-window", str(args.start), str(args.stop)]
+                    return read(*reader, flags, directory, args.timeout_ms, files)
+
+                result["fault_io"] = etl_fault_io.measure(fault_window, lambda ns: file_records(ns, faults=True), metadata,
+                    aggregate.header if summary is not None else None, disk_result, result["file_operations"])
     if args.interrupt_overlap:
         overlap = dict(status="native_window_unavailable", query=None, summary=None)
         if summary is not None:
@@ -232,6 +242,9 @@ def analyze(args, path, pin, size, reader, sdk, disk, directory, files, emit):
 def execute(args):
     check(os.name == "nt" and 1 <= args.timeout_ms <= 600000 and 1 <= args.page_size <= 128, "invalid Windows reader settings")
     check(not args.interrupt_overlap or args.traceprocessor, "--interrupt-overlap requires --traceprocessor")
+    if args.fault_io:
+        check(args.disk_requests, "--fault-io requires --disk-requests")
+        args.file_operations = True
     check(not args.file_operations or args.disk_requests, "--file-operations requires --disk-requests")
     args.start, args.stop = decimal(args.start), decimal(args.stop)
     check(0 < args.start < args.stop <= MAX_RECORDS, "select two increasing original ETW record numbers")
@@ -272,6 +285,9 @@ def execute(args):
             header["schema"] = "kn.etl_activity_waits.v4"
             header["disk_traceprocessor"]["tables"].extend(etl_file_operations.TABLES)
             header["qualification"]["file_scope"] = "same_issuer_and_operation_enclosing_the_full_disk_interval"
+        if args.fault_io:
+            header["schema"] = "kn.etl_activity_waits.v5"
+            header["qualification"]["fault_io_scope"] = "recorded_thread_lifetime_disk_read_overlap_and_reported_read_fields"
         outcome = {}
 
         def render(emit):
@@ -295,10 +311,13 @@ def execute(args):
         receipt.update(schema="kn.etl_activity_waits_receipt.v3", disk_requests_status=outcome["disk_requests"]["status"])
     if args.file_operations:
         receipt.update(schema="kn.etl_activity_waits_receipt.v4", file_operations_status=outcome["file_operations"]["status"])
+    if args.fault_io:
+        receipt.update(schema="kn.etl_activity_waits_receipt.v5", fault_io_status=outcome["fault_io"]["status"])
     return receipt, int(result == "mismatch" or outcome["status"] != "accounted" or outcome["traceprocessor_status"] == "unconfirmed" or
                         (args.interrupt_overlap and receipt["interrupt_overlap_status"] != "measured") or
                         (args.disk_requests is not None and receipt["disk_requests_status"] != "measured") or
-                        (args.file_operations and receipt["file_operations_status"] not in ("compared", "no_disk_requests")))
+                        (args.file_operations and receipt["file_operations_status"] not in ("compared", "no_disk_requests")) or
+                        (args.fault_io and receipt["fault_io_status"] != "compared"))
 
 
 def main():
@@ -312,6 +331,7 @@ def main():
     p.add_argument("--disk-requests", nargs=2, metavar=("DISK_ADAPTER_ZIP", "SHA256"),
                    help="bind disk request endpoints and measure their overlap with the thread's scheduler states")
     p.add_argument("--file-operations", action="store_true", help="compare enclosing file operations with original FileIo and DiskIo records")
+    p.add_argument("--fault-io", action="store_true", help="compare hard faults with disk and file reads and measure their overlap during scheduler waits")
     p.add_argument("--page-size", type=int, default=128)
     p.add_argument("--timeout-ms", type=int, default=240000)
     dest = p.add_mutually_exclusive_group(required=True)

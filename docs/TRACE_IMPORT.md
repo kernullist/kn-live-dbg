@@ -1116,6 +1116,51 @@ measured zero in the selected window. The file query leaves the original
 disk and scheduler results available when its own evidence is incomplete.
 [Command and replay](COMMAND_REFERENCE.md#compare-enclosing-file-operations) · [Measured coverage](VALIDATION.md#file-operations-enclosing-disk-requests-on-2026-11-23)
 
+### Hard faults and reads during a thread activity
+
+`--fault-io` compares each timed hard fault with each pending disk read
+issued by the marked thread. The native fault window must reproduce the
+scheduler's markers, recorded thread lifetime, clock and loss accounting.
+Each comparison requires a positive QPC intersection inside the markers.
+The report includes all such disk reads, including those with no enclosing
+file read. It also lists the faults and disk rows with no overlap.
+[Hard-fault event fields](https://learn.microsoft.com/en-us/windows/win32/etw/pagefault-hardfault)
+
+Windows TDH decodes the selected original records together so their
+reported file-object values can be compared within one logger and pointer
+width. Raw addresses stay inside the reader. The report preserves the
+disk result separately from each enclosing file result.
+
+| Field | Evidence required for a match |
+| --- | --- |
+| `disk_read_fields_match` | The complete disk read fits inside the fault interval and its completion record precedes the fault record. The reported object values and positive transfer byte counts agree. |
+| `file_read_fields_match` | The complete file read fits inside the fault interval and ends before the fault record. It has paging and synchronous-paging flags, NTSTATUS zero, an equal reported object value and the same nonempty file offset range using bytes actually read. |
+
+`file_byte_range` distinguishes equal, containing, partially overlapping
+and disjoint byte ranges. Missing or unusable evidence gives a null match
+when no other field establishes a difference. Distinct pointer widths are
+reported explicitly. The disk byte offset describes a physical disk
+location. This comparison uses the FileIo offset and the hard fault's read
+offset for the logical range. [DiskIo transfer fields](https://learn.microsoft.com/en-us/windows/win32/etw/diskio-typegroup1) · [FileIo transfer fields](https://learn.microsoft.com/en-us/windows/win32/etw/fileio-readwrite)
+
+`disk_overlap_ticks` gives the union of the fault/disk intersections.
+`fault_ticks_without_disk_read` gives the rest of the marked thread's
+observed hard-fault time inside the markers.
+`matching_disk_ticks` and `matching_file_ticks` give the respective unions
+for confirmed field matches. Each total is partitioned by scheduler state.
+Concurrent reads, nested file reads and overlapping faults contribute once
+to each applicable total. An unavailable file query leaves the file total
+null and preserves qualified disk comparisons. A missing scheduler window
+retains the separate hard-fault query and its source records. These observations locate
+I/O during waits. Attributing a wait to a specific object or measuring
+its effect on application completion requires additional evidence.
+
+The native fault window admits up to 128 faults. The comparison admits
+128 overlapping disk/file combinations across those faults, counting a
+disk-only comparison once. Each TDH batch selects up to 128 distinct
+source records. A measured zero still requires complete native coverage.
+[Command and replay](COMMAND_REFERENCE.md#compare-hard-faults-with-disk-and-file-reads) · [Measured coverage](VALIDATION.md#hard-faults-and-reads-during-marked-waits-on-2026-11-23)
+
 ## Saved V8 CPU profiles
 
 The trace query reads the Windows V8 profiler log emitted by Node.js

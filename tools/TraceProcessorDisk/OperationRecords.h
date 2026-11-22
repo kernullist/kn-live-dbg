@@ -1,6 +1,7 @@
 #pragma once
 
 #include "../../user/EtlDiskIo.h"
+#include "../../user/EtlHardFault.h"
 #include <tdh.h>
 #include <vector>
 #pragma comment(lib, "tdh.lib")
@@ -14,11 +15,11 @@ namespace etl_profile
     struct OperationRecord
     {
         const wchar_t* status = L"not_observed";
-        bool file = false;
+        bool file = false, fault = false;
         uint8_t opcode = 0, width = 0;
         uint16_t logger = 0;
         uint32_t number = 0, tid = 0, requested = 0, flags = 0, ntstatus = 0;
-        int64_t timestamp = 0;
+        int64_t timestamp = 0, initial = 0;
         uint64_t packet = 0, object = 0, offset = 0, extra = 0;
 
         static bool Property(PEVENT_RECORD e, PCWSTR name, ULONG bytes, void* out)
@@ -31,21 +32,29 @@ namespace etl_profile
                 TdhGetProperty(e, 0, nullptr, 1, &field, bytes, static_cast<PBYTE>(out)) == ERROR_SUCCESS;
         }
 
-        void Read(PEVENT_RECORD e, uint32_t record)
+        void Read(PEVENT_RECORD e, uint32_t record, bool includeFaults)
         {
             number = record;
             const auto& h = e->EventHeader;
             opcode = h.EventDescriptor.Opcode;
             file = IsEqualGUID(h.ProviderId, FileIoProvider) != 0;
+            fault = includeFaults && IsEqualGUID(h.ProviderId, PageFaultProvider) && opcode == 32;
             const bool disk = IsEqualGUID(h.ProviderId, DiskIoProvider) != 0;
             const bool transfer = opcode == 67 || opcode == 68;
             status = L"other_event";
-            if (!(file && (transfer || opcode == 73 || opcode == 76)) && !(disk && opcode >= 10 && opcode <= 15)) { return; }
+            if (!fault && !(file && (transfer || opcode == 73 || opcode == 76)) && !(disk && opcode >= 10 && opcode <= 15)) { return; }
             status = L"unsupported_record";
-            width = ClassicPointerWidth(h, 3);
+            width = ClassicPointerWidth(h, fault ? 2 : 3);
             if (!width || !e->UserData || (e->ExtendedDataCount && !e->ExtendedData)) { return; }
             timestamp = h.TimeStamp.QuadPart;
             logger = e->BufferContext.LoggerId;
+            if (fault)
+            {
+                if (Property(e, L"InitialTime", 8, &initial) && Property(e, L"ReadOffset", 8, &offset) &&
+                    Property(e, L"FileObject", width, &object) && Property(e, L"TThreadId", 4, &tid) &&
+                    Property(e, L"ByteCount", 4, &requested)) { status = L"decoded"; }
+                return;
+            }
             if (!Property(e, file ? L"IrpPtr" : L"Irp", width, &packet)) { return; }
             if (file && opcode == 76)
             {
@@ -55,6 +64,7 @@ namespace etl_profile
             {
                 if (!Property(e, file ? L"TTID" : L"IssuingThreadId", 4, &tid)) { return; }
                 if ((file || opcode == 10 || opcode == 11) && !Property(e, L"FileObject", width, &object)) { return; }
+                if (includeFaults && disk && (opcode == 10 || opcode == 11) && !Property(e, L"TransferSize", 4, &requested)) { return; }
                 if (file && transfer && (!Property(e, L"Offset", 8, &offset) || !Property(e, L"IoSize", 4, &requested) ||
                     !Property(e, L"IoFlags", 4, &flags))) { return; }
             }
