@@ -1191,19 +1191,10 @@ int RunEtlCapabilityProbe(const std::vector<std::wstring>& args, const std::wstr
     const auto selector = [](const std::wstring& arg) { return _wcsicmp(arg.c_str(), L"--probe-etl") == 0; };
     if (args.size() != 4 || !selector(args[0]) || args[1].empty() || args[2] != L"--sha256" || !Digest(args[3], probe.ExpectedSha256))
     {
-        const auto sink = GetStdHandle(STD_ERROR_HANDLE);
-        const bool disk = GetFileType(sink) == FILE_TYPE_DISK;
-        std::vector<DistinctArtifactInput> guards(disk ? std::count_if(args.begin(), args.end(), selector) : 0);
-        if (disk)
-        {
-            size_t guard = 0;
-            for (size_t i = 0; i + 1 < args.size(); ++i)
-            {
-                if (selector(args[i]) && !guards[guard++].Hold(sink, args[i + 1])) { return 2; }
-            }
-        }
-        std::wcerr << L"usage: KnLiveDbg.exe --capabilities --probe-etl <local.etl> --sha256 <digest>\n";
-        return 2;
+        return WriteWithDistinctSelectedInputs(STD_ERROR_HANDLE, args, selector, [] {
+            std::wcerr << L"usage: KnLiveDbg.exe --capabilities --probe-etl <local.etl> --sha256 <digest>\n";
+            return 2;
+        });
     }
     return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[1], [&] {
         ProbeSavedEtl(args[1], probe);

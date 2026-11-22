@@ -37,6 +37,8 @@ struct EtlCapabilityCoverage
 
 struct SavedEtlCapabilityProbe
 {
+    static constexpr auto Scope = L"saved_etl_probe";
+    static constexpr auto AvailabilityScope = L"supplied_etl_record_family";
     std::wstring ExpectedSha256, SourceSha256;
     uint64_t SourceBytes = 0;
     const wchar_t* Status = L"source_unavailable";
@@ -90,6 +92,11 @@ struct SavedEtlCapabilityProbe
             L",\"first_decoded_record\":" + (records->Decoded ? std::to_wstring(records->FirstDecodedRecord) : L"null") +
             L",\"first_payload_bytes\":" + (records->Decoded ? std::to_wstring(records->FirstPayloadBytes) : L"null") +
             L",\"first_payload_sha256\":" + (records->FirstPayloadSha256.empty() ? L"null" : mcpjson::Quote(records->FirstPayloadSha256)) + L"}";
+    }
+
+    std::wstring EvidenceJson(std::wstring_view operation) const
+    {
+        return L",\"record_evidence\":" + RecordsJson(operation);
     }
 
     std::wstring Json() const

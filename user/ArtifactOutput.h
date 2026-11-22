@@ -34,6 +34,20 @@ private:
     std::unique_ptr<void, decltype(&CloseHandle)> Input{ nullptr, &CloseHandle };
 };
 
+template<class Select, class Write>
+int WriteWithDistinctSelectedInputs(DWORD stream, const std::vector<std::wstring>& args, Select selector, Write write)
+{
+    const auto sink = GetStdHandle(stream);
+    if (GetFileType(sink) != FILE_TYPE_DISK) { return write(); }
+    std::vector<DistinctArtifactInput> inputs(std::count_if(args.begin(), args.end(), selector));
+    size_t guard = 0;
+    for (size_t i = 0; i + 1 < args.size(); ++i)
+    {
+        if (selector(args[i]) && !inputs[guard++].Hold(sink, args[i + 1])) { return 2; }
+    }
+    return write();
+}
+
 template<class Write>
 int WriteWithDistinctInput(DWORD stream, const std::wstring& name, Write write)
 {

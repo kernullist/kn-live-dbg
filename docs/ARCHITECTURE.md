@@ -67,6 +67,28 @@ buffer accounting and reported loss limit both availability claims to
 the separate live invocation. The private saved report records
 `target_probed=false` and leaves platform regression and event semantics open.
 
+The standalone `--capabilities --probe-dump` uses one read-only handle to a
+local AMD64 full dump. It leases the parent directories and rejects reparse
+points and files marked offline or recall-on-access before reading data. It verifies the SHA-256 of the complete 8,192-byte
+header before interpreting the physical runs or following a list pointer.
+`kn.dump_capability_probe.v1` carries the original initialization receipts
+and the paging depth selected from the saved evidence. A mismatch stops after
+the header read. The cost of pinning is independent of file size.
+
+The `memory/read_virtual/dump` row describes one subsequent typed read of
+1–4,096 bytes. It reports each page walk, sparse span offsets and digests,
+physical-read charges and any underlying Win32 read failures. The reader
+checks the open file identity again after the sample. A complete sample can
+be compared with a caller-supplied digest. In default mode the second read
+must also reproduce the 16-byte list head whose forward and backward links
+were checked at initialization. When saved context independently qualifies
+the paging depth, missing neighbors leave a fully read head inconclusive and
+contradictory links fail the check. If depth qualification fails, sampling
+stops at initialization. A caller-selected range leaves semantic validation
+unprobed. The private report retains `target_probed=false`.
+Dump producer authenticity, CPU access permissions and platform regression
+require independent evidence.
+
 The owned read also publishes a `process_read_set` from the shared recorder
 described below. Its single receipt is the same observation as `process_read`;
 the probe does not reread the control range to construct evidence.

@@ -7,6 +7,53 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved dump capability probes on 2026-11-22
+
+The x64 Release CLI completed 66 invocations on synthetic AMD64 full dumps.
+Independent fixture bytes supplied the expected SHA-256 for every complete
+sample, including a list head split across two pages. LA48 and LA57 fixtures
+exercised 4 KiB, 2 MiB and 1 GiB mappings. An explicit range crossing into
+a missing run retained eight observed bytes and eight missing bytes. A
+nonpresent page-table entry, a noncanonical range and a Windows byte-range
+lock produced distinct results. The locked read retained Win32 error 33.
+Replacing payload bytes while keeping the same header changed the sample
+digest. A wrong header digest stopped after exactly one read.
+
+Default list checks covered matched reciprocal links, contradictory links
+and missing neighbors. The last two had a complete sample and an independent
+saved paging context. An explicit range at the same address qualified only
+the bytes. Short headers, ambiguous depth, conflicting context, sharing
+violations, a directory junction, a file marked offline and output hard links
+also exercised the published CLI. The hard-link tests opened append handles
+so the subprocess itself had to preserve each input.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/validate-dump-source.ps1
+# Set $fixtures to the run directory printed by the harness.
+python tools/test-dump-capabilities.py --exe x64/Release/KnLiveDbg.exe --fixtures $fixtures
+```
+
+The dump-source harness passed 166 checks each in Release and AddressSanitizer.
+A focused build of the production dump probe passed 40 instrumented CLI calls.
+MSVC ASan reported its known unsupported host interceptor and continued with
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1`. The existing dump CLI passed
+227 checks. Its final-file symbolic-link case required a Windows privilege
+unavailable to this run. The separate junction test ran. Initialization
+receipt and runtime capability regressions passed. The Release link emitted
+the existing C4744 warning for `KmonHuntIndex::NextQueryEpoch`.
+
+The compiled inventory and the SimpleAllocator ETL capability report matched
+their prechange outputs byte for byte. The 23-record ETL control agreed with
+Windows `tracerpt`. Matrix generation matched all 61 compiled contracts and
+261 command routes. The linked command and console self-tests passed 3,083
+and 570 checks. All 32 public-content test groups passed, including detached
+sparse ranges and their translations.
+
+This evidence covers the offline file decoder and its selected ranges. A
+header digest establishes the header bytes only. Independent capture
+provenance, a real LA57 target, CPU permissions and regression on other
+Windows builds or security configurations remain open.
+
 ## Evidence-checked wait claims on 2026-11-22
 
 This P15 checkpoint used saved Windows Wait Chain Traversal receipts from

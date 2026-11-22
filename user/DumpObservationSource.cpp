@@ -12,7 +12,7 @@ namespace
 {
     constexpr uint64_t PhysicalMask = 0x000ffffffffff000ull;
     constexpr uint64_t PageBytes = 4096;
-    static_assert(kCrashDumpHeaderBytes == 8192, "initialization byte ceiling assumes a complete dump header");
+    static_assert(kCrashDumpHeaderBytes == DumpInitializationObservation::HeaderBytes, "initialization byte ceiling assumes a complete dump header");
 
     struct Run
     {
@@ -66,7 +66,7 @@ namespace
             }
         }
 
-        bool Open(const std::wstring& path, DumpInitializationObservation* init)
+        bool Open(const std::wstring& path, DumpInitializationObservation* init, bool localDataOnly)
         {
             const auto reject = [&](const wchar_t* reason, std::optional<DWORD> status = std::nullopt)
             {
@@ -90,7 +90,7 @@ namespace
                 return reject(L"path_rejected");
             }
             Handle = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+                FILE_FLAG_RANDOM_ACCESS | FILE_FLAG_OPEN_REPARSE_POINT | (localDataOnly ? FILE_FLAG_OPEN_NO_RECALL : 0), nullptr);
             if (init) { init->OpenStatus = Handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS; }
             if (Handle == INVALID_HANDLE_VALUE) { return reject(L"file_open_failed"); }
             if (init) { SetLastError(ERROR_SUCCESS); }
@@ -103,6 +103,8 @@ namespace
             if (!GetFileInformationByHandle(Handle, &Identity)) { return reject(L"file_identity_unavailable", GetLastError()); }
             if (Identity.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
             { return reject(L"unsupported_file_attributes"); }
+            constexpr DWORD recall = FILE_ATTRIBUTE_OFFLINE | FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
+            if (localDataOnly && (Identity.dwFileAttributes & recall)) { return reject(L"data_recall_required"); }
             Size = (uint64_t(Identity.nFileSizeHigh) << 32) | Identity.nFileSizeLow;
             FILETIME created{}, exited{}, kernel{}, user{};
             if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
@@ -475,7 +477,7 @@ DumpReadObservation DumpObservationSource::ReadWithReceipts(const ObservationRea
     root.TargetId = Caps.SourceId;
     root.AddressSpaceId = Caps.SourceId + L":virtual";
     root.RootId = Caps.SourceId + L":root";
-    root.Binding = FileHandleBound ? L"dump_header_and_open_handle" : L"caller_declared_dump_root";
+    root.Binding = FileIdentityMatches ? L"dump_header_and_open_handle" : L"caller_declared_dump_root";
     root.Root = Root;
     root.Epoch = 1; // A reopened file receives a different SourceId.
     root.Space = Caps.AddressSpace;
@@ -538,7 +540,7 @@ DumpReadObservation DumpObservationSource::ReadWithReceipts(const ObservationRea
 }
 
 std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstring& path, std::wstring* error,
-    DumpInitializationObservation* initialization)
+    DumpInitializationObservation* initialization, std::wstring_view expectedHeaderSha256)
 {
     if (initialization) { *initialization = {}; }
     std::wstring ignored;
@@ -553,8 +555,12 @@ std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstr
         *error = explanation;
         return {};
     };
+    if (!expectedHeaderSha256.empty() && !initialization)
+    {
+        return reject(L"header_pin_requires_receipt", L"a pinned header requires an initialization receipt");
+    }
     auto file = std::make_shared<DumpFile>();
-    if (!file->Open(path, initialization)) { return {}; }
+    if (!file->Open(path, initialization, !expectedHeaderSha256.empty())) { return {}; }
     if (initialization)
     {
         initialization->SourceId = file->Id;
@@ -569,6 +575,18 @@ std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstr
     {
         return reject(L"header_read_incomplete", L"unsupported or inaccessible dump file");
     }
+    if (!expectedHeaderSha256.empty())
+    {
+        const auto* digest = initialization->CompleteHeaderSha256();
+        if (!digest)
+        {
+            return reject(L"header_digest_unavailable", L"unable to verify the dump header digest");
+        }
+        if (*digest != expectedHeaderSha256)
+        {
+            return reject(L"header_digest_mismatch", L"dump header digest differs from the supplied digest");
+        }
+    }
     DUMP_HEADER64 header{};
     static_assert(sizeof(header) == kCrashDumpHeaderBytes, "dump header size");
     std::memcpy(&header, bytes.data(), sizeof(header));
@@ -580,6 +598,7 @@ std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstr
     {
         return reject(L"unsupported_header", L"unsupported or inaccessible dump file");
     }
+    if (initialization) { initialization->HeaderModuleList = header.PsLoadedModuleList; }
     uint64_t offset = kCrashDumpHeaderBytes, pages = 0;
     for (uint32_t i = 0; i < block.NumberOfRuns; ++i)
     {
@@ -678,6 +697,11 @@ std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstr
     error->clear();
     auto source = std::make_unique<DumpObservationSource>(file->Id, header.DirectoryTableBase, levels, reader,
         [file](uint64_t address, uint32_t length) { return file->PhysicalObserved(address, length); });
-    source->FileHandleBound = true;
+    source->FileIdentityMatches = [file](uint32_t& status) {
+        DWORD win32 = ERROR_SUCCESS;
+        const bool matched = file->Unchanged(&win32);
+        status = win32;
+        return matched;
+    };
     return source;
 }

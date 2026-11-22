@@ -100,6 +100,18 @@ int wmain(int argc, wchar_t** argv)
     Check(CompareSavedCrashContext(10, 20, 0, 20) == false &&
         CompareSavedCrashContext(10, 20, 10, 0) == false,
         "a successful zero return disagrees with a nonzero saved coordinate");
+    DumpInitializationObservation initDigest;
+    Check(!initDigest.CompleteHeaderSha256(), "an unattempted header has no digest");
+    auto& headerRead = initDigest.Reads.emplace_back();
+    headerRead.RequestedBytes = initDigest.HeaderBytes;
+    headerRead.Sha256.assign(64, L'a');
+    headerRead.DigestBytes = 7;
+    Check(!initDigest.CompleteHeaderSha256(), "a failed short transfer keeps its prefix digest in the original receipt only");
+    headerRead.State = ObservationReadState::Complete;
+    Check(!initDigest.CompleteHeaderSha256(), "a short hash input cannot pin a complete header");
+    headerRead.DigestBytes = initDigest.HeaderBytes;
+    Check(initDigest.CompleteHeaderSha256() && *initDigest.CompleteHeaderSha256() == headerRead.Sha256,
+        "the complete header receipt supplies the pin");
     const std::filesystem::path root(argv[1]);
     std::wstring error;
     unsigned callbackCalls = 0;
@@ -124,6 +136,10 @@ int wmain(int argc, wchar_t** argv)
         !original && parserBytes.empty() && callbackCalls == callsBeforeRejection,
         "invalid exact request clears stale evidence before any source call");
     DumpObservationSource invalid(L"synthetic:invalid", 0x1000, 0, emptyPage);
+    uint32_t identityStatus = 0;
+    Check(!invalid.RevalidateFileIdentity(identityStatus).has_value(), "a callback source has no file identity check");
+    Check(!OpenDumpObservationSource((root / L"absent.dmp").wstring(), &error, nullptr, headerRead.Sha256) &&
+        error == L"a pinned header requires an initialization receipt", "a pin cannot bypass its recorder");
     callbackCalls = 0;
     Check(invalid.ReadWithReceipts(declaredRequest).Result.State == ObservationReadState::IdentityChanged && callbackCalls == 0,
         "unqualified recorded source fails before allocating an operation or reading");

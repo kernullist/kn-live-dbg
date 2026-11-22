@@ -80,13 +80,44 @@ that family. A failed pin or scan gives `unavailable` and null record evidence.
 The file hash identifies the bytes. Producer authenticity and the target
 environment still require independent evidence.
 
-The saved probe exits 0 for a stable scan with matching buffer totals and no
+The ETL probe exits 0 for a stable scan with matching buffer totals and no
 reported loss, including a file containing neither family. Exit 1 covers a
 coverage gap or an unusable source. Exit 2 covers syntax and output errors,
 including a redirected output whose identity cannot be separated from the input.
 Restricted launches reject this named-file operation. A rejection with a named
 ETL returns its exit code silently when standard output points to disk, since
 checking a possible file alias would require opening a named input.
+
+For a saved AMD64 full dump, `--probe-dump` takes the SHA-256 of the first
+8,192 bytes. Use the header digest recorded with the capture when available.
+The following PowerShell example computes the digest locally for a repeatable
+read and checks the 16-byte module list head declared by the header.
+
+```powershell
+$dump = (Get-Item -LiteralPath .\case.dmp).FullName
+$pin = python -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read(8192)).hexdigest())" $dump
+$report = & .\x64\Release\KnLiveDbg.exe --capabilities --probe-dump $dump --header-sha256 $pin | ConvertFrom-Json
+$report.capabilities | Where-Object { $_.operation -eq 'read_virtual' -and $_.backend -eq 'dump' } |
+    Select-Object availability, probe_stages, range_evidence
+```
+
+Add `--range <hex-va> <decimal-length>` to read 1 through 4,096 bytes at an
+explicit virtual address. The optional trailing `--expect-sha256 <digest>`
+compares the complete sample with known bytes. Hex input accepts either case.
+The header pin covers the header alone. The sample hash and each span hash
+identify bytes read from the selected range. The default list control also
+checks reciprocal links using the selected paging depth. An explicit address
+has no object semantics, even when its digest matches.
+
+Exit 0 qualifies the selected range. Exit 1 includes a header mismatch,
+unusable source, sparse range, incomplete list control or sample digest
+mismatch. Exit 2 indicates invalid arguments or an output failure. A range
+with holes retains the offset, length and original state for each span.
+`range_evidence` is null when the source or default range could not be
+qualified for a read. Named dumps use the same restricted-launch and
+output-alias protections as named ETLs. These checks apply to writes by the
+running command. A shell can truncate its destination before launch. Saved
+dump reports are private.
 
 `process_handles_acquired` and `process_handles_closed` count successful
 Windows calls during the self-probe. A failed close retains its acquisition

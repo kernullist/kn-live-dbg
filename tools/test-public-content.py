@@ -405,6 +405,25 @@ class PublicContentTests(unittest.TestCase):
                 self.assertTrue(AUDIT.inspect("renamed.log", ("banner\n" + json.dumps([obj])[:-1]).encode(encoding)))
         self.assertFalse(AUDIT.inspect("manual.md", b"Use kn.wait_investigation.v1 to check evidence_ids."))
 
+    def test_saved_dump_probe_exports(self):
+        scope = dict(schema="kn.capabilities.v1", target_probed=False, scope="saved_dump_probe")
+        metadata = dict(status="header_digest_mismatch", schema="kn.dump_capability_probe.v1")
+        rows = (dict(expected_header_sha256="1" * 64, digest_scope="first_8192_bytes"),
+                dict(availability_scope="supplied_dump_virtual_range", range_evidence=None),
+                dict(range_state="partial", captured_bytes=8, unobserved_bytes=8),
+                dict(range_offset=8, state="complete", span_sha256="a" * 64),
+                dict(range_offset=0, translation_state="unsupported", translation_reason="reserved_paging_entry_bits"),
+                dict(physical_read_sequence=9, native_status_domain="win32", win32_status=33))
+        for encoding in ("utf-8", "utf-16", "utf-16-be", "utf-16-le"):
+            for obj in (scope, metadata):
+                rules = {f["rule"] for f in AUDIT.inspect("renamed.log", ("log\n" + json.dumps(obj)[:-1]).encode(encoding))}
+                self.assertIn("private-runtime-probe", rules)
+            for row in (*rows, scope, metadata):
+                for indent in (None, 2):
+                    fragment = "log\n" + json.dumps(dict(export=[row]), indent=indent)[:-3]
+                    self.assertTrue(AUDIT.inspect("transcript.txt", fragment.encode(encoding)))
+        self.assertFalse(AUDIT.inspect("manual.md", b"saved_dump_probe reports a range_state and span_sha256."))
+
     def test_dump_initialization_exports(self):
         receipt = dict(purpose="list_head", candidate_levels=4, file_offset="32", requested_bytes=8)
         metadata = dict(decision="depth_ambiguous", schema="kn.dump_initialization.v1")

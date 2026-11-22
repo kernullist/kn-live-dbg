@@ -226,21 +226,22 @@ inline const wchar_t* SourceCommandRoute(CommandSupport support)
 
 // Serialization never probes a target. Runtime observations must be supplied
 // explicitly; compiled implementation alone is not availability or validation.
+template<class SavedProbe>
 inline std::wstring RenderSourceCapabilities(const std::wstring& binaryVersion, const RuntimeCapabilityProbe* probe,
-    const SavedEtlCapabilityProbe* etl)
+    const SavedProbe* saved)
 {
     const auto quote = [](const std::wstring& value)
     {
         return L"\"" + mcpjson::Escape(value) + L"\"";
     };
     std::wostringstream out;
-    out << L"{\"schema\":\"kn.capabilities.v1\",\"scope\":" << quote(etl ? L"saved_etl_probe" : probe ? L"runtime_probe" : L"compiled_contract") << L","
+    out << L"{\"schema\":\"kn.capabilities.v1\",\"scope\":" << quote(saved ? SavedProbe::Scope : probe ? L"runtime_probe" : L"compiled_contract") << L","
         << L"\"inventory_complete\":false,\"binary_version\":" << quote(binaryVersion)
         << L",\"driver_abi\":" << KNDBG_ABI_VERSION
         << L",\"architecture\":\"x64\",\"target_probed\":" << (probe != nullptr ? L"true" : L"false") << L","
         << L"\"target\":{\"os_build\":null,\"security_state\":\"unknown\","
         << L"\"virtual_address_bits\":null,\"validation\":\"not_performed\"},";
-    if (etl) { out << L"\"probe\":" << etl->Json() << L","; }
+    if (saved) { out << L"\"probe\":" << saved->Json() << L","; }
     out << L"\"capabilities\":[";
     bool first = true;
     for (const auto& capability : SourceCapabilities())
@@ -249,7 +250,7 @@ inline std::wstring RenderSourceCapabilities(const std::wstring& binaryVersion, 
         const bool unsampledProcessOperation = std::wstring(capability.Backend) == L"process_handle" &&
             (std::wstring(capability.Domain) != L"memory" || std::wstring(capability.Operation) != L"read_virtual");
         const auto* contractProbe = unsampledProcessOperation ? nullptr : probe;
-        const bool etlOperation = etl && etl->Covers(capability.Domain, capability.Operation, capability.Backend);
+        const bool sampled = saved && saved->Covers(capability.Domain, capability.Operation, capability.Backend);
         if (!first)
         {
             out << L",";
@@ -259,15 +260,15 @@ inline std::wstring RenderSourceCapabilities(const std::wstring& binaryVersion, 
             << L",\"operation\":" << quote(capability.Operation)
             << L",\"backend\":" << quote(capability.Backend)
             << L",\"implementation\":" << quote(capability.Implementation)
-            << L",\"availability\":" << quote(etlOperation ? etl->Availability(capability.Operation) :
+            << L",\"availability\":" << quote(sampled ? saved->Availability(capability.Operation) :
                 CapabilityAvailability(capability.Implementation, capability.Backend, contractProbe))
-            << L",\"availability_scope\":" << quote(etlOperation ? L"supplied_etl_record_family" : etl ? L"not_probed" : probe == nullptr ? L"none" :
+            << L",\"availability_scope\":" << quote(sampled ? SavedProbe::AvailabilityScope : saved ? L"not_probed" : probe == nullptr ? L"none" :
                 contractProbe == nullptr ? L"not_probed" :
                 std::wstring(capability.Backend) == L"process_handle" ? L"owned_control_range_only" :
                 std::wstring(capability.Backend) == L"native" ? (probe->NativeProbeAttempted ? L"connection_contract_only" : L"launch_policy") : L"not_probed")
             << L",\"validation\":\"not_performed_for_target_environment\""
-            << L",\"probe_stages\":" << (etlOperation ? etl->StagesJson(capability.Operation) : CapabilityProbeStagesJson(capability.Backend, contractProbe));
-        if (etlOperation) { out << L",\"record_evidence\":" << etl->RecordsJson(capability.Operation); }
+            << L",\"probe_stages\":" << (sampled ? saved->StagesJson(capability.Operation) : CapabilityProbeStagesJson(capability.Backend, contractProbe));
+        if (sampled) { out << saved->EvidenceJson(capability.Operation); }
         out << L",\"address_contract\":" << quote(CapabilityAddressContract(capability.Domain, capability.Operation, capability.Backend))
             << L",\"consistency\":" << quote(capability.Consistency)
             << L",\"requirements\":" << quote(capability.Requirements)
@@ -297,7 +298,7 @@ inline std::wstring RenderSourceCapabilities(const std::wstring& binaryVersion, 
 
 inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion, const RuntimeCapabilityProbe* probe = nullptr)
 {
-    return RenderSourceCapabilities(binaryVersion, probe, nullptr);
+    return RenderSourceCapabilities<SavedEtlCapabilityProbe>(binaryVersion, probe, nullptr);
 }
 
 inline std::wstring SourceCapabilitiesJson(const std::wstring& binaryVersion, const SavedEtlCapabilityProbe& etl)

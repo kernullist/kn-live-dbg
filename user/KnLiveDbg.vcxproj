@@ -135,6 +135,7 @@
     <ClCompile Include="HvPostureScanner.cpp" />
     <ClCompile Include="DumpAnalyzer.cpp" />
     <ClCompile Include="DumpObservationSource.cpp" />
+    <ClCompile Include="SavedDumpCapability.cpp" />
     <ClCompile Include="DmaPostureScanner.cpp" />
     <ClCompile Include="InputStackScanner.cpp" />
     <ClCompile Include="IntegrityScanner.cpp" />
@@ -472,6 +473,7 @@
     <ClInclude Include="ArtifactOutput.h" />
     <ClInclude Include="EtlProfile.h" />
     <ClInclude Include="SavedEtlCapability.h" />
+    <ClInclude Include="SavedDumpCapability.h" />
     <ClInclude Include="EtlProfileRecord.h" />
     <ClInclude Include="EtlThreadEvidence.h" />
     <ClInclude Include="EtlImageEvidence.h" />

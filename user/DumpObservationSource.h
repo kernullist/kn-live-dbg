@@ -5,6 +5,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <string_view>
 
 using DumpPhysicalReader = std::function<ObservationReadState(uint64_t, uint32_t, std::vector<uint8_t>*)>;
 using DumpObservedPhysicalReader = std::function<ObservationReadResult(uint64_t, uint32_t)>;
@@ -48,9 +49,10 @@ struct DumpInitializationObservation
     // The aligned 16-byte head can span two pages. Its two 8-byte
     // neighbors use one page each. Each page needs at most levels+1 reads.
     static constexpr uint32_t MaxReads = 1 + 4 * (4 + 1) + 4 * (5 + 1);
-    static constexpr uint32_t MaxRequestedBytes = 8192 + (4 * (4 + 5) * 8) + 2 * (16 + 8 + 8);
+    static constexpr uint32_t HeaderBytes = 8192;
+    static constexpr uint32_t MaxRequestedBytes = HeaderBytes + (4 * (4 + 5) * 8) + 2 * (16 + 8 + 8);
     std::wstring SourceId;
-    std::optional<uint64_t> FileBytes;
+    std::optional<uint64_t> FileBytes, HeaderModuleList;
     const wchar_t* Decision = L"source_unavailable";
     const wchar_t* Probe4 = L"not_attempted";
     const wchar_t* Probe5 = L"not_attempted";
@@ -60,6 +62,14 @@ struct DumpInitializationObservation
     bool RecordingComplete = true;
     std::vector<DumpInitializationRead> Reads;
     std::vector<DumpInitializationProbeRead> ProbeReads;
+
+    const std::wstring* CompleteHeaderSha256() const
+    {
+        if (Reads.empty()) { return nullptr; }
+        const auto& header = Reads.front();
+        return header.State == ObservationReadState::Complete && header.RequestedBytes == HeaderBytes &&
+            header.DigestBytes == HeaderBytes && !header.Sha256.empty() ? &header.Sha256 : nullptr;
+    }
 };
 
 struct DumpAddressTranslation
@@ -79,22 +89,27 @@ public:
     DumpObservationSource(std::wstring sourceId, uint64_t root, uint32_t pagingLevels,
         DumpPhysicalReader reader, DumpObservedPhysicalReader observedReader = {});
     const ObservationSourceCapabilities& Capabilities() const override;
+    std::optional<bool> RevalidateFileIdentity(uint32_t& status) const
+    {
+        if (!FileIdentityMatches) { return std::nullopt; }
+        return FileIdentityMatches(status);
+    }
     DumpReadObservation ReadWithReceipts(const ObservationReadRequest& request, ObservationOperationBudget budget = {});
 
 protected:
     ObservationReadResult ReadSpans(const ObservationReadRequest& request) override;
 
 private:
-    friend std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstring&, std::wstring*, DumpInitializationObservation*);
+    friend std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstring&, std::wstring*, DumpInitializationObservation*, std::wstring_view);
     ObservationSourceCapabilities Caps;
     uint64_t Root;
     uint32_t PagingLevels;
     DumpPhysicalReader Reader;
     DumpObservedPhysicalReader ObservedReader;
-    bool FileHandleBound = false;
+    std::function<bool(uint32_t&)> FileIdentityMatches;
 };
 
 // Opens a bounded PAGE/DU64 full-dump run layout; never opens a live device.
 // A missing/contradictory paging mode is rejected instead of assuming LA48.
 std::unique_ptr<DumpObservationSource> OpenDumpObservationSource(const std::wstring& path, std::wstring* error,
-    DumpInitializationObservation* initialization = nullptr);
+    DumpInitializationObservation* initialization = nullptr, std::wstring_view expectedHeaderSha256 = {});

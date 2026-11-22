@@ -113,8 +113,9 @@ WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
     ("claim", "proposed_verdict", "evidence_ids"), ("candidate", "unobserved", "next_observation"),
     ("evaluated_views", "required_views", "capture_bytes"), ("pid", "process_created", "tid", "thread_created"),
 ))
-DUMP_INIT_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1")
-DUMP_INIT_MARKERS = (*DUMP_INIT_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"')
+DUMP_EVIDENCE_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
+DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
+                         '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')
 ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
@@ -128,13 +129,16 @@ ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_et
                    '"other_opcodes"', '"header_pid_conflicts"', '"group_mask_records"', '"profile_interval_records"',
                    '"group_masks"', '"profile_source_name"', '"payload_bytes"', '"group_mask_bracket"', '"reported_period_100ns"')
 
-DUMP_INIT_FIELD_SETS = tuple(frozenset(fields) for fields in (
+DUMP_EVIDENCE_FIELDS = tuple(frozenset(fields) for fields in (
+    ("expected_header_sha256", "digest_scope"), ("availability_scope", "range_evidence"),
+    ("range_state", "captured_bytes", "unobserved_bytes"), ("range_offset", "state", "span_sha256"),
+    ("physical_read_sequence", "native_status_domain", "win32_status"), ("range_offset", "translation_state", "translation_reason"),
     ("purpose", "candidate_levels", "file_offset", "requested_bytes"),
     ("purpose", "candidate_levels", "virtual_address", "requested_bytes"),
     ("parser_accepted", "first_file_sequence", "file_read_count"),
     ("seek_win32_status", "read_win32_status", "hash_input_bytes"),
 ))
-DETACHED_FIELD_SETS = WAIT_PLAN_FIELDS + DUMP_INIT_FIELD_SETS + tuple(frozenset(fields) for fields in (
+DETACHED_FIELD_SETS = WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
     ("observation", "decoded", "unsupported", "first_decoded_record"),
     ("first_payload_bytes", "first_payload_sha256"),
@@ -210,7 +214,7 @@ NESTED_EVIDENCE_OBJECT_START = re.compile(r'(\{)\s*"')
 JSON_SPACE = re.compile(r'[ \t\r\n]*')
 
 
-DETACHED_SCHEMAS = (*WAIT_PLAN_SCHEMAS, *DUMP_INIT_SCHEMAS, *TRACE_QUERY_SCHEMAS, "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3",
+DETACHED_SCHEMAS = (*WAIT_PLAN_SCHEMAS, *DUMP_EVIDENCE_SCHEMAS, *TRACE_QUERY_SCHEMAS, "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3",
                     "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8")
 
 
@@ -229,6 +233,8 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
                 return True
             pos = JSON_SPACE.match(text, pos + 1).end()
             value, pos = decoder.raw_decode(text, pos)
+            if key == "scope" and value in ("saved_dump_probe", "saved_etl_probe"):
+                return True
             if key == "schema" and value in schemas:
                 return True
             pos = JSON_SPACE.match(text, pos).end()
@@ -242,8 +248,8 @@ def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool
 
 def detached_evidence_line(text: str) -> int | None:
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
-    if any(tag in text for tag in DUMP_INIT_MARKERS):
-        patterns.append((NESTED_EVIDENCE_OBJECT_START, DUMP_INIT_FIELD_SETS, DUMP_INIT_SCHEMAS))
+    if any(tag in text for tag in DUMP_EVIDENCE_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, DUMP_EVIDENCE_FIELDS, DUMP_EVIDENCE_SCHEMAS))
     if any(tag in text for tag in WAIT_PLAN_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, WAIT_PLAN_FIELDS, WAIT_PLAN_SCHEMAS))
     decoder = json.JSONDecoder()
@@ -315,7 +321,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
-                                                                  "kn.wait_", "ey", "ew", *ETL_ROW_MARKERS, *DUMP_INIT_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
+                                                                  "kn.wait_", "ey", "ew", *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
                                                                  "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
@@ -337,9 +343,10 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if re.search(r'(?im)(?:^|>)[ \t\r\n]*<(?:[\w.-]+:)?(?:Event|Provider)\b', text) and re.search(
                     r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})["']''', text):
                 add("private-whea-event")
-        if (not binary or view is not data) and ("saved_etl_probe" in text or "kn.etl_capability_probe.v1" in text):
+        if (not binary or view is not data) and any(m in text for m in (
+                "saved_etl_probe", "kn.etl_capability_probe.v1", "saved_dump_probe", "kn.dump_capability_probe.v1")):
             # Outer scope and detached probe metadata can survive a truncated export.
-            marker = re.search(r'(?m)^[ \t]*(?:\{[^\r\n]*?)?"(?:scope"\s*:\s*"saved_etl_probe|schema"\s*:\s*"kn\.etl_capability_probe\.v1)"', text)
+            marker = re.search(r'(?m)^[ \t]*(?:\{[^\r\n]*?)?"(?:scope"\s*:\s*"saved_(?:etl|dump)_probe|schema"\s*:\s*"kn\.(?:etl|dump)_capability_probe\.v1)"', text)
             if marker:
                 add("private-runtime-probe", text.count("\n", 0, marker.start()) + 1)
         # Capture contents remain private even if the extension was changed.
@@ -348,7 +355,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                 document = json.loads(text)
                 schema = document.get("schema") if isinstance(document, dict) else None
                 if (schema == "kn.capabilities.v1" and
-                        (document.get("target_probed") is not False or document.get("scope") == "runtime_probe" or "probe" in document)):
+                        (document.get("target_probed") is not False or document.get("scope") in ("runtime_probe", "saved_etl_probe", "saved_dump_probe") or "probe" in document)):
                     add("private-runtime-probe")
                 if isinstance(schema, str) and (schema in BENCHMARK_RECORD_SCHEMAS or schema in {
                     "kmon.bundle.v1", "kmon.bundle.v2", "kmon.evidence.v1", "kmon.evidence.v2", "kn.temporal_facts.v1", "kmon.evidence_session.v1",
@@ -395,7 +402,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_INIT_MARKERS, *WAIT_PLAN_MARKERS)):
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS)):
             line = detached_evidence_line(text)
             if line is not None:
                 add("private-evidence-bundle", line)

@@ -69,7 +69,7 @@ namespace symbol_artifacts
                 (info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0) { return false; }
             return true;
         }
-        bool Pin(const std::filesystem::path& target, bool create)
+        bool Pin(const std::filesystem::path& target, bool create, DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE)
         {
             std::filesystem::path approved;
             if (!LocalRoot(target.wstring(), &approved)) { return false; }
@@ -79,7 +79,7 @@ namespace symbol_artifacts
                 const auto slash = path.find(L'\\', start);
                 const auto directory = path.substr(0, slash);
                 if (create && !CreateDirectoryW(directory.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS) { return false; }
-                if (!HoldExisting(directory)) { return false; }
+                if (!HoldExisting(directory, share)) { return false; }
                 if (slash == std::wstring::npos) { break; }
                 start = slash + 1;
             }
