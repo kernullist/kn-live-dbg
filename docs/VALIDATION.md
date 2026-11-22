@@ -882,6 +882,41 @@ hash, signed capture statements and redirected output against owned hard
 links were checked separately. The probe's first payload fingerprint was
 checked against the Windows fields. [Disk I/O command and timing units](TRACE_IMPORT.md#read-saved-disk-io-response-times)
 
+## Issuing thread state during directory I/O on 2026-11-23
+
+On Windows `10.0.28000` x64, the paired collector sampled the issuing
+thread of the existing directory notification executable (SHA-256 prefix
+`2bda0417bff9`). In four captures it attempted 220 state queries. Of
+these, 211 fell strictly inside one of seven wait-any calls and reported
+Waiting. The table counts each query once, including calls that waited on
+more than one request.
+
+| Workload | Recorded waits | Waits with an interior sample | Waiting samples | Journal outcome |
+| --- | ---: | ---: | ---: | --- |
+| Changes in two of three directories | 3 | 3 | 169 | Request 2 selected, then request 1, then timeout and cancellation of request 3 |
+| Two requests watching one directory | 2 | 1 | 10 | Both requests completed after one change. The second wait had no interior sample. |
+| Three quiet directories | 1 | 1 | 32 | One shared timeout |
+| One-sample limit with three quiet directories | 1 | 0 | 0 | The timeout and request results survived the sampling limit. |
+
+The stimulus controller waited for a recorded monitor or release and a
+live Waiting observation before creating each change. A separate .NET
+process checked the PID, TID and both creation times. Of its 15 views,
+13 fell strictly inside the corresponding wait and reported
+`Wait / UserRequest`. These are observations at separate instants. The
+Windows SDK x64 structures independently confirmed the offsets and sizes
+used to extract the original native fields. In a separate run of the
+command reference example, the uninstrumented controller observed 24
+Waiting samples inside one quiet-directory wait and reproduced the
+report digest.
+
+Replay kept calls with no sample, rejected a foreign generation and
+withheld links across a journal gap or contradictory thread exit. A
+disputed wait selection preserved the native return and the independently
+observed thread state. The 15 existing I/O lifecycle regressions passed.
+Wait-object identity inside the scheduler, kernel IRP generations and
+continuous time off CPU remain open.
+[Command and replay](COMMAND_REFERENCE.md#observe-the-issuing-thread-during-an-io-wait) · [Independent checks](../tools/test-io-thread-waits.py)
+
 ## Directory notification timing on 2026-11-22
 
 The x64 Release collector from `fd3b28f` recorded four runs against owned

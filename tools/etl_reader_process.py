@@ -36,8 +36,8 @@ class WindowsFiles:
         check(0 < get_system(buf, len(buf)) < len(buf), "cannot locate Windows system directory")
         self.tracerpt = Path(buf.value) / "tracerpt.exe"
 
-    def process_identity(self, pid):
-        handle = self.open_process(0x1000, False, pid)
+    def process_identity(self, pid, *, process_handle=None):
+        handle = self.open_process(0x1000, False, pid) if process_handle is None else process_handle
         if not handle:
             return None
         try:
@@ -47,16 +47,17 @@ class WindowsFiles:
             created = times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
             return dict(pid=pid, process_created=str(created))
         finally:
-            self.close(handle)
+            if process_handle is None:
+                self.close(handle)
 
-    def image_binding(self, pid, pinned):
+    def image_binding(self, pid, pinned, *, process_handle=None):
         import msvcrt
         buf = ctypes.create_unicode_buffer(32768)
         n = self.final_name(msvcrt.get_osfhandle(pinned.fileno()), buf, len(buf), 2)  # VOLUME_NAME_NT
         if not 0 < n < len(buf):
             return dict(status="unavailable", win32_status=ctypes.get_last_error() if not n else 122)
         expected = buf.value
-        handle = self.open_process(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        handle = self.open_process(0x1000, False, pid) if process_handle is None else process_handle
         if not handle:
             return dict(status="unavailable", win32_status=ctypes.get_last_error())
         try:
@@ -65,7 +66,8 @@ class WindowsFiles:
                 return dict(status="unavailable", win32_status=ctypes.get_last_error())
             return dict(status="matched" if expected == buf.value else "different_path", win32_status=0)
         finally:
-            self.close(handle)
+            if process_handle is None:
+                self.close(handle)
 
     @contextmanager
     def hold(self, path, directory=False):

@@ -746,6 +746,39 @@ with code 2 for an invalid journal or pin. Use a separate file when
 saving the report.
 [Timing bounds and clock resolution](ARCHITECTURE.md#directory-notification-timing)
 
+### Observe the issuing thread during an I/O wait
+
+On Windows x64, launch the directory notification collector with an
+independent thread-state sampler. This example uses a quiet directory.
+A timeout still contains an observation of the issuing thread if Windows
+reported its state during the wait.
+
+```powershell
+$out = '.\.build\io-thread-wait-example'
+New-Item -ItemType Directory -Path $out -ErrorAction Stop | Out-Null
+$watched = (New-Item -ItemType Directory -Path "$out\watched").FullName
+$exe = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$exePin = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash
+$tool = 'tools/measure-io-waits.py'
+$capture = python -B $tool capture --exe $exe --exe-sha256 $exePin --wait-ms 750 --interval-ms 20 --output "$out\capture.json" $watched | ConvertFrom-Json
+$query = @('replay', '--capture', "$out\capture.json", '--sha256', $capture.capture_sha256)
+$receipt = python -B $tool @query --output "$out\report.json" | ConvertFrom-Json
+$report = Get-Content -Raw -LiteralPath "$out\report.json" | ConvertFrom-Json
+$report.wait_sets | Select-Object wait_line, wait_result, qualified_selected_generation, scheduler_evidence
+python -B $tool @query --check-report $receipt.report_sha256
+```
+
+Pass 1–8 directory arguments in handle order. Each wait set lists its
+request generations and the original admission, submission, pending probe
+and final result lines when present. `waiting_samples` identifies the
+Windows state queries strictly inside that call. The capture keeps the
+original journal, thread field bytes and native query statuses for offline
+replay. `sources_status` describes the two inputs. A complete report
+also requires an interior state sample in every recorded wait call.
+Exit 1 preserves partial evidence or signals a report digest mismatch.
+Exit 2 indicates an invalid input or output operation.
+[How the observations are joined](ARCHITECTURE.md#thread-state-evidence-during-directory-io)
+
 ## Capture a cooperative kernel I/O trace
 
 On an elevated Windows test host, build the Release fixture and run the

@@ -1065,6 +1065,41 @@ service time or worker scheduling breakdown. Terminal I/O status comes
 from the retained result for each generation.
 [Replay a timing report](COMMAND_REFERENCE.md#measure-directory-notification-timing)
 
+#### Thread state evidence during directory I/O
+
+The paired capture starts the pinned directory notification collector
+and reads its flushed plan. The controller checks the loaded image and
+creation time using the original process handle. It then opens the
+issuing thread, checks its owner PID, TID and creation time, and retains
+that handle through sampling. The original plan line's digest binds the
+two observations to this provider run.
+
+On native Windows x64 the sampler queries `SystemProcessInformation` and
+extracts the matching process and thread row. Each sample retains the
+original little-endian bytes for the process header counts, process and
+client IDs, thread state and wait reason. Replay checks the offsets, row
+extent and decoded fields. The capture also retains the returned byte
+counts, NTSTATUS for each attempt and liveness results on both sides.
+The rest of the system process buffer stays in the sampler.
+[Windows process and thread information](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntquerysysteminformation)
+
+The journal identifies the issuing thread's **wait-any** call, its ordered
+set of completion events and the index Windows returned. Each event belongs
+to a request generation in the same run, even when multiple requests
+watch the same directory. A sampled state of Waiting corroborates the
+thread's state during that call. The state row supplies a wait reason
+code. Identifying which object blocked the thread requires further
+evidence. A disputed native selection remains visible with its original
+lines and an empty qualified selection.
+
+Both sources use `GetTickCount64`. A state query must fall strictly
+inside the recorded call with the thread still live before and after the
+query. A timestamp shared with a call boundary leaves the sample
+ambiguous. A gap in the journal ends the eligible prefix. A thread exit
+that precedes a later record from the same issuer invalidates the join.
+Samples establish individual observations. Continuous off-CPU time and a
+kernel IRP identity remain open. [Capture and replay](COMMAND_REFERENCE.md#observe-the-issuing-thread-during-an-io-wait)
+
 ### Cooperative kernel I/O request lifetimes
 
 The pending-I/O fixture can record the CREATE and READ requests that its owner
