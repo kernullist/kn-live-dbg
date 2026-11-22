@@ -211,6 +211,9 @@ def main():
     assert all(item in switches["requirements"] for item in ("opt_in_on_cpu_and_off_cpu_intervals", "readythread_v2_boundaries", "numeric_tid_filter"))
     assert "recorded_capture_settings" in switches["requirements"] and "1024_capture_setting_records" in switches["limits"]
     assert "no_authenticated_thread_lifetime_or_wait_cause" in switches["limits"]
+    inventory = by_key[("evidence", "rotation_inventory", "etl")]
+    assert inventory["consistency"] == "authenticated_file_inventory" and "trusted_es256_key_and_role" in inventory["requirements"]
+    assert "controller_reported_stop_and_loss" in inventory["limits"]
     profile = by_key[("execution", "cpu_profile", "etl")]
     assert profile["consistency"] == "reported_cpu_samples" and "raw_clock" in profile["requirements"]
     assert "no_thread_lifetime_or_code_binding" in profile["limits"]

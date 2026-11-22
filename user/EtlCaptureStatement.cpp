@@ -115,6 +115,94 @@ namespace etl_profile
             return true;
         }
 
+        const wchar_t* SignedPayload(const std::vector<uint8_t>& file, const StatementAuthority& key, const wchar_t* type,
+            size_t maximum, size_t payloadLimit, std::optional<bool>& verified, std::vector<uint8_t>& payload)
+        {
+            if (file.empty() || file.size() > maximum || key.PublicPoint.size() != 65) { return L"invalid_jws"; }
+            std::string_view token(reinterpret_cast<const char*>(file.data()), file.size());
+            if (token.back() == '\n')
+            {
+                token.remove_suffix(1);
+                if (!token.empty() && token.back() == '\r') { token.remove_suffix(1); }
+            }
+            const auto first = token.find('.');
+            if (first == token.npos) { return L"invalid_jws"; }
+            const auto last = token.find('.', first + 1);
+            if (last == token.npos) { return L"invalid_jws"; }
+            std::vector<uint8_t> protectedHeader, signature;
+            Object header;
+            if (!Decode64(token.substr(0, first), 512, protectedHeader) || !JsonObject(protectedHeader, header) ||
+                !trace_json::HasFields(header, {L"alg", L"typ"}) || !Label(header.at(L"alg"), L"ES256") ||
+                !Label(header.at(L"typ"), type) ||
+                !Decode64(token.substr(first + 1, last - first - 1), payloadLimit, payload) ||
+                !Decode64(token.substr(last + 1), 64, signature) || signature.size() != 64) { return L"invalid_jws"; }
+
+            BCRYPT_ECCKEY_BLOB publicHeader{BCRYPT_ECDSA_PUBLIC_P256_MAGIC, 32};
+            std::vector<uint8_t> blob(sizeof(publicHeader));
+            std::memcpy(blob.data(), &publicHeader, sizeof(publicHeader));
+            blob.insert(blob.end(), key.PublicPoint.begin() + 1, key.PublicPoint.end());
+            std::vector<uint8_t> digest;
+            if (!p256_signature::Sha256(file.data(), last, &digest)) { return L"hash_unavailable"; }
+            verified = p256_signature::VerifyP256Signature(blob, digest, signature);
+            return *verified ? nullptr : L"signature_rejected";
+        }
+
+        bool Ulong(const std::wstring& raw, uint32_t& result)
+        {
+            uint64_t number = 0;
+            if (!trace_json::Decimal(raw, &number) || number > UINT32_MAX) { return false; }
+            result = static_cast<uint32_t>(number);
+            return true;
+        }
+
+        bool NullableUlong(const std::wstring& raw, std::optional<uint32_t>& result)
+        {
+            if (raw == L"null") { return true; }
+            uint32_t number = 0;
+            if (!Ulong(raw, number)) { return false; }
+            result = number;
+            return true;
+        }
+
+        bool RotationClaims(const std::vector<uint8_t>& bytes, RotationInventory& out)
+        {
+            Object f;
+            if (!JsonObject(bytes, f) || !trace_json::HasFields(f, {L"schema", L"role", L"session_id", L"stop", L"members"}) ||
+                !Label(f.at(L"schema"), L"kn.etl_rotation_inventory.v1") ||
+                !trace_json::Text(f.at(L"role"), &out.Role) || !Id(f.at(L"session_id"), out.SessionJson)) { return false; }
+            const bool controller = out.Role == L"capture_controller";
+            if ((!controller && out.Role != L"archive_witness") || controller != (out.SessionJson != L"null")) { return false; }
+            if (f.at(L"stop") != L"null")
+            {
+                Object stop;
+                uint32_t code = 0;
+                if (!controller || !trace_json::Members(f.at(L"stop"), {L"win32_status", L"final_ordinal", L"events_lost", L"log_buffers_lost"}, &stop) ||
+                    !Ulong(stop.at(L"win32_status"), code) || !NullableUlong(stop.at(L"final_ordinal"), out.FinalOrdinal) ||
+                    !NullableUlong(stop.at(L"events_lost"), out.EventsLost) || !NullableUlong(stop.at(L"log_buffers_lost"), out.LogBuffersLost)) { return false; }
+                out.StopWin32 = code;
+                if (!code && (!out.FinalOrdinal || !*out.FinalOrdinal || *out.FinalOrdinal > MaxRotationMembers)) { return false; }
+                if (code && (out.FinalOrdinal || out.EventsLost || out.LogBuffersLost)) { return false; }
+            }
+            std::vector<std::wstring> rows;
+            if (!trace_json::Array(f.at(L"members"), MaxRotationMembers, &rows) || (rows.empty() && !out.FinalOrdinal)) { return false; }
+            uint32_t previous = 0;
+            for (const auto& raw : rows)
+            {
+                Object fields;
+                RotationMember member;
+                if (!trace_json::Members(raw, {L"ordinal", L"etl_bytes", L"etl_sha256"}, &fields) ||
+                    !Ulong(fields.at(L"ordinal"), member.Ordinal) || member.Ordinal <= previous ||
+                    member.Ordinal > out.FinalOrdinal.value_or(MaxRotationMembers) ||
+                    !trace_json::Number(fields.at(L"etl_bytes"), &member.Bytes) || !member.Bytes || member.Bytes > MaxFileBytes ||
+                    !trace_json::Text(fields.at(L"etl_sha256"), &member.Sha256, 64) || member.Sha256.size() != 64 ||
+                    member.Sha256.find_first_not_of(L"0123456789abcdef") != std::wstring::npos ||
+                    std::any_of(out.Members.begin(), out.Members.end(), [&](const auto& m) { return m.Sha256 == member.Sha256; })) { return false; }
+                previous = member.Ordinal;
+                out.Members.push_back(std::move(member));
+            }
+            return true;
+        }
+
         const wchar_t* Boolean(std::optional<bool> value)
         {
             return !value ? L"null" : *value ? L"true" : L"false";
@@ -143,39 +231,26 @@ namespace etl_profile
         const std::wstring& etlSha256, uint64_t etlBytes)
     {
         CaptureStatement out;
-        out.Status = L"invalid_jws";
-        if (file.empty() || file.size() > MaxStatementBytes || key.PublicPoint.size() != 65) { return out; }
-        std::string_view token(reinterpret_cast<const char*>(file.data()), file.size());
-        if (token.back() == '\n')
-        {
-            token.remove_suffix(1);
-            if (!token.empty() && token.back() == '\r') { token.remove_suffix(1); }
-        }
-        const auto first = token.find('.');
-        if (first == token.npos) { return out; }
-        const auto last = token.find('.', first + 1);
-        if (last == token.npos) { return out; }
-        std::vector<uint8_t> protectedHeader, payload, signature;
-        Object header;
-        if (!Decode64(token.substr(0, first), 512, protectedHeader) || !JsonObject(protectedHeader, header) ||
-            !trace_json::HasFields(header, {L"alg", L"typ"}) || !Label(header.at(L"alg"), L"ES256") ||
-            !Label(header.at(L"typ"), L"kn.etl_capture_statement.v1+jws") ||
-            !Decode64(token.substr(first + 1, last - first - 1), 4096, payload) ||
-            !Decode64(token.substr(last + 1), 64, signature) || signature.size() != 64) { return out; }
-
-        BCRYPT_ECCKEY_BLOB publicHeader{BCRYPT_ECDSA_PUBLIC_P256_MAGIC, 32};
-        std::vector<uint8_t> blob(sizeof(publicHeader));
-        std::memcpy(blob.data(), &publicHeader, sizeof(publicHeader));
-        blob.insert(blob.end(), key.PublicPoint.begin() + 1, key.PublicPoint.end());
-        std::vector<uint8_t> digest;
-        out.Status = L"hash_unavailable";
-        if (!p256_signature::Sha256(file.data(), last, &digest)) { return out; }
-        out.SignatureValid = p256_signature::VerifyP256Signature(blob, digest, signature);
-        if (!*out.SignatureValid) { out.Status = L"signature_rejected"; return out; }
+        std::vector<uint8_t> payload;
+        const auto failure = SignedPayload(file, key, L"kn.etl_capture_statement.v1+jws", MaxStatementBytes, 4096, out.SignatureValid, payload);
+        if (failure) { out.Status = failure; return out; }
         if (!Claims(payload, out)) { out.Status = L"invalid_claims"; return out; }
         out.RoleMatches = out.CaptureController == (key.Role == L"capture_controller");
         out.EtlMatches = out.ClaimedEtlSha256 == etlSha256 && *out.ClaimedBytes == etlBytes;
         out.Status = !*out.RoleMatches ? L"signer_role_mismatch" : *out.EtlMatches ? L"bound" : L"etl_identity_mismatch";
+        return out;
+    }
+
+    RotationInventory VerifyRotationInventory(const std::vector<uint8_t>& file, const StatementAuthority& key)
+    {
+        RotationInventory out;
+        std::vector<uint8_t> payload;
+        const auto failure = SignedPayload(file, key, L"kn.etl_rotation_inventory.v1+jws", MaxInventoryBytes, 12288, out.SignatureValid, payload);
+        if (failure) { out.Status = failure; return out; }
+        if (!RotationClaims(payload, out)) { out.Status = L"invalid_claims"; return out; }
+        if (out.Role != key.Role) { out.Status = L"signer_role_mismatch"; return out; }
+        out.Status = L"authenticated";
+        out.Accepted = true;
         return out;
     }
 

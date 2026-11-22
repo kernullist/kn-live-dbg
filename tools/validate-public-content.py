@@ -15,7 +15,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -71,7 +71,7 @@ def path_rule(name: str) -> str | None:
     if (base.startswith(".env") and base != ".env.example") or base in PRIVATE_NAMES:
         return "credential-file"
     if (base.startswith(".knbench-") and base.endswith(".tmp")) or path.suffix.lower() in PRIVATE_EXTENSIONS or any(
-        extension + ".pending-" in base for extension in (".knmanifest", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
+        extension + ".pending-" in base for extension in (".knmanifest", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".kngc", ".kngcintent", ".kngcreceipt", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult")
     ):
         return "private-container-or-capture"
     return None
@@ -90,12 +90,13 @@ def text_views(data: bytes) -> list[str]:
 
 
 DISK_IO_SCHEMA = "kn.etl_disk_io.v1"
-TRACE_QUERY_SCHEMAS = (DISK_IO_SCHEMA, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1")
+ETL_ROTATION_SCHEMAS = ("kn.etl_rotation_inventory.v1", "kn.etl_rotation_set.v1")
+TRACE_QUERY_SCHEMAS = (DISK_IO_SCHEMA, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
                            r"code-(?:move|delete|source-info|disassemble),0x[0-9a-fA-F]+(?:,|$))")
 # Detect a complete protected header or payload even after a JWS is renamed or cut.
-ETL_JWS_OBJECT = re.compile(r"(?<![A-Za-z0-9_-])(e[wy][A-Za-z0-9_-]{18,5460})(?![A-Za-z0-9_-])")
+ETL_JWS_OBJECT = re.compile(r"(?<![A-Za-z0-9_-])(e[wy][A-Za-z0-9_-]{18,16384})(?![A-Za-z0-9_-])")
 
 
 def capture_jws_offset(text: str) -> int | None:
@@ -105,8 +106,8 @@ def capture_jws_offset(text: str) -> int | None:
             fields = json.loads(base64.b64decode(part + "=" * (-len(part) % 4), altchars=b"-_", validate=True).decode("utf-8"))
         except (binascii.Error, ValueError, UnicodeError, RecursionError):
             continue
-        if isinstance(fields, dict) and (fields.get("typ") == "kn.etl_capture_statement.v1+jws" or
-                                         fields.get("schema") == "kn.etl_capture_statement.v1"):
+        if isinstance(fields, dict) and (fields.get("typ") in ("kn.etl_capture_statement.v1+jws", "kn.etl_rotation_inventory.v1+jws") or
+                                         fields.get("schema") in ("kn.etl_capture_statement.v1", "kn.etl_rotation_inventory.v1")):
             return match.start()
     return None
 
@@ -157,7 +158,9 @@ DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
     ("longest_response_ties", "initiations", "completions"), ("response_ticks_per_second", "operations"),
     ("decoded_disk_records", "records_seen"), ("cross_provider_join", "device_service_time", "request_generation"),
 ))
-ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *DISK_IO_MARKERS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
+ETL_ROTATION_MARKERS = (*ETL_ROTATION_SCHEMAS, '"expected_inventory_sha256"', '"closed_controller_inventory_verified"',
+                        '"final_ordinal"', '"etl_bytes"', '"observed_bytes"')
+ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *DISK_IO_MARKERS, *ETL_ROTATION_MARKERS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
                    '"elapsed_ticks"', '"ready_records"', '"ready_flags"', '"thread_filter"', '"ready_to_switch_in_ticks"', 'kn.etl_switches.v', 'kn.etl_profile.v4', 'kn.etl_profile.v5', 'kn.etl_profile.v6', 'kn.etl_profile.v7', 'kn.etl_profile.v8',
@@ -179,7 +182,12 @@ DUMP_EVIDENCE_FIELDS = tuple(frozenset(fields) for fields in (
     ("parser_accepted", "first_file_sequence", "file_read_count"),
     ("seek_win32_status", "read_win32_status", "hash_input_bytes"),
 ))
-DETACHED_FIELD_SETS = WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + tuple(frozenset(fields) for fields in (
+ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
+    ("expected_inventory_sha256", "trusted_key_sha256"), ("ordinal", "etl_bytes", "etl_sha256"),
+    ("ordinal", "expected_bytes", "observed_bytes"), ("win32_status", "final_ordinal", "log_buffers_lost"),
+    ("contiguous_inventory_verified", "closed_controller_inventory_verified"),
+))
+DETACHED_FIELD_SETS = WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + ETL_ROTATION_FIELDS + tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
     ("observation", "decoded", "unsupported", "first_decoded_record"),
     ("first_payload_bytes", "first_payload_sha256"),
@@ -293,6 +301,8 @@ def detached_evidence_line(text: str) -> int | None:
         patterns.append((NESTED_EVIDENCE_OBJECT_START, DISK_IO_FIELDS, (DISK_IO_SCHEMA,)))
     if any(tag in text for tag in IO_TIMING_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, IO_TIMING_FIELDS, IO_LIFETIME_SCHEMAS))
+    if any(tag in text for tag in ETL_ROTATION_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, ETL_ROTATION_FIELDS, ETL_ROTATION_SCHEMAS))
     if any(tag in text for tag in ETL_COMPARISON_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, ETL_COMPARISON_FIELDS, ETL_COMPARISON_SCHEMAS))
     if any(tag in text for tag in DUMP_EVIDENCE_MARKERS):
@@ -430,7 +440,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

@@ -262,6 +262,9 @@
     <ClCompile Include="PendingIrpScannerTests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="EtlRotationSet.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="EtlCaptureStatement.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -478,6 +481,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ExecutionEvidence.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="SavedEtlInput.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="EtlCaptureStatement.h">

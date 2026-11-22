@@ -8,11 +8,14 @@
 class DistinctArtifactInput
 {
 public:
-    bool Hold(HANDLE sink, const std::wstring& name)
+    bool Hold(HANDLE sink, const std::wstring& name, bool allowMissingParent = false)
     {
         if (name.empty()) { return true; }
         std::filesystem::path path;
-        if (!symbol_artifacts::LocalRoot(name, &path) || !Parents.Pin(path.parent_path(), false)) { return false; }
+        if (!symbol_artifacts::LocalRoot(name, &path)) { return false; }
+        DWORD parentError = ERROR_SUCCESS;
+        if (!Parents.Pin(path.parent_path(), false, FILE_SHARE_READ | FILE_SHARE_WRITE, allowMissingParent ? &parentError : nullptr))
+        { return allowMissingParent && (parentError == ERROR_FILE_NOT_FOUND || parentError == ERROR_PATH_NOT_FOUND); }
         HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
             OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_NO_RECALL, nullptr);
         if (raw == INVALID_HANDLE_VALUE)

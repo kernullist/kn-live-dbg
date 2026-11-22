@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Signed ETL rotation inventory on 2026-11-22
+
+On Windows `10.0.28000`, the Release x64 reader (SHA-256 prefix
+`c4431364362e`) verified an OpenSSL-signed three-member inventory in signed order when given the paths in order 3, 1,
+2. It matched Windows `tracerpt` on 114, 179,474 and 23 records in the
+respective files. The first was the public KrabsETW recording. The other
+two were copies of saved traces with the rotation header flag set. This
+was a test grouping of existing files. The signer supplied the shared
+session ID, final ordinal and loss counters. [Public KrabsETW trace](https://github.com/microsoft/krabsetw/blob/43864e67d592779f05cd982b637ca660923e0e09/examples/NativeExamples/powershell.etl)
+
+An archive signature verified order with an unknown end. A failed
+controller stop retained Win32 error 5. The reader reported missing
+identities, unsupplied positions, a missing directory, substituted bytes,
+an unexpected input and a sequential file. It rejected a cross-role
+signature, a single-file statement type, repeated identities and a
+tampered signature. While a report was blocked on a pipe, Windows rejected
+writable opens of the verified member and signed inventory with sharing
+violation 32. Both writable opens succeeded after publication. A redirected
+report preserved the missing member and its original Windows open error.
+
+MSVC built the owned recorder with warnings as errors. Its in-process
+single-file controller test passed. Starting a named three-file rotation
+returned Win32 error 5 from
+`StartTraceW` on this host. A live three-member capture with independently
+counted provider markers and controller stop statistics remains unverified.
+[Signed inventory checks](../tools/test-etl-rotation-set.py)
+
 ## Rotating ETL member read on 2026-11-22
 
 On Windows `10.0.28000`, the Release x64 user reader and system `tracerpt`

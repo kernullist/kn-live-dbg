@@ -1119,6 +1119,10 @@ identifies the signed claims, the original ETL, the regenerated page, the
 statement file and the trusted key. It records the role check separately
 from the signature check. [Signed statement fields](TRACE_IMPORT.md#verify-a-signed-capture-statement)
 
+Use `--etl-rotation-set` to verify the order, file identities and any signed
+controller stop for a rotating recording. Supply an explicit ordinal for
+each file. Missing positions stay in the report. [Rotation inventory format and example](TRACE_IMPORT.md#verify-an-ordered-rotation-inventory)
+
 ### Inspect CPU samples from a saved ETL
 
 ```powershell

@@ -30,6 +30,28 @@ namespace etl_profile
         std::wstring Json(const StatementAuthority& key, bool pageMatches) const;
     };
 
+    inline constexpr uint32_t MaxRotationMembers = 32;
+    inline constexpr size_t MaxInventoryBytes = 16384;
+
+    struct RotationMember
+    {
+        uint32_t Ordinal = 0;
+        uint64_t Bytes = 0;
+        std::wstring Sha256;
+    };
+
+    struct RotationInventory
+    {
+        const wchar_t* Status = L"invalid_jws";
+        std::optional<bool> SignatureValid;
+        bool Accepted = false;
+        std::wstring Role, SessionJson;
+        std::optional<uint32_t> StopWin32, FinalOrdinal, EventsLost, LogBuffersLost;
+        std::vector<RotationMember> Members;
+    };
+
+    RotationInventory VerifyRotationInventory(const std::vector<uint8_t>& file, const StatementAuthority& key);
+
     // The caller supplies the trusted uncompressed SEC 1 point, independently of the JWS.
     bool ParseStatementAuthority(const std::wstring& role, const std::wstring& hex, StatementAuthority& result);
     CaptureStatement VerifyCaptureStatement(const std::vector<uint8_t>& file, const StatementAuthority& key,

@@ -84,19 +84,21 @@ def statement(etl, capture=None):
     return obj
 
 
+def provider_guids(event):
+    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
+    tns = "{http://schemas.microsoft.com/win/2004/08/events/trace}"
+    provider = event.find(ns + "System/" + ns + "Provider")
+    return [v.strip("{}").lower() for v in ((provider.get("Guid", "") if provider is not None else ""),
+            event.findtext(tns + "ExtendedTracingInfo/" + tns + "EventGuid") or "")]
+
+
 def owned_capture(exe, folder):
     record = json.loads(run([exe, folder]))
     etl = folder / record["session_id"] / "capture.etl"
     xml = folder / "owned.xml"
     run([Path(os.environ["SystemRoot"]) / "System32/tracerpt.exe", etl, "-o", xml, "-of", "XML", "-rts", "-y"], cwd=folder)
     events = ET.parse(xml).findall(".//{http://schemas.microsoft.com/win/2004/08/events/event}Event")
-    ns = "{http://schemas.microsoft.com/win/2004/08/events/event}"
-    tns = "{http://schemas.microsoft.com/win/2004/08/events/trace}"
-    def ids(event):
-        provider = event.find(ns + "System/" + ns + "Provider")
-        return [v.strip("{}").lower() for v in ((provider.get("Guid", "") if provider is not None else ""),
-                event.findtext(tns + "ExtendedTracingInfo/" + tns + "EventGuid") or "")]
-    assert sum(record["provider_id"] in ids(e) for e in events) == 1, len(events)
+    assert sum(record["provider_id"] in provider_guids(e) for e in events) == 1, len(events)
     assert record["system_trace_enable_flags"] == 0
     return etl, record, len(events)
 

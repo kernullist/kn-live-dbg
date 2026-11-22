@@ -16,6 +16,24 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_rotation_inventories_and_exports(self):
+        for filename in ("source.knetlset", "source.knetlset.pending-1", "controller.knetlowner"):
+            self.assertIsNotNone(AUDIT.path_rule(filename))
+        rows = (dict(schema="kn.etl_rotation_inventory.v1"), dict(schema="kn.etl_rotation_set.v1"),
+                dict(ordinal=1, etl_bytes="8", etl_sha256="digest"),
+                dict(win32_status=0, final_ordinal=3, log_buffers_lost=0),
+                dict(ordinal=1, expected_bytes=8, observed_bytes=8))
+        for row in rows:
+            wrapped = json.dumps(dict(outer=dict(inner=row))).encode()
+            for text in (wrapped, wrapped[:-3], wrapped.decode().encode("utf-16-le")):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", text)})
+        header = json.dumps(dict(typ="kn.etl_rotation_inventory.v1+jws", alg="ES256")).encode()
+        payload = json.dumps(dict(schema="kn.etl_rotation_inventory.v1", members=["x" * 5500])).encode()
+        for part in (header, payload):
+            encoded = base64.urlsafe_b64encode(part).rstrip(b"=")
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", encoded)})
+        self.assertFalse(AUDIT.inspect("unrelated.json", json.dumps(dict(ordinal=1, observed_bytes=8)).encode()))
+
     def test_saved_etl_comparison_archives_and_excerpts(self):
         self.assertEqual(AUDIT.path_rule(".knbench-etl-abc/summary.txt"), "local-state-directory")
         for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17)):

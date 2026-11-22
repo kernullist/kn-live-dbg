@@ -24,6 +24,8 @@
 *.etl
 *.etl.zip
 *.knetlstatement
+*.knetlset
+*.knetlowner
 *.kniotrace
 *.kniotrace.pending-*
 *.knirp

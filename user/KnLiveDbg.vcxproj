@@ -232,6 +232,7 @@
     <ClCompile Include="BrokeredSymbolIndexes.cpp" />
     <ClCompile Include="ExecutionTrace.cpp" />
     <ClCompile Include="EtlCaptureStatement.cpp" />
+    <ClCompile Include="EtlRotationSet.cpp" />
     <ClCompile Include="EtlTracePage.cpp" />
     <ClCompile Include="V8Profile.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
@@ -474,6 +475,7 @@
     <ClInclude Include="EtlProfile.h" />
     <ClInclude Include="CapabilityProbeContracts.h" />
     <ClInclude Include="SavedEtlCapability.h" />
+    <ClInclude Include="SavedEtlInput.h" />
     <ClInclude Include="SavedDumpCapability.h" />
     <ClInclude Include="EtlDiskIo.h" />
     <ClInclude Include="EtlProfileRecord.h" />

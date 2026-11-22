@@ -1,4 +1,5 @@
 #include "EtlProfile.h"
+#include "SavedEtlInput.h"
 #include "ContentHash.h"
 #include "EtlCaptureSettings.h"
 #include "EtlDiskIo.h"
@@ -69,19 +70,10 @@ namespace
         return true;
     }
 
-    bool Digest(const std::wstring& input, std::wstring& result)
-    {
-        if (input.size() != 64 || input.find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos) { return false; }
-        result = input;
-        std::transform(result.begin(), result.end(), result.begin(),
-            [](wchar_t c) { return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
-        return true;
-    }
-
     bool Parse(const std::vector<std::wstring>& args, Options& options)
     {
         if (args.size() < 3 || args.size() > MaxArguments || args[0].empty() ||
-            args[1] != L"--sha256" || !Digest(args[2], options.digest)) { return false; }
+            args[1] != L"--sha256" || !etl_profile::NormalizeDigest(args[2], options.digest)) { return false; }
         bool haveAfter = false, haveLimit = false;
         for (size_t i = 3; i < args.size(); ++i)
         {
@@ -93,7 +85,7 @@ namespace
             if (args[i] == L"--build-evidence" && options.family == Family::Profile && !options.builds) { options.builds = true; continue; }
             if (args[i] == L"--reference-image" && options.family == Family::Profile && options.referencePath.empty())
             {
-                if (args.size() - i < 3 || args[i + 1].empty() || !Digest(args[i + 2], options.referenceDigest)) { return false; }
+                if (args.size() - i < 3 || args[i + 1].empty() || !etl_profile::NormalizeDigest(args[i + 2], options.referenceDigest)) { return false; }
                 options.referencePath = args[i + 1];
                 i += 2;
                 continue;
@@ -114,7 +106,7 @@ namespace
             { haveLimit = true; }
             else if (args[i] == L"--check-page" && options.expectedPage.empty())
             {
-                if (!Digest(args[i + 1], options.expectedPage)) { return false; }
+                if (!etl_profile::NormalizeDigest(args[i + 1], options.expectedPage)) { return false; }
             }
             else if (args[i] == L"--thread-id" && options.Switches() && !options.haveTid && Decimal(args[i + 1], UINT32_MAX, options.tid))
             { options.haveTid = true; }
@@ -307,23 +299,35 @@ namespace
     };
 
     bool OpenSource(const std::filesystem::path& path, symbol_artifacts::Directories& parents,
-        SchemaArtifact& source, std::wstring& volumePath, uint64_t maximum = MaxBytes)
+        SchemaArtifact& source, std::wstring& volumePath, uint64_t maximum = MaxBytes,
+        std::optional<uint64_t>* memberBytes = nullptr, DWORD* apiError = nullptr)
     {
+        const auto failed = [&] { if (apiError) { *apiError = GetLastError(); } return false; };
         HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
             FILE_FLAG_OPEN_NO_RECALL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
-        if (raw == INVALID_HANDLE_VALUE) { return false; }
+        if (raw == INVALID_HANDLE_VALUE) { return failed(); }
         const std::unique_ptr<void, decltype(&CloseHandle)> lease(raw, &CloseHandle);
         FILE_ATTRIBUTE_TAG_INFO attributes{};
         constexpr DWORD excluded = FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_OFFLINE |
             FILE_ATTRIBUTE_RECALL_ON_OPEN | FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS;
-        if (!GetFileInformationByHandleEx(raw, FileAttributeTagInfo, &attributes, sizeof(attributes)) ||
-            (attributes.FileAttributes & excluded) || !source.OpenHandle(raw, maximum) || !source.PathNamesFile())
-        { return false; }
+        if (!GetFileInformationByHandleEx(raw, FileAttributeTagInfo, &attributes, sizeof(attributes))) { return failed(); }
+        if (attributes.FileAttributes & excluded) { return false; }
+        if (memberBytes)
+        {
+            LARGE_INTEGER size{};
+            if (!GetFileSizeEx(raw, &size)) { return failed(); }
+            if (size.QuadPart < 0) { return false; }
+            const auto actual = static_cast<uint64_t>(size.QuadPart);
+            *memberBytes = actual;
+            if (actual != maximum) { return false; }
+        }
+        if (!source.OpenHandle(raw, maximum) || !source.PathNamesFile()) { return false; }
         // OpenTrace takes a name. Use the leased file's volume GUID and the
         // pinned directory hierarchy for the entire decode, including reopens.
         std::vector<wchar_t> buffer(32768);
         const auto length = GetFinalPathNameByHandleW(raw, buffer.data(), static_cast<DWORD>(buffer.size()), VOLUME_NAME_GUID);
-        if (!length || length >= buffer.size()) { return false; }
+        if (!length) { return failed(); }
+        if (length >= buffer.size()) { return false; }
         volumePath.assign(buffer.data(), length);
         if (volumePath.rfind(L"\\\\?\\Volume{", 0) != 0) { return false; }
         const auto root = volumePath.find(L"}\\");
@@ -332,36 +336,30 @@ namespace
         // actual ancestor against rename and reparse changes, then check the leaf.
         for (auto end = volumePath.find(L'\\', root + 2); end != std::wstring::npos; end = volumePath.find(L'\\', end + 1))
         {
-            if (!parents.HoldExisting(volumePath.substr(0, end), FILE_SHARE_READ)) { return false; }
+            if (!parents.HoldExisting(volumePath.substr(0, end), FILE_SHARE_READ, apiError)) { return false; }
         }
         return source.PathNamesFile(volumePath);
     }
 
-    bool OpenTraceSource(const std::wstring& name, symbol_artifacts::Directories& parents, SchemaArtifact& source, std::wstring& volumePath)
+    bool OpenTraceSource(const std::wstring& name, symbol_artifacts::Directories& parents, SchemaArtifact& source,
+        std::wstring& volumePath, uint64_t maximum = MaxBytes, std::optional<uint64_t>* memberBytes = nullptr, DWORD* apiError = nullptr)
     {
+        if (apiError) { *apiError = ERROR_SUCCESS; }
         std::filesystem::path path;
-        return symbol_artifacts::LocalRoot(name, &path) && parents.Pin(path.parent_path(), false) &&
-            OpenSource(path, parents, source, volumePath);
+        return symbol_artifacts::LocalRoot(name, &path) && parents.Pin(path.parent_path(), false, FILE_SHARE_READ | FILE_SHARE_WRITE, apiError) &&
+            OpenSource(path, parents, source, volumePath, maximum, memberBytes, apiError);
     }
 
     etl_profile::CaptureStatement ReadCaptureStatement(const Options& options, const SchemaArtifact& etl)
     {
-        std::filesystem::path path;
-        symbol_artifacts::Directories parents;
-        SchemaArtifact statement;
-        std::wstring volumePath;
+        etl_profile::SavedEtlInput statement;
         etl_profile::CaptureStatement result;
         result.Status = L"statement_unavailable";
-        if (!symbol_artifacts::LocalRoot(options.statementPath, &path) || !parents.Pin(path.parent_path(), false) ||
-            !OpenSource(path, parents, statement, volumePath, etl_profile::MaxStatementBytes)) { return result; }
-        std::vector<uint8_t> bytes(static_cast<size_t>(statement.Bytes()));
-        DWORD read = 0;
-        if (!approved_file::ReadAt(statement.Handle(), 0, bytes.data(), static_cast<DWORD>(bytes.size()), &read) ||
-            read != bytes.size() || ContentHash::Bytes(bytes) != statement.Sha256 ||
-            !statement.PathNamesFile(volumePath) || !statement.Unchanged())
-        { result.Status = L"statement_changed"; }
+        if (!statement.Open(options.statementPath, etl_profile::MaxStatementBytes)) { return result; }
+        std::vector<uint8_t> bytes;
+        if (!statement.ReadStatement(bytes)) { result.Status = L"statement_changed"; }
         else { result = etl_profile::VerifyCaptureStatement(bytes, options.statementAuthority, etl.Sha256, etl.Bytes()); }
-        result.FileSha256 = statement.Sha256;
+        result.FileSha256 = statement.File.Sha256;
         return result;
     }
 
@@ -1071,6 +1069,15 @@ namespace
 
 }
 
+bool etl_profile::NormalizeDigest(const std::wstring& input, std::wstring& result)
+{
+    if (input.size() != 64 || input.find_first_not_of(L"0123456789abcdefABCDEF") != std::wstring::npos) { return false; }
+    result = input;
+    std::transform(result.begin(), result.end(), result.begin(),
+        [](wchar_t c) { return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
+    return true;
+}
+
 static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
 {
     symbol_artifacts::Directories parents;
@@ -1206,24 +1213,44 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, Family family)
     return 2;
 }
 
-static void ProbeSavedEtl(const std::wstring& name, SavedEtlCapabilityProbe& probe)
+bool etl_profile::SavedEtlInput::Open(const std::wstring& name, uint64_t maximum, DWORD* apiError)
 {
-    symbol_artifacts::Directories parents;
-    SchemaArtifact source;
-    std::wstring volumePath;
-    if (!OpenTraceSource(name, parents, source, volumePath)) { return; }
-    probe.SourceSha256 = source.Sha256;
-    probe.SourceBytes = source.Bytes();
-    if (probe.ExpectedSha256 != source.Sha256) { probe.Status = L"digest_mismatch"; return; }
+    return OpenTraceSource(name, Parents, File, VolumePath, maximum, nullptr, apiError);
+}
+
+bool etl_profile::SavedEtlInput::OpenMember(const std::wstring& name, uint64_t expectedBytes, std::optional<uint64_t>& observedBytes, DWORD& apiError)
+{
+    return OpenTraceSource(name, Parents, File, VolumePath, expectedBytes, &observedBytes, &apiError);
+}
+
+bool etl_profile::SavedEtlInput::Revalidated()
+{
+    return File.PathNamesFile(VolumePath) && File.Unchanged();
+}
+
+bool etl_profile::SavedEtlInput::ReadStatement(std::vector<uint8_t>& bytes)
+{
+    if (File.Bytes() > MaxInventoryBytes) { return false; }
+    bytes.resize(static_cast<size_t>(File.Bytes()));
+    DWORD read = 0;
+    return approved_file::ReadAt(File.Handle(), 0, bytes.data(), static_cast<DWORD>(bytes.size()), &read) &&
+        read == bytes.size() && ContentHash::Bytes(bytes) == File.Sha256 && Revalidated();
+}
+
+void etl_profile::SavedEtlInput::Probe(SavedEtlCapabilityProbe& probe)
+{
+    probe.SourceSha256 = File.Sha256;
+    probe.SourceBytes = File.Bytes();
+    if (probe.ExpectedSha256 != File.Sha256) { probe.Status = L"digest_mismatch"; return; }
 
     CapabilityScan scan;
-    auto log = ConfigureLog(volumePath, scan);
+    auto log = ConfigureLog(VolumePath, scan);
     Trace trace;
     auto result = trace.OpenSingle(log);
     probe.TraceOpened = trace.handle != INVALID_PROCESSTRACE_HANDLE;
     if (!result.failure)
     {
-        result = trace.ProcessPinned(source, volumePath, scan);
+        result = trace.ProcessPinned(File, VolumePath, scan);
         probe.SourceRevalidated = !result.sourceChanged;
     }
     if (result.failure)
@@ -1256,7 +1283,7 @@ int RunEtlCapabilityProbe(const std::vector<std::wstring>& args, const std::wstr
 {
     SavedEtlCapabilityProbe probe;
     const auto selector = [](const std::wstring& arg) { return _wcsicmp(arg.c_str(), capability_probes::SavedEtl.Selector) == 0; };
-    if (args.size() != 4 || !selector(args[0]) || args[1].empty() || args[2] != L"--sha256" || !Digest(args[3], probe.ExpectedSha256))
+    if (args.size() != 4 || !selector(args[0]) || args[1].empty() || args[2] != L"--sha256" || !etl_profile::NormalizeDigest(args[3], probe.ExpectedSha256))
     {
         return WriteWithDistinctSelectedInputs(STD_ERROR_HANDLE, args, selector, [] {
             std::wcerr << L"usage: KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"\n";
@@ -1264,7 +1291,8 @@ int RunEtlCapabilityProbe(const std::vector<std::wstring>& args, const std::wstr
         });
     }
     return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[1], [&] {
-        ProbeSavedEtl(args[1], probe);
+        etl_profile::SavedEtlInput input;
+        if (input.Open(args[1])) { input.Probe(probe); }
         if (!WriteCapabilityJson(SourceCapabilitiesJson(binaryVersion, probe))) { return 2; }
         return probe.Coverage && !probe.Coverage->HasGap() ? 0 : 1;
     });

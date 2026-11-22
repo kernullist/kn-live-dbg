@@ -49,6 +49,55 @@ recorder or archive is needed to establish order and missing files.
 Keep ETLs and JSON reports private.
 [Windows ETW log filenames](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/ns-evntrace-event_trace_logfilew)
 
+### Verify an ordered rotation inventory
+
+Use `--etl-rotation-set` with a signed inventory, its independently retained
+SHA-256, and the trusted signer's role and uncompressed P-256 public point.
+Supply the files by recorder ordinal. Their names and argument order are
+local choices. For example, this command retains a missing second file
+when the controller declared three.
+
+```powershell
+& KnLiveDbg.exe --etl-rotation-set .\run.knetlset --sha256 $inventorySha256 --authority capture_controller $trustedPoint --member 3 .\last.etl --member 1 .\first.etl
+```
+
+The inventory uses compact JWS with ES256 and protected type
+`kn.etl_rotation_inventory.v1+jws`. The protected header has exactly
+`alg` and `typ`. The UTF-8 payload has the following fields.
+The digest covers the original token file, including an optional final LF
+or CRLF. The public point uses SEC 1 hex beginning with `04`.
+
+| Field | Signed value |
+| --- | --- |
+| `schema` | `kn.etl_rotation_inventory.v1` |
+| `role` | `capture_controller` or `archive_witness`, matching the role authorized for the trusted key |
+| `session_id` | Controller's nonzero lowercase GUID, or null for an archive witness |
+| `members` | Array in increasing ordinal order. Each entry has a JSON integer `ordinal`, a positive decimal **string** `etl_bytes`, and a lowercase `etl_sha256`. Ordinals and byte digests are unique. |
+| `stop` | Null for an archive or a controller without a stop observation. A controller can supply `win32_status`, `final_ordinal`, `events_lost` and `log_buffers_lost` in a stop object. A successful stop requires a positive final ordinal and accepts unsigned 32-bit loss counters or null. A failed stop retains its unsigned Win32 code and requires null for the other three fields. |
+
+The reader accepts ordinals 1–32, up to 512 MiB and two million records
+per file, and up to 16 KiB for the signed inventory. A successful stop
+can declare an end even if all member identities were lost. Every position
+through the claimed end is then visible. The reader takes paths only from
+the command line. It checks each declared size and digest, traverses the
+pinned ETL, confirms rotation mode and rechecks the member leases together
+before writing the report.
+
+`closed_controller_inventory` means the supplied files cover every ordinal
+through the controller's signed successful stop. `ordered_members_verified`
+covers a contiguous archive list or a controller list without a recorded end.
+Both return exit 0. A missing declaration, absent file, extra input,
+substitution or failed stop returns exit 1 with the observed member statuses.
+A failed Windows file or directory open retains its Win32 code. The receipt
+keeps that code separate from the ETW reader status and the controller stop.
+An untrusted inventory returns exit 1 with a null member list. Invalid
+arguments or an unsafe output destination return exit 2.
+
+The stop counters remain controller claims, including any reported loss.
+File verification leaves independent session membership, uninterrupted
+event coverage and timing across files unverified. Keep the signed inventory
+and output private. [Windows rotating log mode](https://learn.microsoft.com/en-us/windows/win32/etw/logging-mode-constants)
+
 ### Read recorded capture settings
 
 Add `--capture-settings` to `--etl-profile` or `--etl-switches` for
