@@ -71,7 +71,7 @@ class PublicContentTests(unittest.TestCase):
                        "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                        "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                        "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
-                       "kn.translation_receipt.v1", "kn.dump_read.v1",
+                       "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.dump_read.v2", "kn.dump_initialization.v1",
                        "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                        "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                        "kn.execution_trace.v1", "kn.execution_trace_query.v1", "kn.mcp_operation.v1",
@@ -390,6 +390,17 @@ class PublicContentTests(unittest.TestCase):
                           {"target_probed": False, "scope": "runtime_probe"}):
             inconsistent = {**runtime, **overrides}
             self.assertTrue(AUDIT.inspect("renamed.json", json.dumps(inconsistent).encode()))
+
+    def test_dump_initialization_exports(self):
+        receipt = dict(purpose="list_head", candidate_levels=4, file_offset="32", requested_bytes=8)
+        metadata = dict(decision="depth_ambiguous", schema="kn.dump_initialization.v1")
+        for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+            for group in ([receipt], [metadata], dict(archive=metadata)):
+                fragment = "banner\n" + json.dumps(group)[:-1]
+                self.assertTrue(AUDIT.inspect("log.txt", fragment.encode(encoding)))
+            for obj in (receipt, metadata, dict(schema="kn.dump_read.v2", initialization=metadata)):
+                text = "private report\n" + json.dumps(obj, indent=2)[:-1]
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("log.txt", text.encode(encoding))})
 
     def test_saved_etl_capability_exports(self):
         nested = dict(schema="kn.etl_capability_probe.v1", expected_sha256="a" * 64)

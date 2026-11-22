@@ -260,7 +260,7 @@ completion, approved reference provenance, atomic mapping lifetime and execution
 are not established. `/current` explicitly returns unavailable for slice recipes;
 existing v1/v2 single-range recipe behavior is unchanged.
 
-Cross-bundle graph associations, source-initialization receipts, other KMON reader paths,
+Cross-bundle graph associations, image-collector initialization receipts, other KMON reader paths,
 crash recovery/global retention, reference caching and native lifecycle validation
 remain open. These slices do not complete VS1.
 
@@ -719,7 +719,7 @@ not additional supported profiles. See the
 The root callback checks retained provider metadata; acquisition that establishes
 that context belongs in the provider's own evidence/budget. Native live root
 acquisition, lifecycle leases and scanner migration remain open. The current
-production integration is `dump-read /receipts`, described below.
+saved-dump command records either the caller's range (`/receipts`) or both file initialization and that range (`/init-receipts`).
 
 Virtual image-recipe capture rejects physical sources and stops after a source
 contract change or deadline overrun. The v1 recipe format refuses an overrun
@@ -3701,8 +3701,24 @@ the dump format's range limit, not observed target MAXPHYADDR. The dump metadata
 does not establish MAXPHYADDR, NXE or 1 GiB feature support, so the receipt's
 target fields and paging permissions remain unknown. Its decoded address is
 usable for locating captured file bytes, not a verified live CPU translation.
-The legacy output and other dump/image collectors retain their existing path;
-initialization receipts, wider migration and durable translation replay remain open.
+Wider collector migration and durable translation replay remain open.
+
+`dump-read /init-receipts` emits `kn.dump_read.v2`. Its initialization record
+belongs to the same deny-write file handle as the requested range. A failed open
+returns the decision and any reads already made, with a null range. A successful
+open places the existing v1 range observation under `requested_range`. Source
+initialization and the requested range have separate operation IDs and budgets.
+
+The initialization record charges each header or physical lookup before it runs.
+The fixed ceiling is 45 attempts and 8,544 requested bytes. It covers an 8 KiB
+header and the two candidate paging depths, including a list head that crosses
+a page boundary. Each logical list read retains the original sparse states and
+links to its ordered file attempts. An uncaptured physical range has no file
+offset. An actual file call retains the Win32 status and transfer count. File
+rows hash only the stable bytes returned by that attempt. The collector issues
+no extra reads to populate the log. The depth decision distinguishes a usable
+context, a unique list match, disagreement and ambiguity. Collector ticks measure
+local access time. Verifying a digest later requires the original saved file.
 
 ### Typed crash dump diagnosis
 

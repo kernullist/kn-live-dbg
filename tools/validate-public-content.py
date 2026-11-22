@@ -104,6 +104,8 @@ def capture_jws_offset(text: str) -> int | None:
     return None
 
 
+DUMP_INIT_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1")
+DUMP_INIT_MARKERS = (*DUMP_INIT_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"')
 ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_etl_probe", '"first_decoded_record"', '"first_payload_sha256"', '"statement_file_sha256"', '"trusted_key_sha256"', '"se_system_profile_privilege_enabled"', '"record_ordinal"', '"reported_etl_sha256"', '"expected_page_sha256"', '"event_keyword_decimal"',
                    '"source_after"', '"header_perf_frequency"', '"start_filetime"', '"sampled_thread_id"', '"paired_record_pid"', '"payload_tid"', '"image_base"',
                    '"recorded_file_name"', '"reported_rva"', '"before_record"', '"switch_ordinal"', '"new_thread_id"',
@@ -117,7 +119,13 @@ ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, "kn.etl_capability_probe.v1", "saved_et
                    '"other_opcodes"', '"header_pid_conflicts"', '"group_mask_records"', '"profile_interval_records"',
                    '"group_masks"', '"profile_source_name"', '"payload_bytes"', '"group_mask_bracket"', '"reported_period_100ns"')
 
-DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
+DUMP_INIT_FIELD_SETS = tuple(frozenset(fields) for fields in (
+    ("purpose", "candidate_levels", "file_offset", "requested_bytes"),
+    ("purpose", "candidate_levels", "virtual_address", "requested_bytes"),
+    ("parser_accepted", "first_file_sequence", "file_read_count"),
+    ("seek_win32_status", "read_win32_status", "hash_input_bytes"),
+))
+DETACHED_FIELD_SETS = DUMP_INIT_FIELD_SETS + tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
     ("observation", "decoded", "unsupported", "first_decoded_record"),
     ("first_payload_bytes", "first_payload_sha256"),
@@ -189,10 +197,15 @@ DETACHED_FIELD_SETS = tuple(frozenset(fields) for fields in (
     ("record_ordinal", "header_process_id", "payload_pid", "image_base"),
 ))
 EVIDENCE_OBJECT_START = re.compile(r'(?m)^[ \t,]*(\{)\s*"')
+DUMP_INIT_OBJECT_START = re.compile(r'(\{)\s*"')
 JSON_SPACE = re.compile(r'[ \t\r\n]*')
 
 
-def detached_evidence_object(text: str, offset: int, decoder: json.JSONDecoder) -> bool:
+DETACHED_SCHEMAS = (*DUMP_INIT_SCHEMAS, *TRACE_QUERY_SCHEMAS, "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3",
+                    "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8")
+
+
+def detached_evidence_object(text, offset, decoder, field_sets, schemas) -> bool:
     # Count keys in one object. Exporters may reorder them or stop during its final value.
     keys = set()
     pos = JSON_SPACE.match(text, offset + 1).end()
@@ -203,11 +216,11 @@ def detached_evidence_object(text: str, offset: int, decoder: json.JSONDecoder) 
             if not text.startswith(":", pos):
                 break
             keys.add(key)
-            if any(fields <= keys for fields in DETACHED_FIELD_SETS):
+            if any(fields <= keys for fields in field_sets):
                 return True
             pos = JSON_SPACE.match(text, pos + 1).end()
             value, pos = decoder.raw_decode(text, pos)
-            if key == "schema" and value in (*TRACE_QUERY_SCHEMAS, "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3", "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8"):
+            if key == "schema" and value in schemas:
                 return True
             pos = JSON_SPACE.match(text, pos).end()
             if not text.startswith(",", pos):
@@ -216,6 +229,19 @@ def detached_evidence_object(text: str, offset: int, decoder: json.JSONDecoder) 
     except (ValueError, RecursionError):
         pass
     return False
+
+
+def detached_evidence_line(text: str) -> int | None:
+    patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
+    if any(tag in text for tag in DUMP_INIT_MARKERS):
+        patterns.append((DUMP_INIT_OBJECT_START, DUMP_INIT_FIELD_SETS, DUMP_INIT_SCHEMAS))
+    decoder = json.JSONDecoder()
+    for pattern, fields, schemas in patterns:
+        for match in pattern.finditer(text):
+            offset = match.start(1)
+            if detached_evidence_object(text, offset, decoder, fields, schemas):
+                return text.count("\n", 0, offset) + 1
+    return None
 
 
 def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list[dict]:
@@ -278,7 +304,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
-                                                                  "kn.wait_", "ey", "ew", *ETL_ROW_MARKERS, '"target_created"', '"begin_qpc"',
+                                                                  "kn.wait_", "ey", "ew", *ETL_ROW_MARKERS, *DUMP_INIT_MARKERS, '"target_created"', '"begin_qpc"',
                                                                  "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
@@ -323,7 +349,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
-                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1",
+                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.dump_read.v2", "kn.dump_initialization.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1",
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", *TRACE_QUERY_SCHEMAS, "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8", "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3", "kn.mcp_operation.v1",
@@ -358,12 +384,10 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS)):
-            decoder = json.JSONDecoder()
-            for match in EVIDENCE_OBJECT_START.finditer(text):
-                if detached_evidence_object(text, match.start(1), decoder):
-                    add("private-evidence-bundle", text.count("\n", 0, match.start(1)) + 1)
-                    break
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_INIT_MARKERS)):
+            line = detached_evidence_line(text)
+            if line is not None:
+                add("private-evidence-bundle", line)
         # WCT output may be redirected or cut between individually flushed rounds.
         if (not binary or view is not data) and ("kn.wait_" in text or '"begin_qpc"' in text) and not any(f["rule"] == "private-evidence-bundle" for f in findings):
             record = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.wait_(?:chain|assessment|diagnosis|series(?:_assessment)?)\.v1"\s*(?:[,}]|$)', text)

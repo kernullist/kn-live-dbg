@@ -114,6 +114,15 @@ int wmain(int argc, wchar_t** argv)
     const auto declaredRead = declared.ReadWithReceipts(declaredRequest);
     Check(declaredRead.Translations[0].Root.Binding == L"caller_declared_dump_root",
         "callback-only source does not claim an owned dump file handle");
+    std::optional<ObservationReadResult> original;
+    std::vector<uint8_t> parserBytes{0xff};
+    Check(!ReadObservationExactWithReceipt(declared, declaredRequest.Address, declaredRequest.Length, &parserBytes, &original) &&
+        original && original->State == ObservationReadState::NotPresent && parserBytes.empty(),
+        "exact parser rejection retains the observed missing mapping");
+    const auto callsBeforeRejection = callbackCalls;
+    Check(!ReadObservationExactWithReceipt(declared, declaredRequest.Address, 0, &parserBytes, &original) &&
+        !original && parserBytes.empty() && callbackCalls == callsBeforeRejection,
+        "invalid exact request clears stale evidence before any source call");
     DumpObservationSource invalid(L"synthetic:invalid", 0x1000, 0, emptyPage);
     callbackCalls = 0;
     Check(invalid.ReadWithReceipts(declaredRequest).Result.State == ObservationReadState::IdentityChanged && callbackCalls == 0,
@@ -246,6 +255,45 @@ int wmain(int argc, wchar_t** argv)
         Check(probed.Save(path) && !OpenDumpObservationSource(path.wstring(), &error),
             "contradictory CR4 and unique page-table evidence cannot silently select a mode");
     }
+    for (const auto levels : {4u, 5u})
+    {
+        const uint64_t page = levels == 5 ? 0xff01000000100000ull : 0xffff800000100000ull;
+        Fixture split(levels, 1, page + 4088);
+        split.Header.KdSecondaryVersion = 0;
+        split.Header.PsLoadedModuleList = split.Virtual;
+        const auto end = split.Bytes.size();
+        std::memcpy(split.Bytes.data() + end - 8, &split.Virtual, 8);
+        auto path = root / (L"split-hole-" + std::to_wstring(levels) + L".dmp");
+        DumpInitializationObservation init;
+        Check(split.Save(path) && !OpenDumpObservationSource(path.wstring(), &error, &init) &&
+            init.RecordingComplete && !init.SelectedLevels, "missing second page rejects the list head and retains attempts");
+
+        split.Bytes.resize(end + 4096);
+        ++split.Header.PhysicalMemoryBlock.NumberOfPages;
+        ++split.Header.PhysicalMemoryBlock.Run[1].PageCount;
+        std::memcpy(split.Bytes.data() + end, &split.Virtual, 8);
+        path = root / (L"split-head-" + std::to_wstring(levels) + L".dmp");
+        Check(split.Save(path), "captured both pages of the split head");
+        auto qualified = OpenDumpObservationSource(path.wstring(), &error, &init);
+        Check(qualified && init.SelectedLevels == levels && init.RecordingComplete &&
+            init.Attempts == init.Reads.size() && init.ChargedBytes <= init.MaxRequestedBytes,
+            "split-head validation fits the same initialization budget");
+        if (qualified)
+        {
+            const auto originalJson = DumpInitializationJson(init);
+            ObservationReadRequest request{qualified->Capabilities().SourceId, split.Virtual, 8, 8};
+            Check(qualified->ReadWithReceipts(request).Result.State == ObservationReadState::Complete &&
+                originalJson == DumpInitializationJson(init), "requested reads cannot append to the initialization ledger");
+            qualified.reset();
+            Check(originalJson == DumpInitializationJson(init), "initialization proof survives source close");
+            auto reopened = OpenDumpObservationSource(path.wstring(), &error, &init);
+            Check(reopened && init.SourceId != request.SourceId && init.SelectedLevels == levels,
+                "reusing the report starts a fresh handle binding");
+        }
+        Check(!OpenDumpObservationSource((root / L"missing.dmp").wstring(), &error, &init) && init.Reads.empty() &&
+            init.Attempts == 0 && init.SourceId.empty() && !init.SelectedLevels && init.OpenStatus == static_cast<uint32_t>(ERROR_FILE_NOT_FOUND),
+            "failed reopen cannot retain previous decisions or digests");
+    }
     Fixture ambiguous(5, 1, 0xffffffffffffe000ull);
     ambiguous.Header.KdSecondaryVersion = 0;
     ambiguous.Header.PsLoadedModuleList = ambiguous.Virtual;
@@ -253,6 +301,27 @@ int wmain(int argc, wchar_t** argv)
     std::memcpy(ambiguous.Bytes.data() + 0x2000 + 0x3000 + 510 * 8, &alternate, 8);
     std::memcpy(ambiguous.Bytes.data() + ambiguous.Bytes.size() - 4096, &ambiguous.Virtual, 8);
     std::memcpy(ambiguous.Bytes.data() + ambiguous.Bytes.size() - 4096 + 8, &ambiguous.Virtual, 8);
+    Fixture bothSplit(5, 1, 0xffffffffffffcff8ull);
+    bothSplit.Header.KdSecondaryVersion = 0;
+    bothSplit.Header.PsLoadedModuleList = bothSplit.Virtual;
+    // The two candidate layouts in this fixture refer to the same pair of data pages.
+    const size_t alternateSlot = 0x2000 + 3 * 4096 + ((bothSplit.Virtual >> 12) & 511) * 8;
+    const uint64_t secondData = alternate + 4096;
+    std::memcpy(bothSplit.Bytes.data() + alternateSlot, &alternate, 8);
+    std::memcpy(bothSplit.Bytes.data() + alternateSlot + 8, &secondData, 8);
+    const size_t endOfRun = bothSplit.Bytes.size();
+    bothSplit.Bytes.resize(endOfRun + 4096);
+    ++bothSplit.Header.PhysicalMemoryBlock.NumberOfPages;
+    ++bothSplit.Header.PhysicalMemoryBlock.Run[1].PageCount;
+    std::memcpy(bothSplit.Bytes.data() + endOfRun - 8, &bothSplit.Virtual, 8);
+    std::memcpy(bothSplit.Bytes.data() + endOfRun, &bothSplit.Virtual, 8);
+    DumpInitializationObservation maximum;
+    const auto bothSplitPath = root / L"split-ambiguous.dmp";
+    Check(bothSplit.Save(bothSplitPath) && !OpenDumpObservationSource(bothSplitPath.wstring(), &error, &maximum) &&
+        maximum.RecordingComplete && maximum.Attempts == maximum.MaxReads && maximum.ChargedBytes == maximum.MaxRequestedBytes &&
+        maximum.ProbeReads.size() == 6 && std::wstring(maximum.Decision) == L"depth_ambiguous",
+        "both complete cross-page candidate probes reach the exact file budget and retain the ambiguity");
+
     const auto ambiguousPath = root / L"ambiguous.dmp";
     Check(ambiguous.Save(ambiguousPath) && !OpenDumpObservationSource(ambiguousPath.wstring(), &error),
         "two successful paging probes without CR4 remain ambiguous");

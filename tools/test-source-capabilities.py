@@ -106,7 +106,8 @@ def main():
     assert "successful_original_slice_replay" in sweep_graph["requirements"]
     assert "no_execution_or_cross_bundle_lifetime_join" in sweep_graph["limits"]
     assert "query_budget_excludes_replay" in sweep_graph["limits"]
-    assert "qualified_paging_depth" in by_key[("memory", "read_virtual", "dump")]["requirements"]
+    dump_requirements = by_key[("memory", "read_virtual", "dump")]["requirements"]
+    assert "qualified_paging_depth" in dump_requirements and "optional_initialization_file_read_receipts" in dump_requirements
     assert "not_captured_vs_not_present" in by_key[("memory", "read_virtual", "dump")]["limits"]
     schema = by_key[("schema", "export_type", "local_pdb")]
     assert "exact_amd64_image_pdb_identity" in schema["requirements"]

@@ -26,6 +26,7 @@
 #include "DumpAnalyzer.h"
 #include "DumpObservationSource.h"
 #include "DumpReadObservationJson.h"
+#include "ArtifactOutput.h"
 #include "ObservationSourceJson.h"
 #include "DmaPostureScanner.h"
 #include "InputStackScanner.h"
@@ -23119,7 +23120,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples or saved ETL profile pages\n";
     std::wcout << L"  !kmon trace <local.log> /v8 <sha256> [/code-log <local.log.ll> <sha256>] [/limit N] [/cursor token] [/json]  saved V8 CPU samples\n";
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
-    std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
+    std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
@@ -23465,6 +23466,47 @@ static bool ParseKmonStartArgs(
     return true;
 }
 
+static int ReadOfflineDumpRange(const std::wstring& path, uint64_t address, uint32_t length,
+    bool receipts, DumpInitializationObservation* initialization, bool directJsonOutput)
+{
+    const auto publish = [&](const std::wstring& document, int status)
+    {
+        if (initialization && directJsonOutput) { return WriteCapabilityJson(document) ? status : 3; }
+        std::wcout << document << L"\n";
+        std::wcout.flush();
+        return std::wcout.good() ? status : 1;
+    };
+    std::wstring error;
+    auto source = OpenDumpObservationSource(path, &error, initialization);
+    if (!source)
+    {
+        // An inherited writable hard link can prevent the source's deny-write
+        // lease from opening. Check the sink before publishing that failure.
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, path, [&] {
+            if (initialization) { return publish(DumpReadWithInitializationJson(*initialization, nullptr, error), 1); }
+            return publish(L"{\"schema\":" + mcpjson::Quote(receipts ? L"kn.dump_read.v1" : L"kn.observation_read.v1") +
+                L",\"status\":\"unavailable\",\"error\":" + mcpjson::Quote(error) + L",\"collector_authenticated\":false,\"spans\":[]}", 1);
+        });
+    }
+    ObservationReadRequest request;
+    request.SourceId = source->Capabilities().SourceId;
+    request.Address = address;
+    request.Length = length;
+    request.ByteBudget = length;
+    request.Cancellation = &g_StopRequested;
+    if (receipts || initialization)
+    {
+        const auto observed = source->ReadWithReceipts(request);
+        const bool complete = observed.Result.State == ObservationReadState::Complete &&
+            !observed.Result.CancellationObserved && !observed.Result.OperationDeadlineExceeded;
+        return publish(initialization ? DumpReadWithInitializationJson(*initialization, &observed, error) :
+            DumpReadObservationJson(observed), complete ? 0 : 1);
+    }
+    const auto result = source->Read(request);
+    return publish(ObservationReadJson(source->Capabilities(), request, result),
+        result.State == ObservationReadState::Complete && !result.CancellationObserved ? 0 : 1);
+}
+
 static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool directJsonOutput = false)
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
@@ -23705,47 +23747,27 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
     if (action == L"dump-read")
     {
         uint64_t address = 0, length = 0;
-        bool receipts = false, json = false;
+        bool receipts = false, includeInitialization = false, json = false;
         bool valid = args.size() >= 5 && args.size() <= 7;
         for (size_t i = 5; valid && i < args.size(); ++i)
         {
             const auto option = ToLower(args[i]);
-            if (option == L"/receipts" && !receipts) { receipts = true; }
+            if (option == L"/receipts" && !receipts && !includeInitialization) { receipts = true; }
+            else if (option == L"/init-receipts" && !receipts && !includeInitialization) { includeInitialization = true; }
             else if (option == L"/json" && !json) { json = true; }
             else { valid = false; }
         }
         if (!valid || args[2].empty() ||
             !ParseUnsigned(args[3], 16, &address) || !ParseUnsigned(args[4], 10, &length) || length == 0 || length > 4096)
         {
-            std::wcerr << L"usage: !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
-            return 2;
+            return WriteWithDistinctInput(STD_ERROR_HANDLE, args.size() > 2 ? args[2] : L"", [] {
+                std::wcerr << L"usage: !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]\n";
+                return 2;
+            });
         }
-        std::wstring error;
-        auto source = OpenDumpObservationSource(args[2], &error);
-        if (!source)
-        {
-            std::wcout << L"{\"schema\":" << mcpjson::Quote(receipts ? L"kn.dump_read.v1" : L"kn.observation_read.v1")
-                << L",\"status\":\"unavailable\",\"error\":"
-                << mcpjson::Quote(error) << L",\"collector_authenticated\":false,\"spans\":[]}\n";
-            return 1;
-        }
-        ObservationReadRequest request;
-        request.SourceId = source->Capabilities().SourceId;
-        request.Address = address;
-        request.Length = static_cast<uint32_t>(length);
-        request.ByteBudget = length;
-        request.Cancellation = &g_StopRequested;
-        if (receipts)
-        {
-            const auto observed = source->ReadWithReceipts(request);
-            std::wcout << DumpReadObservationJson(observed) << L"\n";
-            std::wcout.flush();
-            return observed.Result.State == ObservationReadState::Complete && !observed.Result.CancellationObserved &&
-                !observed.Result.OperationDeadlineExceeded && std::wcout.good() ? 0 : 1;
-        }
-        const auto result = source->Read(request);
-        std::wcout << ObservationReadJson(source->Capabilities(), request, result) << L"\n";
-        return result.State == ObservationReadState::Complete && !result.CancellationObserved ? 0 : 1;
+        DumpInitializationObservation initialization;
+        return ReadOfflineDumpRange(args[2], address, static_cast<uint32_t>(length), receipts,
+            includeInitialization ? &initialization : nullptr, directJsonOutput);
     }
     if (action == L"relate")
     {
@@ -54039,13 +54061,14 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
     // must never be consumed as an ignored argument by one of those handlers.
     const auto reject = [&](const std::wstring& mode, const wchar_t* reason, int code)
     {
-        // A restricted launch cannot open a named ETL to exclude a writable
+        // A restricted launch cannot open a named artifact to exclude a writable
         // hard-link alias. Preserve the file and return the policy exit code.
         if (GetFileType(GetStdHandle(STD_OUTPUT_HANDLE)) == FILE_TYPE_DISK)
         {
             for (int i = 1; i + 1 < argc; ++i)
             {
-                if (_wcsicmp(argv[i], L"--probe-etl") == 0) { return code; }
+                if (_wcsicmp(argv[i], L"--probe-etl") == 0 ||
+                    (_wcsicmp(argv[i], L"dump-read") == 0 && _wcsicmp(argv[i - 1], L"!kmon") == 0)) { return code; }
             }
         }
         return WriteLaunchDecision(mode, reason, code);

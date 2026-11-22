@@ -5,7 +5,9 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 enum class ObservationReadState
@@ -250,9 +252,11 @@ private:
     }
 };
 
-inline bool ReadObservationExact(IObservationSource& source, uint64_t address, size_t length,
-    std::vector<uint8_t>* bytes, bool allowResidencyChanges = false, const std::atomic<bool>* cancellation = nullptr)
+inline bool ReadObservationExactWithReceipt(IObservationSource& source, uint64_t address, size_t length,
+    std::vector<uint8_t>* bytes, std::optional<ObservationReadResult>* original,
+    bool allowResidencyChanges = false, const std::atomic<bool>* cancellation = nullptr)
 {
+    if (original) { original->reset(); }
     if (bytes == nullptr)
     {
         return false;
@@ -269,16 +273,24 @@ inline bool ReadObservationExact(IObservationSource& source, uint64_t address, s
     request.ByteBudget = length;
     request.AllowResidencyChanges = allowResidencyChanges;
     request.Cancellation = cancellation;
-    const auto result = source.Read(request);
-    if (result.State != ObservationReadState::Complete || result.CancellationObserved || result.OperationDeadlineExceeded)
+    auto result = source.Read(request);
+    // Preserve the original sparse result before assembling the exact parser view.
+    const auto& observed = original ? original->emplace(std::move(result)) : result;
+    if (observed.State != ObservationReadState::Complete || observed.CancellationObserved || observed.OperationDeadlineExceeded)
     {
         return false;
     }
-    for (const auto& span : result.Spans)
+    for (const auto& span : observed.Spans)
     {
         bytes->insert(bytes->end(), span.Bytes.begin(), span.Bytes.end());
     }
     return bytes->size() == length;
+}
+
+inline bool ReadObservationExact(IObservationSource& source, uint64_t address, size_t length,
+    std::vector<uint8_t>* bytes, bool allowResidencyChanges = false, const std::atomic<bool>* cancellation = nullptr)
+{
+    return ReadObservationExactWithReceipt(source, address, length, bytes, nullptr, allowResidencyChanges, cancellation);
 }
 
 // Parser compatibility helper. Multiple reads are not an atomic snapshot.

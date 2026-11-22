@@ -41,7 +41,7 @@ inline const std::vector<SourceCapability>& SourceCapabilities()
             L"supported_dump_header;captured_physical_runs;qualified_root",
             L"uncaptured_pages;not_all_dump_formats;not_live_execution"},
         {L"memory", L"read_virtual", L"dump", L"implemented", L"offline_dump",
-            L"amd64_full_dump_runs;qualified_paging_depth;readable_file",
+            L"amd64_full_dump_runs;qualified_paging_depth;readable_file;optional_initialization_file_read_receipts",
             L"captured_root_only;not_captured_vs_not_present;file_handle_scope;no_collector_authentication"},
         {L"evidence", L"query", L"bundle", L"implemented", L"recorded_bundle",
             L"valid_kncase_v1_or_v2;readable_directory",

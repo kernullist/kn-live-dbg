@@ -537,12 +537,15 @@ static int RunCommandAuditSelfTest()
     { check(run(line).Error.find(L"usage") != std::wstring::npos, L"direct capture archival rejects malformed arguments"); }
     check(IsWriteLikeCommandLine(L"!kmon inventory x new-output /json") &&
         !IsWriteLikeCommandLine(L"!kmon evidence x /inventory saved-index /json") &&
-        !IsWriteLikeCommandLine(L"!kmon dump-read x.dmp 1000 16 /json"),
+        !IsWriteLikeCommandLine(L"!kmon dump-read x.dmp 1000 16 /json") &&
+        !IsWriteLikeCommandLine(L"!kmon dump-read x.dmp 1000 16 /init-receipts /json"),
         L"inventory publication is an explicit file export while snapshot queries are read-only");
     for (const auto& line : {L"!kmon inventory x", L"!kmon inventory x y /bad", L"!kmon evidence x /inventory",
         L"!kmon evidence x /inventory /json", L"!kmon evidence x /inventory-cursor token",
         L"!kmon dump-read x.dmp 1000", L"!kmon dump-read x.dmp 1000 0", L"!kmon dump-read x.dmp 1000 4097",
-        L"!kmon dump-read x.dmp -1 8", L"!kmon dump-read x.dmp 1000 8 /bad"})
+        L"!kmon dump-read x.dmp -1 8", L"!kmon dump-read x.dmp 1000 8 /bad",
+        L"!kmon dump-read x.dmp 1000 8 /init-receipts /receipts",
+        L"!kmon dump-read x.dmp 1000 8 /init-receipts /init-receipts"})
     {
         check(run(line).Error.find(L"usage") != std::wstring::npos, L"inventory arguments fail before file creation");
     }

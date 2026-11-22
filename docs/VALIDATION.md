@@ -4432,6 +4432,48 @@ collector authenticity, execution or maliciousness. No driver was loaded,
 service started, Verifier enabled, reboot requested or security policy changed
 for this substep.
 
+## Saved dump initialization receipts on 2026-11-22
+
+This P02 checkpoint covers the file reads that qualify a saved AMD64 full dump.
+The direct `--offline !kmon dump-read` command exposes them through
+`/init-receipts`. Both the regular and AddressSanitizer builds of
+`tools/validate-dump-source.ps1` passed 160 checks each on owned synthetic files.
+Run the CLI check against either harness's reported fixture directory:
+
+```text
+python tools/test-dump-initialization.py --executable x64/Release/KnLiveDbg.exe --fixtures <fixture-directory>
+```
+
+The CLI check compared file offsets, physical addresses, byte counts and
+SHA-256 values to the fixture bytes. Unique four- and five-level probes required
+17 and 19 file attempts. A fixture where both candidates matched took 34. A
+list head split across two pages at both depths reached the full ceiling of
+45 attempts and 8,544 requested bytes. Both ambiguous fixtures returned an
+unavailable decision and a null requested range. A missing second page retained
+the captured first span. Complete neighbor reads with disagreeing pointer
+values recorded the comparison failure and stopped at that neighbor.
+
+Windows returned sharing violation 32 when an existing writer prevented the
+file from opening. A byte-range lock over the header or list data allowed
+the file to open and produced read error 33 at the locked range. Tests also
+covered 13 malformed or conflicting fixtures, stale report reuse, hard-linked
+diagnostic sinks, read-only output and truncated private exports in UTF-8
+and UTF-16. The Release x64 CLI passed its 227 legacy dump checks. One final
+symlink check was skipped because the host lacked symlink creation privilege.
+
+Shared read and translation harnesses passed 48 and 65 checks respectively.
+Their JSON checks covered 14 read snapshots across 13 operations and 13
+translation observations. Linked command and console self-tests passed 3,083
+and 570 checks. The compiled matrix matched 61 source contracts and 261 routes.
+The public-content scanner passed 30 regression tests. The Release link retained
+the existing C4744 alignment warning for `KmonHuntIndex::NextQueryEpoch`. The
+AddressSanitizer runtime reported an interceptor warning and ran with its
+continue-on-interception-failure setting.
+
+This checkpoint used saved synthetic inputs. Live root acquisition, real LA57
+hardware validation, initialization in other collectors and replay from the
+initialization hashes remain open.
+
 ## Typed dump translation checkpoint: 2026-11-07
 
 This P02 substep adds a physical address domain, a typed page-table walker and

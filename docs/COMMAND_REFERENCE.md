@@ -261,6 +261,27 @@ opening; initialization probes are not included. Unknown dump CPU features leave
 paging permissions null, and matching rechecks do not establish mapping lifetime
 or execution. The existing command without `/receipts` keeps its original schema.
 
+Use `/init-receipts` for the evidence used to open the dump. For example, the
+four-level fixture from `tools/validate-dump-source.ps1` can be read from its fixture directory:
+
+```text
+KnLiveDbg.exe --offline !kmon dump-read probed-4.dmp ffff800000100000 8 /init-receipts /json
+```
+
+In `kn.dump_read.v2`, `initialization.decision` explains how the reader accepted
+or rejected the dump. The fixture returns `unique_probe` and selects four levels.
+Each logical list check identifies its first file-read sequence and count. The
+file rows give offsets, requested lengths, SHA-256 of the observed bytes and
+native I/O results. A null seek or read status means that call did not run.
+If opening fails, `requested_range` is null and the command exits 1. An accepted
+source includes the normal `kn.dump_read.v1` range result. Specify one receipt
+option per command. The direct v2 command exits 3 if writing the report fails.
+When the reader cannot establish that a redirected diagnostic goes to a file
+separate from its input, it skips the write and exits 2. Restricted `--mode`
+rejects named dump reads and sends its decision to a pipe or console. For a disk
+sink it returns the policy or syntax exit code without writing. Both receipt
+formats are private evidence.
+
 `KnLiveDbg.exe --offline !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length> <new-directory> /json`
 captures one 1..4,096-byte executable comparison and its exact reference into a
 new case directory using its parent's access controls. The dump must meet `dump-read` requirements. Base and RVA
