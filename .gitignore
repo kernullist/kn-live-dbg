@@ -58,6 +58,7 @@ ipch/
 *.pdb
 *.ilk
 *.log
+*.log.ll
 *.tlog
 *.lastbuildstate
 *.recipe

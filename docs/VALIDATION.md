@@ -5341,6 +5341,52 @@ the 93 execution trace controls passed. The x64 AddressSanitizer run used
 warnings. The observed workload declarations were v1. Capture-time code
 bytes, a live ReJIT transition and independently verified execution remain open.
 
+## V8 CPU samples and recorded code bytes on 2026-11-22
+
+On Windows x64, Node.js 24.22.3 (V8 13.6.233.17-node.63) ran a
+single-isolate arithmetic workload with CPU profiling, low-level code logging
+and disassembly enabled. The Release reader paged through all 274 ticks,
+2,564 code creations and 2,564 binary records. It matched 59 sampled PCs
+to the recorded bytes of JavaScript functions. Nine of those PCs were in the
+workload's `profiledArithmetic` function.
+
+The test compared each tick's PC and original line with the text log, and its
+logger timestamp and VM state with Node's tick processor. For all 59 matched
+PCs, the processor agreed on the native code kind, creation time and offset
+within the function. A separate Python reader checked the complete body's
+SHA-256 and the byte window at that offset against the x64 binary log.
+All 59 windows also matched the instruction bytes printed by V8's disassembler.
+These checks use different representations from the same producer. The tick's
+timestamp comes from the logger when it drains its queue. The actual sampling
+instant and the code bytes resident at that instant remain unknown.
+[V8 log writer](https://github.com/nodejs/node/blob/v24.22.3/deps/v8/src/logging/log.cc) · [V8 tick processor](https://github.com/nodejs/node/blob/v24.22.3/deps/v8/tools/tickprocessor.mjs)
+
+Pairing the text log with a valid binary log from a different Node process
+preserved the raw ticks, reported a partial result and returned no code bytes.
+Constructed cases covered address reuse, relocation, deoptimization,
+interpreter ranges, missing history, truncated records, incorrect file
+digests, paging and redirected source/output aliases. The named CLI and
+the restricted single-file input route both ran. The two-file example in
+the operator guide ran in Windows PowerShell 5.1 and PowerShell 7.
+[Saved V8 CPU profiles](TRACE_IMPORT.md#saved-v8-cpu-profiles)
+
+Separate runs of the owned workload exercised the Win32 reader and the x64
+AddressSanitizer build. Win32 matched 91 of 239 ticks and the sanitizer build
+matched 50 of 256. Every matched byte window in both runs agreed with the
+disassembly. The sanitizer used `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1`
+for this host's interceptor warnings. The Release build emitted the 16 existing
+C4744 link warnings. All 570 console checks, 93 execution trace controls
+and the compiled capability inventory (60 contracts, 261 routes) passed.
+
+```powershell
+python tools/test-v8-profile.py --exe x64/Release/KnLiveDbg.exe --node node
+powershell -NoProfile -ExecutionPolicy Bypass -File tools/validate-execution-trace.ps1
+```
+
+This adapter covers the pinned Windows V8 format and x64 binary layout.
+Browser builds, other V8 versions, Wasm code identity, live JIT or CLR ReJIT
+transitions and process-lifetime attribution remain open.
+
 ## Normalized trace import checkpoint: 2026-10-30
 
 Release x64 EXE SHA-256:

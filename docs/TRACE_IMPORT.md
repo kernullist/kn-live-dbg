@@ -406,6 +406,55 @@ require separate evidence. The incoming `new_wait_time` payload keeps
 its original, unspecified unit. Store both full pages and extracted intervals
 with the private trace.
 
+## Saved V8 CPU profiles
+
+The trace query reads the Windows V8 profiler log emitted by Node.js
+24.22.3, V8 13.6.233.17-node.63. The optional x64 low-level log contains
+the bytes V8 wrote for each code-creation record. Each input has its own
+SHA-256. One isolate per log gives the records a common file scope.
+[V8 sample-based profiler](https://v8.dev/docs/profile) · [Node's V8 log writer](https://github.com/nodejs/node/blob/v24.22.3/deps/v8/src/logging/log.cc)
+
+From PowerShell, run a single-isolate workload called `workload.js` in the
+current directory and pass the two resulting files to KnLiveDbg.
+
+```powershell
+node --prof --ll-prof --no-logfile-per-isolate --no-log-source-code --logfile=workload.log .\workload.js
+$profilePin = (Get-FileHash .\workload.log -Algorithm SHA256).Hash
+$codePin = (Get-FileHash .\workload.log.ll -Algorithm SHA256).Hash
+$exe = 'x64/Release/KnLiveDbg.exe'
+& $exe --offline '!kmon' trace .\workload.log /v8 $profilePin /code-log .\workload.log.ll $codePin /limit 32 /json
+```
+
+Use the same digests and limit with `/cursor <next_cursor>` for the next
+page. A query of the text log alone omits `/code-log`. Restricted offline and
+observe launches accept a single resident local file redirected to standard
+input, for example `KnLiveDbg.exe --mode offline trace - /v8 <sha256>` with
+file redirection in `cmd.exe`. The named offline query accepts both files.
+
+| Result field | Meaning |
+| --- | --- |
+| `sampled_pc`, `logger_time_us`, `record_ordinal` | Original PC, logger elapsed microseconds and one-based physical line. V8 takes this timestamp when its profiler thread drains a queued sample. The row also preserves the VM state, external-callback flag, TOS or callback address, reported stack depth and overflow marker. |
+| `log_order_range` | Most recent code-map entry at that PC in file order. It retains the creation and location ordinals, original and mapped addresses, extent, offset, V8 kind, tier marker and reported shared-function-info address at creation. The escaped name is retained up to 1,024 printable bytes. The source line identifies longer names. |
+| `code_record_bytes` | SHA-256 and file offset of the complete low-level body plus a separate hash and offset for up to 32 bytes beginning at the sampled PC's offset. A matching binary record supplies the bytes. |
+| `range_relation`, `byte_relation` | Why a row has a reported JS range or recorded bytes. External callbacks, interpreter bytecode, reused locations, relocations, deoptimizations, incomplete mapping history and sample overflow retain distinct outcomes. |
+
+The code map applies creation, overlap replacement, move and deletion in
+file order. A byte match requires a qualified baseline, Maglev or TurboFan
+JS range at its original address. The reader compares the entire ordered
+creation/move sequence from both logs and the individual code label. The
+binary logger may truncate long names. An unconfirmed label leaves the
+hash fields null. Code-creation records can also enumerate existing code.
+The producer's authenticity, isolate/process lifetime and the bytes at the
+actual sample instant remain unverified. [V8 dynamic code map](https://github.com/nodejs/node/blob/v24.22.3/deps/v8/tools/codemap.mjs)
+
+The query accepts up to 64 MiB per input, one million text lines, 65,536
+retained mappings or binary records, and 128 samples per page. An incomplete
+final line, missing profiler boundary, unresolved mapping change or mismatched
+companion yields `partial` and exit 1 with available rows. Unsupported text
+versions, malformed recognized records, exhausted text mapping budgets and
+incorrect pins yield `unavailable` and exit 1. A complete page returns
+`ok` and exit 0. [V8 validation](VALIDATION.md#v8-cpu-samples-and-recorded-code-bytes-on-2026-11-22)
+
 ## Normalized execution trace import
 
 The trace query reads a local normalized trace or a saved CPU profile page.

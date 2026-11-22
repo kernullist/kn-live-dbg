@@ -265,6 +265,9 @@
     <ClCompile Include="EtlTracePage.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="V8Profile.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="ExecutionTrace.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -481,6 +484,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="EtlTracePage.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="V8Profile.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="TraceJsonFields.h">

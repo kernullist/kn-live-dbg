@@ -880,6 +880,18 @@ original method record ordinals and the sample's offset. The normalized
 query carries this reported method separately from verified code identity.
 [Saved CLR method evidence](TRACE_IMPORT.md#match-a-cpu-sample-to-a-clr-method)
 
+### V8 code records in saved profiles
+
+The offline trace query accepts the Windows V8 text profiler and its x64
+binary code log. The original sample PC, logger time and physical record
+number remain available even when a JS function cannot be assigned. The
+reader tracks range replacement, relocation, deletion and deoptimization.
+An optional, independently pinned low-level log supplies the bytes attached
+to a matching code-creation record. Matching requires an ordered comparison
+of the two files and a compatible function label. The target process creation
+time and the original PC capture timestamp remain unknown.
+[Saved V8 CPU profiles](TRACE_IMPORT.md#saved-v8-cpu-profiles)
+
 ## Pending I/O observation graphs
 
 The native pending-IRP reader retains every admitted request, including requests

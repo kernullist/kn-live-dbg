@@ -1,4 +1,5 @@
 #include "ExecutionTrace.h"
+#include "V8Profile.h"
 #include "ArtifactOutput.h"
 #include "ContentHash.h"
 #include "TraceJsonFields.h"
@@ -393,6 +394,10 @@ std::wstring ExecutionTracePageJson(const ExecutionTrace& trace, size_t offset, 
 int RunExecutionTraceCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation, ExecutionTraceInput input)
 {
     std::wstring error;
+    if (args.size() >= 2 && args[1] == L"/v8")
+    {
+        return RunV8ProfileQuery(args, cancellation, input == ExecutionTraceInput::LocalStandardInput);
+    }
     std::wstring unavailable = L"{\"schema\":\"kn.execution_trace_query.v1\",\"status\":\"unavailable\",\"execution_observed\":false";
     std::wstring cursor;
     uint64_t limit = 64;

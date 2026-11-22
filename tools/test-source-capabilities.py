@@ -193,10 +193,13 @@ def main():
     assert "saved_context_not_cpu_sample" in by_key[("execution", "classify_reference", "native")]["limits"]
     assert "single_observation_ids" in by_key[("io", "request_graph", "native")]["limits"]
     assert "no_request_lifetime_or_completion_inference" in by_key[("io", "request_graph", "native")]["limits"]
+    v8 = by_key[("execution", "v8_profile", "v8_windows_log")]
+    assert "ordered_code_event_and_label_match" in v8["requirements"] and "no_code_bytes_at_sample_time" in v8["limits"]
     trace = by_key[("execution", "trace_import", "trace")]
     assert trace["implementation"] == "implemented" and "unauthenticated_producer" in trace["limits"]
     assert "no_raw_decoder_or_live_backend" in trace["limits"]
-    assert all(s in trace["requirements"] for s in ("saved_etl_profile_pages_v1_to_v7", "separate_report_and_source_digests"))
+    assert all(s in trace["requirements"] for s in ("saved_etl_profile_pages_v1_to_v7", "saved_etl_profile_v8_clr",
+                                                   "separate_report_and_source_digests"))
     switches = by_key[("execution", "context_switch", "etl")]
     assert switches["implementation"] == "implemented" and switches["consistency"] == "reported_scheduler_event"
     assert "classic_thread_opcode36_versions2_3_4" in switches["requirements"]

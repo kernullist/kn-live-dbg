@@ -23117,6 +23117,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
     std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples or saved ETL profile pages\n";
+    std::wcout << L"  !kmon trace <local.log> /v8 <sha256> [/code-log <local.log.ll> <sha256>] [/limit N] [/cursor token] [/json]  saved V8 CPU samples\n";
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
@@ -54130,6 +54131,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --help                   show this help without loading a driver\n";
         std::wcout << L"  KnLiveDbg.exe --mode offline|observe --help   list operations for a restricted one-shot launch\n";
         std::wcout << L"    --capabilities | trace - [/limit N] [/cursor token] (redirect a local trace file to stdin)\n";
+        std::wcout << L"    trace - /v8 <sha256> [/limit N] [/cursor token] (redirect a V8 profiler log to stdin)\n";
         std::wcout << L"    observe also accepts --capabilities --probe --allow-residency (self only, 32 bytes)\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities           print compiled source contracts as JSON; no target probe\n";
         std::wcout << L"  KnLiveDbg.exe --capabilities --probe   probe an owned read and existing device; no driver load\n";

@@ -232,6 +232,7 @@
     <ClCompile Include="ExecutionTrace.cpp" />
     <ClCompile Include="EtlCaptureStatement.cpp" />
     <ClCompile Include="EtlTracePage.cpp" />
+    <ClCompile Include="V8Profile.cpp" />
     <ClCompile Include="ParserWorkerProcess.cpp" />
     <ClCompile Include="ReferenceArtifact.cpp" />
     <ClCompile Include="ImageRecipeJson.cpp" />
@@ -338,6 +339,7 @@
     <ClInclude Include="ExecutionTrace.h" />
     <ClInclude Include="EtlCaptureStatement.h" />
     <ClInclude Include="EtlTracePage.h" />
+    <ClInclude Include="V8Profile.h" />
     <ClInclude Include="P256Signature.h" />
     <ClInclude Include="TraceJsonFields.h" />
     <ClInclude Include="HiveScanner.h" />
