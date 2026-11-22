@@ -16,6 +16,7 @@ CPU_PROGRAM = "TraceProcessorReadyTest.exe"
 CPU_SDK_HASH = "bee8791296225909ead0839cd4f18585062f8efeb4a0654dcae5dcca73c00ab8"
 TABLE = "IGenericEventDataSource.Events"
 SCHEMA = "kn.traceprocessor_activity_rows.v1"
+ALL_MARKERS = "kn.traceprocessor_activity_markers.v1"
 HEADER = ("provider_guid", "activity_id", "channel", "task", "opcode", "event_id", "version", "header_process_id", "header_thread_id")
 
 
@@ -96,21 +97,34 @@ def verify_modules(modules, required_sdk, optional=()):
           "unexpected loaded processing modules")
 
 
-def correlate(document, native):
-    page = native["page"]
-    a, b = (page["activity_window"][name] for name in ("start", "stop"))
+def validate_projection(document, source_hash, size, provider, activity_id, window=None):
     fields(document, "schema source_sha256 source_bytes table provider_guid activity_id query_filter loaded_processing_modules "
-           "provider_rows activity_marker_rows scoped_marker_rows matched_rows row_limit rows",
+           "provider_rows activity_marker_rows scoped_marker_rows matched_rows row_limit rows" + ("" if window else " trace_metadata"),
            "TraceProcessor query")
-    check(document["schema"] == SCHEMA and document["source_sha256"] == native["source_sha256"] and
-          uint(document["source_bytes"]) == native["source_bytes"] and document["table"] == TABLE and
-          document["provider_guid"] == a["provider_guid"] and document["activity_id"] == a["activity_id"],
+    check(document["schema"] == (SCHEMA if window else ALL_MARKERS) and document["source_sha256"] == source_hash and
+          uint(document["source_bytes"]) == size and document["table"] == TABLE and
+          document["provider_guid"] == provider and document["activity_id"] == activity_id,
           "TraceProcessor source or filter mismatch")
     scope = document["query_filter"]
-    fields(scope, "header_process_id header_thread_id channel task begin_raw end_raw", "TraceProcessor filter")
-    for key in ("header_process_id", "header_thread_id", "channel", "task"):
-        check(uint(scope[key]) == a[key], "TraceProcessor numeric filter mismatch")
-    check((scope["begin_raw"], scope["end_raw"]) == (a["raw_timestamp"], b["raw_timestamp"]), "TraceProcessor clock filter mismatch")
+    if window:
+        a, b = window["start"], window["stop"]
+        fields(scope, "header_process_id header_thread_id channel task begin_raw end_raw", "TraceProcessor filter")
+        for key in ("header_process_id", "header_thread_id", "channel", "task"):
+            check(uint(scope[key]) == a[key], "TraceProcessor numeric filter mismatch")
+        check((scope["begin_raw"], scope["end_raw"]) == (a["raw_timestamp"], b["raw_timestamp"]), "TraceProcessor clock filter mismatch")
+    else:
+        fields(scope, "opcodes", "whole-activity filter")
+        check(type(scope["opcodes"]) is list and len(scope["opcodes"]) == 2 and
+              [uint(v, 255) for v in scope["opcodes"]] == [1, 2], "unexpected whole-activity filter")
+        meta = document["trace_metadata"]
+        fields(meta, "clock_type context_clock_type timestamp_context_partial performance_counter_hz lost_events lost_buffers", "SDK metadata")
+        check(all(type(meta[k]) is str and 0 < len(meta[k]) <= 64 for k in ("clock_type", "context_clock_type")) and
+              type(meta["timestamp_context_partial"]) is bool, "invalid SDK clock context")
+        hz = meta["performance_counter_hz"]
+        check(type(hz) is str and re.fullmatch(r"0|-?[1-9][0-9]{0,18}", hz) and -(1 << 63) <= int(hz) < 1 << 63,
+              "invalid SDK counter frequency")
+        uint(meta["lost_events"])
+        uint(meta["lost_buffers"])
     verify_modules(document["loaded_processing_modules"], ("Events", "Processes", "Processing"))
     total = uint(document["provider_rows"], 2_000_000)
     activity = uint(document["activity_marker_rows"], total)
@@ -119,19 +133,18 @@ def correlate(document, native):
     rows = document["rows"]
     check(uint(document["row_limit"]) == 128 and type(rows) is list and len(rows) == min(count, 128),
           "invalid TraceProcessor row extent")
-    exact = {"start": [], "stop": []}
-    uncertain = {"start": 0, "stop": 0}
+    check(window is not None or count == scoped == activity, "whole-activity query omitted markers")
     previous = 0
     for row in rows:
         fields(row, "table_row clock_type timestamp_partial raw_timestamp " + " ".join(HEADER), "TraceProcessor table row")
         ordinal = uint(row["table_row"], total)
-        check(previous < ordinal and row["provider_guid"] == a["provider_guid"] and row["activity_id"] == a["activity_id"],
+        check(previous < ordinal and row["provider_guid"] == provider and row["activity_id"] == activity_id,
               "row outside filtered TraceProcessor table")
         previous = ordinal
         for key, maximum in (("channel", 255), ("task", 65535), ("event_id", 65535), ("version", 255),
                              ("header_process_id", 0xffffffff), ("header_thread_id", 0xffffffff)):
             uint(row[key], maximum)
-        check(all(row[k] == scope[k] for k in ("header_process_id", "header_thread_id", "channel", "task")),
+        check(not window or all(row[k] == scope[k] for k in ("header_process_id", "header_thread_id", "channel", "task")),
               "row outside TraceProcessor header filter")
         opcode = uint(row["opcode"])
         check(opcode in (1, 2) and type(row["timestamp_partial"]) is bool, "invalid marker or clock state")
@@ -142,8 +155,19 @@ def correlate(document, native):
             check(type(clock) is str and 0 < len(clock) <= 64 and type(raw) is str and
                   re.fullmatch(r"0|-?[1-9][0-9]{0,18}", raw) and -(1 << 63) <= int(raw) < (1 << 63),
                   "invalid raw TraceProcessor timestamp")
-            if clock == "PerformanceCounter" and not row["timestamp_partial"]:
+            if window and clock == "PerformanceCounter" and not row["timestamp_partial"]:
                 check(int(scope["begin_raw"]) <= int(raw) <= int(scope["end_raw"]), "row outside TraceProcessor clock filter")
+    return rows
+
+
+def correlate(document, native):
+    window = native["page"]["activity_window"]
+    a, b = window["start"], window["stop"]
+    rows = validate_projection(document, native["source_sha256"], native["source_bytes"], a["provider_guid"], a["activity_id"], window)
+    exact = {"start": [], "stop": []}
+    uncertain = {"start": 0, "stop": 0}
+    for row in rows:
+        opcode, ordinal, raw, clock = (row[k] for k in ("opcode", "table_row", "raw_timestamp", "clock_type"))
         label, marker = ("start", a) if opcode == 1 else ("stop", b)
         if any(row[k] != marker[k] for k in HEADER):
             continue
@@ -152,7 +176,7 @@ def correlate(document, native):
         elif raw == marker["raw_timestamp"]:
             exact[label].append(ordinal)
 
-    if count > len(rows):
+    if document["matched_rows"] > len(rows):
         status = "row_limit"
     elif any(uncertain.values()):
         status = "clock_unqualified"
@@ -167,30 +191,33 @@ def correlate(document, native):
     return dict(status=status, matching_table_rows=exact, unqualified_clock_rows=uncertain)
 
 
-def verify_side(query, native, measured, runtime, directory, timeout, files, decode):
-    result = dict(status="native_window_unavailable", native_page_sha256=native["reader"]["stdout_sha256"] if native["reader"] else None,
-                  reader=None, projection=None, correspondence=None)
-    if measured is None:
-        return result
-    window = native["page"]["activity_window"]
-    marker = window["start"]
+def read_query(arguments, native_page_hash, runtime, directory, timeout, files, decode, compare):
+    result = dict(status="reader_unavailable", native_page_sha256=native_page_hash, reader=None, projection=None, correspondence=None)
     exe, binary, _ = runtime
-    arguments = [str(query.path), marker["provider_guid"], marker["activity_id"],
-                 *(str(marker[key]) for key in ("header_process_id", "header_thread_id", "channel", "task")),
-                 marker["raw_timestamp"], window["stop"]["raw_timestamp"]]
     attempt = run_reader(exe, arguments, directory, timeout, MIB, files, binary)
     receipt = reader_receipt(attempt)
     result["reader"] = receipt
     if receipt["state"] != "exited" or receipt["exit_code"] != 0 or receipt["image_binding"] != dict(status="matched", win32_status=0):
-        result["status"] = "reader_unavailable"
         return result
     try:
         raw, complete = original(attempt["stdout"], MIB)
         check(complete, "TraceProcessor output exceeds byte limit")
         document = decode(raw)
-        correspondence = correlate(document, native)
+        correspondence = compare(document)
     except (KeyError, TypeError, ValueError, RecursionError):
         result["status"] = "invalid_projection"
         return result
     result.update(status=correspondence["status"], projection=document, correspondence=correspondence)
     return result
+
+
+def verify_side(query, native, measured, runtime, directory, timeout, files, decode):
+    page_hash = native["reader"]["stdout_sha256"] if native["reader"] else None
+    if measured is None:
+        return dict(status="native_window_unavailable", native_page_sha256=page_hash, reader=None, projection=None, correspondence=None)
+    window = native["page"]["activity_window"]
+    marker = window["start"]
+    arguments = [str(query.path), marker["provider_guid"], marker["activity_id"],
+                 *(str(marker[key]) for key in ("header_process_id", "header_thread_id", "channel", "task")),
+                 marker["raw_timestamp"], window["stop"]["raw_timestamp"]]
+    return read_query(arguments, page_hash, runtime, directory, timeout, files, decode, lambda doc: correlate(doc, native))

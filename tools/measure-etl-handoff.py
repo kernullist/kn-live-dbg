@@ -10,6 +10,8 @@ from uuid import uuid4
 import zipfile
 
 import etl_handoff as study
+import etl_handoff_markers
+import etl_traceprocessor
 from etl_reader_process import WindowsFiles, file_hash, reader_receipt, run_reader
 from owned_module_benchmark import check, decimal, encoded, fields, publish_new, sha, stored_directory, stored_extent, uint
 from saved_etl_comparison import DIAGNOSTIC, MIB, digest, local_path, original, outputs_safe, process_state, write_result
@@ -184,12 +186,38 @@ def structure(archive, source, bounds, expected_plan):
     return cfg, acquisition, env, outcomes
 
 
-def observe(cfg, slot, activity, record, archive, reader, binary, directory, files, join_path):
+def native_observation(cfg, record, result, path, reader, binary, directory, files, join_path):
+    selection = "--handoff-markers" if cfg.get("observe_scheduling") else "--activity-markers"
+    flags = ["--etl-hard-faults", str(path), "--sha256", record["source_sha256"], selection, "--limit", "128"]
+    native = run_reader(reader, flags, directory, cfg["timeout_ms"], MIB, files, binary)
+    result["reader"] = reader_receipt(native)
+    if native["state"] != "exited" or native["image_binding"] != study.MATCHED_IMAGE or native["exit_code"] not in (0, 1):
+        result["reason"] = "reader_unavailable"
+        return
+    try:
+        raw_page, complete = original(native["stdout"], MIB)
+        check(complete, "reader output truncated")
+        page = study.DECODE(raw_page)
+        check(type(page) is dict and page["source_sha256"] == record["source_sha256"] and
+              native["exit_code"] == (0 if page["status"] == "read" else 1), "unexpected reader output")
+        result["marker_page"] = page
+        result["measurement"] = study.measure(cfg, result["selection"], result["expected_activity_id"], result["workload"], result["process"],
+                                             page, record["source_sha256"], record["source_bytes"], join_path)
+        result.update(status="measured", reason=None)
+    except study.Unqualified as exc:
+        result.update(status="unqualified", reason=str(exc))
+    except (KeyError, TypeError, ValueError, RecursionError):
+        result.update(status="unqualified", reason="invalid_measurement_evidence")
+
+
+def observe(cfg, slot, activity, record, archive, reader, binary, directory, files, join_path, runtime):
     attempt = record["attempt"]
     result = dict(selection=slot, expected_activity_id=activity, status="unavailable", reason=record["retention"], etl_sha256=record["source_sha256"],
                   session_id=None, process=attempt["process_identity"], recorder=reader_receipt(attempt),
                   reader=None, workload=None, marker_page=None, measurement=None)
     if record["retention"] != "retained":
+        if runtime:
+            result["traceprocessor"] = dict(status="source_unavailable", native_page_sha256=None, reader=None, projection=None, correspondence=None)
         return result
     name = slot_name(slot)
     raw = member(archive, name, ETL_LIMIT)
@@ -199,32 +227,18 @@ def observe(cfg, slot, activity, record, archive, reader, binary, directory, fil
         result.update(session_id=truth["session_id"], workload=truth)
     except (KeyError, TypeError, ValueError, RecursionError):
         result["reason"] = "invalid_recorder_output"
-        return result
+        if not runtime:
+            return result
     path = directory / name
     with path.open("xb") as out:
         out.write(raw)
     with files.hold(path) as source:
         check(file_hash(source) == record["source_sha256"], "replay ETL changed")
-        selection = "--handoff-markers" if cfg.get("observe_scheduling") else "--activity-markers"
-        flags = ["--etl-hard-faults", str(path), "--sha256", record["source_sha256"], selection, "--limit", "128"]
-        native = run_reader(reader, flags, directory, cfg["timeout_ms"], MIB, files, binary)
-    result["reader"] = reader_receipt(native)
-    if native["state"] != "exited" or native["image_binding"] != study.MATCHED_IMAGE or native["exit_code"] not in (0, 1):
-        result["reason"] = "reader_unavailable"
-        return result
-    try:
-        raw_page, complete = original(native["stdout"], MIB)
-        check(complete, "reader output truncated")
-        page = study.DECODE(raw_page)
-        check(type(page) is dict and page["source_sha256"] == record["source_sha256"] and
-              native["exit_code"] == (0 if page["status"] == "read" else 1), "unexpected reader output")
-        result["marker_page"] = page
-        result["measurement"] = study.measure(cfg, slot, activity, truth, result["process"], page, record["source_sha256"], len(raw), join_path)
-        result.update(status="measured", reason=None)
-    except study.Unqualified as exc:
-        result.update(status="unqualified", reason=str(exc))
-    except (KeyError, TypeError, ValueError, RecursionError):
-        result.update(status="unqualified", reason="invalid_measurement_evidence")
+        if result["workload"] is not None:
+            native_observation(cfg, record, result, path, reader, binary, directory, files, join_path)
+        if runtime:
+            schema = "kn.etl_handoff_markers.v1" if cfg.get("observe_scheduling") else "kn.etl_activity_markers.v1"
+            result["traceprocessor"] = etl_handoff_markers.observe(path, result, len(raw), schema, runtime, directory, cfg["timeout_ms"], files)
     return result
 
 
@@ -236,9 +250,13 @@ def replay(args, output, files, stack, held, directory):
     with zipfile.ZipFile(source) as archive:
         cfg, acquisition, env, outcomes = structure(archive, source, bounds, plan_pin)
         exe, binary = pinned_image(args.exe, cfg["reader_sha256"], files, stack, held)
-        rows = [observe(cfg, slot, study.activity_id(acquisition, plan_pin, slot), result, archive, exe, binary, directory, files, args.join_path)
+        runtime = etl_traceprocessor.admit(args.traceprocessor, directory, files, stack, held) if args.traceprocessor else None
+        rows = [observe(cfg, slot, study.activity_id(acquisition, plan_pin, slot), result, archive, exe, binary, directory, files, args.join_path, runtime)
                 for slot, result in zip(cfg["slots"], outcomes, strict=True)]
     report = study.summarize(cfg, plan_pin, expected, acquisition, env, rows, args.join_path)
+    if runtime:
+        report["traceprocessor"] = etl_handoff_markers.summarize(report, runtime[2])
+        report["schema"] = "kn.etl_handoff_study.v4"
     data = encoded(report)
     if output:
         report_pin = publish_new(output, lambda out: out.write(data))
@@ -251,7 +269,10 @@ def replay(args, output, files, stack, held, directory):
                    planned_pairs=report["planned_pairs"], measured_pairs=report["measured_pairs"])
     if "scheduling_summary" in report:
         receipt["scheduling_pairs"] = report["scheduling_summary"]["measured_pairs"]
-    return receipt, int(state == "mismatch" or report["status"] != "complete")
+    if runtime:
+        receipt["traceprocessor_status"] = report["traceprocessor"]["status"]
+        receipt["traceprocessor_pairs"] = report["traceprocessor"]["measured_pairs"]
+    return receipt, int(state == "mismatch" or report["status"] != "complete" or receipt.get("traceprocessor_status") == "unconfirmed")
 
 
 def execute(args):
@@ -298,6 +319,8 @@ def main():
         acquire.add_argument(flag, required=True)
     verify = sub.add_parser("replay", help="read original ETLs and compute paired differences", allow_abbrev=False)
     verify.add_argument("--join-path", action="store_true", help="also bound the join path for original ten-event recordings")
+    verify.add_argument("--traceprocessor", nargs=2, metavar=("MARKER_ADAPTER_ZIP", "SHA256"),
+                        help="independently read all handoff activity markers and retain their table rows and phase times")
     for flag in ("--package", "--sha256", "--plan-sha256", "--exe"):
         verify.add_argument(flag, required=True)
     target = verify.add_mutually_exclusive_group(required=True)

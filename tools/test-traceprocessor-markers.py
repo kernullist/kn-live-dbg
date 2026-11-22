@@ -1,5 +1,6 @@
 """Check Microsoft TraceProcessor marker correspondence, pinned deployment, and native report compatibility."""
 import argparse
+from contextlib import ExitStack
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -10,6 +11,8 @@ import tempfile
 import zipfile
 
 import etl_traceprocessor as sdk
+from etl_reader_process import WindowsFiles, file_hash, run_reader
+from saved_etl_comparison import MIB, original
 
 
 HERE = Path(__file__).resolve().parent
@@ -48,10 +51,34 @@ def controls(native, source):
             raise AssertionError("accepted a malformed SDK result")
 
 
+def whole_activity(oracle, archive, folder, cases):
+    files = WindowsFiles()
+    with ExitStack() as stack:
+        program, image, _ = sdk.admit([archive, pin(archive)], folder, files, stack, set())
+        for path, window, count in cases:
+            with files.hold(path) as source:
+                source_hash = file_hash(source)
+                provider, activity = window["provider_guid"], window["activity_id"]
+                _, _, groups, _ = PAIR["WINDOW"]["read_oracle"](oracle, path)
+                expected = sorted((e for group in groups.values() for e in group if (e["provider_guid"], e["activity_id"]) == (provider, activity)),
+                                  key=lambda e: e["record_ordinal"])
+                args = [str(path), provider, activity, "--all-markers"]
+                attempt = run_reader(program, args, folder, 120000, MIB, files, image)
+                assert attempt["exit_code"] == 0 and attempt["image_binding"]["status"] == "matched"
+                raw, complete = original(attempt["stdout"], MIB)
+                projection = json.loads(raw)
+                rows = sdk.validate_projection(projection, source_hash, path.stat().st_size, provider, activity)
+                assert complete and len(expected) == projection["matched_rows"] == count and len(rows) == min(count, 128)
+                assert projection["provider_rows"] == window["provider_rows"] and rows[-1]["table_row"] > len(rows)
+                for row, event in zip(rows, expected[:128], strict=True):
+                    assert all(row[k] == event[k] for k in (*sdk.HEADER, "raw_timestamp"))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("exe", "adapter", "x64", "x86", "taskbar"):
         parser.add_argument("--" + name, type=Path, required=True)
+    parser.add_argument("--whole-activity-oracle", type=Path, help="also validate sparse and capped whole-activity SDK rows against Windows ETW")
     args = parser.parse_args()
     src = [f.resolve() for f in (args.x64, args.x86, args.taskbar)]
     assert tuple(map(pin, src)) == PAIR["PINS"]
@@ -105,6 +132,9 @@ def main():
         p = result["projection"]
         assert [p[k] for k in ("provider_rows", "activity_marker_rows", "scoped_marker_rows", "matched_rows")] == [56702, 7329, 902, 2]
         assert result["correspondence"]["matching_table_rows"] == {"start": [5413], "stop": [7465]}
+        if args.whole_activity_oracle:
+            whole_activity(args.whole_activity_oracle, args.adapter.resolve(), folder,
+                           [(src[0], tp["baseline"]["projection"], 2), (src[2], p, 7329)])
         unavailable = folder / "unavailable.json"
         fail = command(before, (after[0], "0"*64, *after[2:]), args.adapter)
         assert run(fail, "--output", unavailable, 1)["traceprocessor_status"] == "unconfirmed"

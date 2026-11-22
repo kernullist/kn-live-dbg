@@ -13,20 +13,32 @@ from etl_reader_process import WindowsFiles, file_hash, run_reader
 from saved_etl_comparison import MIB, original
 
 
-def traceprocessor_markers(package, report, deployment, folder):
-    """Re-query each scheduling task and compare every selected header and raw QPC."""
-    assert report["plan"].get("observe_scheduling")
+def traceprocessor_markers(package, report, deployment, folder, checked=None):
+    """Use independent per-task SDK filters to check table row numbers and raw QPC."""
+    assert checked or report["plan"].get("observe_scheduling")
     files, matched = WindowsFiles(), 0
     with ExitStack() as stack, zipfile.ZipFile(package) as archive:
         program, binary, runtime = sdk.admit(deployment, folder, files, stack, set())
-        for row in report["observations"]:
+        for index, row in enumerate(report["observations"]):
             path = folder / "sdk-source.etl"
             path.write_bytes(archive.read(f"slot-{row['selection']['slot']:02d}.etl"))
             events = [m["event"] for m in row["marker_page"]["markers"]]
+            if checked:
+                verified = checked["observations"][index]["traceprocessor"]
+                assert verified["status"] == "matched" and verified["native_page_sha256"] == row["reader"]["stdout_sha256"]
+                document, correspondence = verified["projection"], verified["correspondence"]
+                meta = document["trace_metadata"]
+                assert meta["clock_type"] == meta["context_clock_type"] == "PerformanceCounter" and meta["timestamp_context_partial"] is False
+                assert meta["lost_events"] == meta["lost_buffers"] == 0 and meta["performance_counter_hz"] == row["measurement"]["frequency"]
+                assert correspondence["native_frequency_matches"] is True
+                links = {m["record_ordinal"]: m for m in correspondence["marker_links"]}
+                projected = {m["table_row"]: m for m in document["rows"]}
+                assert len(links) == len(projected) == correspondence["matched_markers"] == len(events)
             with files.hold(path) as source:
                 assert file_hash(source) == row["etl_sha256"]
                 table_rows = set()
-                for task in (4, 5, 8, 9):
+                tasks = sorted({e["task"] for e in events}) if checked else (4, 5, 8, 9)
+                for task in tasks:
                     group = [e for e in events if e["task"] == task]
                     if not group:
                         assert task == 8 and not row["measurement"]["scheduling"]["observer"]["views"]
@@ -34,6 +46,8 @@ def traceprocessor_markers(package, report, deployment, folder):
                     start, stop = group[0], group[-1]
                     scope = {k: start[k] for k in ("header_process_id", "header_thread_id", "channel", "task")}
                     scope.update(begin_raw=start["raw_timestamp"], end_raw=stop["raw_timestamp"])
+                    if scope["begin_raw"] == scope["end_raw"]:
+                        scope["end_raw"] = str(int(scope["end_raw"])+1)
                     args = [str(path), start["provider_guid"], start["activity_id"], *map(str, scope.values())]
                     attempt = run_reader(program, args, folder, 60000, MIB, files, binary)
                     assert attempt["state"] == "exited" and attempt["exit_code"] == 0 and attempt["image_binding"]["status"] == "matched"
@@ -52,8 +66,96 @@ def traceprocessor_markers(package, report, deployment, folder):
                         assert previous < ordinal <= len(events) and ordinal not in table_rows
                         table_rows.add(ordinal)
                         previous = ordinal
+                        if checked:
+                            link = links[event["record_ordinal"]]
+                            assert link["status"] == "matched" and link["matching_table_rows"] == [ordinal] and not link["unqualified_clock_rows"]
+                            assert projected[ordinal] == other
+                if checked:
+                    ticks = row["measurement"]["ticks"]
+                    for key, identifiers in (("activity", (1, 2)), ("caller_work", (3, 4)), ("worker_span", (5, 6))):
+                        phase = correspondence["phase_intervals"][key]
+                        a, b = (projected[phase[name]] for name in ("start_table_row", "stop_table_row"))
+                        assert (a["event_id"], b["event_id"]) == identifiers
+                        assert phase["native_elapsed_matches"] is phase["recorder_pid_matches"] is True and phase["status"] == "measured"
+                        assert int(b["raw_timestamp"])-int(a["raw_timestamp"]) == int(phase["elapsed_qpc_ticks"]) == int(ticks[key])
+                        value = phase["elapsed_ns"]
+                        assert Fraction(int(value["numerator"]), int(value["denominator"])) == Fraction(int(ticks[key])*10**9, int(meta["performance_counter_hz"]))
                 matched += len(table_rows)
     return matched
+
+
+def marker_controls(arm, compare):
+    original = arm["traceprocessor"]["projection"]
+    page = arm["marker_page"]
+    def assess(doc, selected=arm):
+        return compare(doc, selected, original["source_bytes"], page["schema"])
+
+    def with_rows(rows, total=None):
+        # Give the SDK table its own coordinates and adjust every reported extent.
+        n = len(rows)
+        return dict(original, rows=[dict(v, table_row=i+1) for i, v in enumerate(rows)], provider_rows=total or n,
+                    activity_marker_rows=total or n, scoped_marker_rows=total or n, matched_rows=total or n)
+
+    rows = original["rows"]
+    base = assess(original)
+    assert base["status"] == "matched"
+    start = next(i for i, v in enumerate(rows) if v["event_id"] == 1)
+    stop = next(i for i, v in enumerate(rows) if v["event_id"] == 2)
+    for extra, reason in ((rows[start], "ambiguous_rows"), (dict(rows[start], raw_timestamp="0"), "clock_unqualified"),
+                          (dict(rows[start], timestamp_partial=True), "clock_unqualified"),
+                          (dict(rows[start], raw_timestamp=None, clock_type=None), "clock_unqualified")):
+        result = assess(with_rows([*rows, extra]))
+        assert result["status"] == "row_mismatch" and result["matched_markers"] == len(rows)-1
+        assert sum(m["status"] == reason for m in result["marker_links"]) == 1
+    missing = assess(with_rows([r for i, r in enumerate(rows) if i != stop]))
+    assert missing["phase_intervals"]["activity"]["status"] == "boundary_missing"
+    assert missing["status"] == "row_mismatch" and any(m["status"] == "row_missing" for m in missing["marker_links"])
+    switched = list(rows)
+    switched[start], switched[stop] = switched[stop], switched[start]
+    reversed_phase = assess(with_rows(switched))
+    assert reversed_phase["marker_status"] == "matched" and reversed_phase["status"] == "phase_unconfirmed"
+    assert reversed_phase["phase_intervals"]["activity"]["status"] == "order_conflict"
+    wrong_thread = list(rows)
+    wrong_thread[stop] = dict(rows[stop], header_thread_id=rows[stop]["header_thread_id"] ^ 1)
+    assert assess(with_rows(wrong_thread))["phase_intervals"]["activity"]["status"] == "thread_mismatch"
+    swapped_process = dict(arm, process=dict(arm["process"], pid=arm["process"]["pid"]+1))
+    wrong_owner = assess(original, swapped_process)["phase_intervals"]["activity"]
+    assert wrong_owner["status"] == "process_mismatch" and wrong_owner["recorder_pid_matches"] is False and wrong_owner["elapsed_qpc_ticks"] is None
+    capped = assess(with_rows((rows*128)[:128], total=129))
+    assert capped["matched_markers"] == 0 and capped["status"] == "row_limit" and len(capped["unlinked_table_rows"]) == 128
+    assert all(m["status"] == "row_limit" for m in capped["marker_links"])
+    lost = dict(arm, marker_page=dict(page, loss_marker_records=1))
+    loss = assess(original, lost)
+    assert loss["status"] == "native_page_unqualified" and loss["phase_intervals"]["activity"]["native_elapsed_matches"] is None
+    assert assess(original, dict(arm, marker_page=dict(page, opcodes=[True, 2])))["status"] == "native_page_unqualified"
+    duplicated = deepcopy(arm)
+    a, b = (duplicated["marker_page"]["markers"][i]["event"] for i in (0, 1))
+    b.update(dict(a, record_ordinal=b["record_ordinal"]))
+    assert sum(m["status"] == "ambiguous_rows" for m in assess(original, duplicated)["marker_links"]) == 2
+    bad_timing = deepcopy(arm)
+    bad_timing["measurement"]["ticks"]["activity"] = "-1"
+    assert assess(original, bad_timing)["status"] == "phase_unconfirmed"
+    meta = original["trace_metadata"]
+    def clocks(**values):
+        return assess(dict(original, trace_metadata=dict(meta, **values)))
+    for changes, status in (({"timestamp_context_partial": True}, "sdk_clock_unqualified"), ({"performance_counter_hz": "0"}, "sdk_clock_unqualified"),
+                            ({"lost_events": 1}, "sdk_loss_reported"), ({"context_clock_type": "SystemTime"}, "sdk_clock_unqualified")):
+        result = clocks(**changes)
+        assert result["status"] == status and result["matched_markers"] == 0
+        assert all(v["status"] == status and v["elapsed_ns"] is None for v in result["phase_intervals"].values())
+    scaled = clocks(performance_counter_hz=str(2*int(meta["performance_counter_hz"])))
+    assert scaled["marker_status"] == "matched" and scaled["status"] == "clock_disagreement" and scaled["native_frequency_matches"] is False
+    for phase, v in scaled["phase_intervals"].items():
+        value = v["elapsed_ns"]
+        assert Fraction(int(value["numerator"]), int(value["denominator"])) == Fraction(int(arm["measurement"]["ticks"][phase])*10**9, 2*int(meta["performance_counter_hz"]))
+    for doc in (dict(original, source_sha256="0"*64), dict(original, source_bytes=True),
+                dict(original, query_filter={"opcodes": [True, 2]}), dict(original, scoped_marker_rows=0),
+                dict(original, rows=[dict(rows[0], table_row=0), *rows[1:]]), dict(original, loaded_processing_modules=[])):
+        try:
+            assess(doc)
+        except ValueError:
+            continue
+        raise AssertionError("accepted an invalid whole-activity SDK projection")
 
 
 def minimum(windows, count):

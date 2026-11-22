@@ -775,6 +775,45 @@ count and up to 1,024 bytes in hex. An oversized payload retains its
 length with a null hex field. The study retains these rows in its private
 report. [Capture and replay](COMMAND_REFERENCE.md#measure-scheduling-during-a-thread-join)
 
+### Independent table rows and phase timing for a thread handoff
+
+With `replay --traceprocessor <adapter.zip> <sha256>`, the handoff
+reader holds each original ETL open while KnLiveDbg and Microsoft
+TraceProcessor read it. The SDK queries the owned provider and the
+activity ID derived from the registered slot. It selects Start and Stop
+events across all threads and tasks. It also reads the trace clock,
+performance-counter frequency and loss counts. The private v4 report
+retains the full projection, the filter, the SDK and adapter hashes and
+the processing modules. Symbol lookup is disabled. SDK metadata reporting
+lost events or buffers, a partial clock, or an unusable QPC frequency
+withholds the timing and the unique row claims. [Adapter query](../tools/TraceProcessorMarkers/TraceProcessorMarkers.cs) · [Microsoft TraceProcessor data sources](https://learn.microsoft.com/en-us/windows/apps/trace-processing/tutorial)
+
+Each `marker_links` entry connects a native `record_ordinal` to a
+one-based row in the provider's `IGenericEventDataSource.Events` table.
+The readers must agree on provider, activity, PID, TID, descriptor and
+raw QPC timestamp. Duplicate candidates and unknown clocks keep their
+row numbers and a reason. Unlinked SDK rows stay in the report. The SDK
+returns at most 128 rows and the total match count. A truncated query
+withholds unique links because an unseen row could duplicate a candidate.
+
+For the outer activity, caller calculation and worker span, the SDK
+uses the two boundary rows to compute elapsed QPC ticks. Each recording's
+SDK frequency converts those ticks to an exact fraction of a nanosecond.
+The report compares candidate minus baseline per pair and summarizes the
+differences by arm order. A compared pair needs all three intervals
+from the expected recorder PIDs. `native_frequency_matches`,
+`native_elapsed_matches` and `native_changes_match` show where the
+native results allow a cross-check. These intervals include wall time
+between the marked boundaries. The dispatch counts and wait-chain
+payloads have their own evidence in the native report.
+
+An unreadable recorder receipt can leave a usable original ETL. The SDK
+can still time its marked phases and retain their rows. A missing ETL
+leaves the registered arm and pair in the report with their missing
+evidence. Use `study_status` for the native result, `traceprocessor_status`
+for correspondence and `traceprocessor_pairs` for the independent timing
+denominator. [Replay and inspect the rows](COMMAND_REFERENCE.md#retain-independent-table-rows-for-a-thread-handoff)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

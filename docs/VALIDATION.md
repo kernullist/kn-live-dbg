@@ -7,6 +7,51 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Independent marker replay of the 2026-11-22 handoff studies
+
+The x64 marker adapter (executable SHA-256 prefix `d88368b82e1e`,
+deployment `1f0aa0ec2eee`) read each original ETL on Windows
+`10.0.28000` with Microsoft TraceProcessor Events 1.12.10 and Toolkit
+1.11.0. Each native record matched one SDK table row. Separate SDK
+queries restricted to one task at a time reproduced the coordinates.
+The SDK used its own clock metadata for all three phase durations and
+the signed candidate-minus-baseline comparisons.
+[Replay commands](COMMAND_REFERENCE.md#retain-independent-table-rows-for-a-thread-handoff) · [Independent checks](../tools/test-etl-handoff.py)
+
+| Source | Runs | Paired comparisons | Matched marker rows | Checked phase intervals |
+| --- | ---: | ---: | ---: | ---: |
+| Scheduling, three Release studies | 40 | 20 | 914 | 120 |
+| Scheduling, checked recorder | 4 | 2 | 100 | 12 |
+| Earlier v2 join-probe study | 16 | 8 | 224 | 48 |
+| Earlier v1 handoff study | 4 | 2 | 40 | 12 |
+
+In one candidate run, original records 4 and 33 bounded the outer
+activity. SDK rows 2 and 31 gave 1,910,458 QPC ticks at 10 MHz, or
+191.0458 ms. The median paired activity increase across that eight-pair
+study was 147.54375 ms. Exact replay reproduced all six enriched reports.
+With the adapter omitted, the same inputs reproduced the native reports
+of the preceding implementation.
+
+In a rehashed control, one original ETL declared 7,000,003 Hz and its
+recorder receipt still declared 10 MHz. Native replay withheld that
+arm's timing. The SDK read the changed frequency, retained its matching
+headers and computed the paired differences using each arm's own clock.
+Another control removed the recorder receipt's usable content while
+retaining the ETL. The independent phase durations survived, with native
+correspondence unavailable. Removing the ETL itself kept the pair in
+the denominator for planned work and withheld that pair's comparison.
+Running the documented capture and SDK replay on a fresh four-pair
+study checked another 200 marker coordinates and reproduced its report digest.
+
+The public TaskbarLatency recording supplied 7,329 markers for one
+activity in a provider table of 56,702 rows. The 128 returned rows
+matched the Windows ETW oracle and extended to table row 1,710. A
+second public recording returned rows 6 and 8. Duplicate headers,
+uncertain clocks, source loss and reversed phase boundaries exercised
+the correspondence and timing checks. The Windows ETW oracle covers
+handoff payloads. An exact context-switch timeline requires separate
+scheduler events. [Public fixture checks](../tools/test-traceprocessor-markers.py)
+
 ## Scheduling during a thread join on 2026-11-22
 
 On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix

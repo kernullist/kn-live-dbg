@@ -10,12 +10,14 @@ from pathlib import Path
 import runpy
 import shutil
 import statistics
+import struct
 import subprocess
 import sys
 import tempfile
 import zipfile
 
 import etl_handoff as study
+import etl_handoff_markers as marker_rows
 import etl_handoff_scheduling as dispatch
 import etl_handoff_scheduling_checks as dispatch_checks
 
@@ -336,6 +338,54 @@ def archive_controls(args, folder, replay, report):
         assert summary["last_prerequisites"][result["observations"][0]["selection"]["role"]]["unavailable"] == 1
         assert summary["changes"]["exposed_worker"]["pairs"] == result["measured_pairs"]
     assert invoke([*limited, "--check-report", receipt["report_sha256"]], 1)["status"] == "matched"
+    if args.check_marker_report:
+        sdk_args = ["--traceprocessor", *args.traceprocessor]
+        def partial_sdk(flags, label):
+            destination = folder/(label+"-sdk.json")
+            result = invoke([*flags, *sdk_args, "--output", destination], 1)
+            assert invoke([*flags, *sdk_args, "--check-report", pin(destination)], 1) == dict(result, status="matched")
+            return json.loads(destination.read_bytes())
+
+        missing = partial_sdk(limited, "missing")
+        assert missing["traceprocessor"]["matched_arms"] == len(report["observations"])-1
+        assert missing["traceprocessor"]["measured_pairs"] == report["planned_pairs"]-1 and missing["traceprocessor"]["pairs"][0]["phase_change_ns"] is None
+        assert missing["observations"][0]["traceprocessor"]["status"] == "source_unavailable"
+
+        def invalid_receipt(_parts, outcomes):
+            raw = b"{}"
+            pin_value = hashlib.sha256(raw).hexdigest()
+            outcomes[0]["attempt"]["stdout"].update(byte_count=len(raw), original_sha256=pin_value, retained_sha256=pin_value,
+                                                    base64=base64.b64encode(raw).decode("ascii"))
+        broken = repack(folder/"invalid-receipt.zip", invalid_receipt)
+        retained = partial_sdk(broken, "invalid-receipt")
+        arm = retained["observations"][0]
+        assert arm["reason"] == "invalid_recorder_output" and arm["reader"] is None
+        sdk = arm["traceprocessor"]
+        assert sdk["status"] == "native_page_unqualified" and sdk["projection"]["source_sha256"] == arm["etl_sha256"]
+        assert sdk["correspondence"]["marker_links"] is None and sdk["correspondence"]["matched_markers"] == 0
+        assert all(v["status"] == "measured" and v["native_elapsed_matches"] is None for v in sdk["correspondence"]["phase_intervals"].values())
+        assert retained["traceprocessor"]["measured_pairs"] == report["planned_pairs"] and retained["traceprocessor"]["pairs"][0]["native_changes_match"] is None
+        assert retained["traceprocessor"]["changes"] == {k: report["changes"][k] for k in marker_rows.PHASES}
+
+        def scaled_clock(parts, outcomes):
+            page = report["observations"][0]["marker_page"]
+            data = bytearray(parts["slot-01.etl"])
+            field = struct.pack("<qqII", int(page["clock"]["header_perf_frequency"]), int(page["log_header"]["start_filetime"]), 1, 0)
+            assert data[:512].count(field) == 1
+            struct.pack_into("<q", data, data[:512].index(field), 7_000_003)
+            parts["slot-01.etl"] = data
+            outcomes[0]["source_sha256"] = hashlib.sha256(data).hexdigest()
+        altered = partial_sdk(repack(folder/"scaled-clock.zip", scaled_clock), "scaled-clock")
+        assert altered["observations"][0]["reason"] == "clock_unqualified" and altered["traceprocessor"]["status"] == "matched"
+        assert altered["observations"][0]["traceprocessor"]["projection"]["trace_metadata"]["performance_counter_hz"] == "7000003"
+        first_pair = altered["traceprocessor"]["pairs"][0]
+        assert first_pair["native_changes_match"] is None
+        for phase in marker_rows.PHASES:
+            durations = {}
+            for i, arm in enumerate(report["observations"][:2]):
+                hz = 7_000_003 if i == 0 else int(arm["measurement"]["frequency"])
+                durations[arm["selection"]["role"]] = Fraction(int(arm["measurement"]["ticks"][phase])*10**9, hz)
+            assert fraction(first_pair["phase_change_ns"][phase]) == durations["candidate"]-durations["baseline"]
     if "caller_delay_ms" in report["plan"]:
         def change_probe(_parts, outcomes):
             captured = outcomes[0]["attempt"]["stdout"]
@@ -374,6 +424,10 @@ def archive_controls(args, folder, replay, report):
         assert changed["caller_join"]["disable_win32"] == 5 and changed["caller_residency"]["status"] == "unavailable"
         assert changed["worker_timer"] == report["observations"][0]["measurement"]["scheduling"]["worker_timer"]
         assert invoke([*flags, "--check-report", evidence["report_sha256"]], 1)["status"] == "matched"
+        if args.check_marker_report:
+            corroborated = partial_sdk(flags, "failed-dispatch")
+            assert corroborated["status"] == "partial" and corroborated["traceprocessor"]["status"] == "matched"
+            assert corroborated["scheduling_summary"] == result["scheduling_summary"]
     def reversed_order(_parts, outcomes):
         outcomes[0], outcomes[1] = outcomes[1], outcomes[0]
     def bad_binding(_parts, outcomes):
@@ -466,7 +520,10 @@ def main():
     parser.add_argument("--join-path", action="store_true", help="check optional join analysis of a legacy archive")
     parser.add_argument("--traceprocessor", nargs=2, metavar=("MARKER_ADAPTER_ZIP", "SHA256"),
                         help="also check scheduling marker table rows with the pinned Microsoft adapter")
+    parser.add_argument("--check-marker-report", action="store_true", help="check the whole-activity SDK report and all independent table coordinates")
     args = parser.parse_args()
+    if args.check_marker_report and not args.traceprocessor:
+        parser.error("--check-marker-report requires --traceprocessor")
     replay = ["replay", "--package", args.package, "--sha256", args.sha256, "--plan-sha256", args.plan_sha256, "--exe", args.exe]
     if args.join_path:
         replay.append("--join-path")
@@ -478,8 +535,42 @@ def main():
         report = json.loads(output.read_bytes())
         markers = independent(args.package, report, args.oracle, folder)
         if args.traceprocessor:
-            n = dispatch_checks.traceprocessor_markers(args.package, report, args.traceprocessor, folder)
-            print(f"{n} scheduling marker headers matched identified Microsoft TraceProcessor table rows.")
+            checked = None
+            if args.check_marker_report:
+                flags = [*replay, "--traceprocessor", *args.traceprocessor]
+                dest = folder/"sdk.json"
+                receipt = invoke([*flags, "--output", dest], 0)
+                assert receipt["report_sha256"] == pin(dest) and receipt["traceprocessor_status"] == "matched"
+                assert invoke([*flags, "--check-report", pin(dest)], 0) == dict(receipt, status="matched")
+                checked = json.loads(dest.read_bytes())
+                assert checked["schema"] == "kn.etl_handoff_study.v4" and checked["traceprocessor"]["matched_markers"] == markers
+                summary = checked["traceprocessor"]
+                assert receipt["traceprocessor_pairs"] == summary["measured_pairs"] == report["planned_pairs"]
+                assert summary["changes"] == {k: report["changes"][k] for k in marker_rows.PHASES}
+                for role, grouped in summary["by_first_arm"].items():
+                    assert grouped == {k: report["by_first_arm"][role]["changes"][k] for k in marker_rows.PHASES}
+                for independent_pair, native_pair in zip(summary["pairs"], report["pairs"], strict=True):
+                    assert independent_pair["native_changes_match"] is True and independent_pair["order"] == native_pair["order"]
+                    assert independent_pair["phase_change_ns"] == {k: native_pair["candidate_minus_baseline_ns"][k] for k in marker_rows.PHASES}
+                reverted = deepcopy(checked)
+                reverted["schema"] = reverted.pop("traceprocessor")["native_study_schema"]
+                for arm in reverted["observations"]:
+                    del arm["traceprocessor"]
+                assert reverted == report
+                evidence = checked["observations"][0]["traceprocessor"]
+                for item in (summary, summary["pairs"][0], evidence, evidence["projection"], evidence["projection"]["trace_metadata"], evidence["correspondence"],
+                             evidence["correspondence"]["marker_links"][0], evidence["correspondence"]["phase_intervals"]["activity"]):
+                    WINDOW["private"](item)
+                if args.check_controls:
+                    dispatch_checks.marker_controls(checked["observations"][0], marker_rows.correspondence)
+                    revised = deepcopy(checked)
+                    value = revised["pairs"][0]["candidate_minus_baseline_ns"]["activity"]
+                    value["numerator"] = str(int(value["numerator"])+1)
+                    disagrees = marker_rows.summarize(revised, {})
+                    assert disagrees["matched_arms"] == len(report["observations"]) and disagrees["status"] == "unconfirmed"
+                    assert disagrees["pairs"][0]["native_changes_match"] is False
+            n = dispatch_checks.traceprocessor_markers(args.package, report, args.traceprocessor, folder, checked)
+            print(f"{n} marker headers matched independently filtered Microsoft TraceProcessor table rows.")
         row = report["observations"][0]
         for part in (receipt, report["plan"], report["plan"]["slots"][0], row, row["workload"], row["measurement"],
                      row["measurement"]["ticks"], row["process"], report["pairs"][0], report["changes"]["activity"],

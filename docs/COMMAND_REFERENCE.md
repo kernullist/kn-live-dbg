@@ -1467,17 +1467,41 @@ query fails. Use `observations[].measurement.scheduling` for the
 counter values, Win32 statuses, query intervals and source record numbers.
 [How to read the bounds](TRACE_IMPORT.md#scheduler-evidence-at-a-thread-join)
 
-To check the same recordings independently, build the marker adapter
-with the MSBuild command under [Microsoft TraceProcessor](#check-the-same-markers-with-microsoft-traceprocessor).
-Keep the variables from the capture example and run the following in
-the same x64 Developer PowerShell.
+### Retain independent table rows for a thread handoff
+
+Use the variables from the preceding capture in the same x64 Developer
+PowerShell. Build the marker adapter once, then keep its ZIP and SHA-256
+with the plan and archive. This replay works with v1, v2 and v3 handoff
+archives.
+
+```powershell
+MSBuild tools\TraceProcessorMarkers\TraceProcessorMarkers.csproj /restore /t:PackageAdapter /p:Configuration=Release
+if ($LASTEXITCODE -ne 0) { throw 'Marker adapter build failed' }
+$adapter = (Get-Item .\.build\traceprocessor-markers\TraceProcessorMarkers.zip).FullName
+$adapterPin = (Get-FileHash -LiteralPath $adapter -Algorithm SHA256).Hash
+$sdkArgs = @('--traceprocessor', $adapter, $adapterPin)
+$sdkReceipt = python -B $tool @query @sdkArgs --output "$out\report-sdk.json" | ConvertFrom-Json
+$sdkReport = Get-Content -LiteralPath "$out\report-sdk.json" -Raw | ConvertFrom-Json
+$first = $sdkReport.observations[0].traceprocessor.correspondence
+$first.marker_links | Select-Object -First 4 record_ordinal, status, matching_table_rows
+$first.phase_intervals.activity
+$sdkReport.traceprocessor.changes.activity
+python -B $tool @query @sdkArgs --check-report $sdkReceipt.report_sha256
+```
+
+The receipt reports the native study status, SDK correspondence and
+the number of pairs timed independently. Exit 1 preserves a partial study,
+an unconfirmed SDK comparison or a report digest mismatch. Exit 2
+reports input admission or output failure. Replay without `--traceprocessor`
+keeps the native report format. [Table coordinates, clocks and limits](TRACE_IMPORT.md#independent-table-rows-and-phase-timing-for-a-thread-handoff)
+
+To verify each saved coordinate, run the Windows ETW oracle and query
+the SDK again with a separate filter per task.
 
 ```powershell
 cl /nologo /std:c++17 /EHsc /O2 /W4 /WX "/Fo:$out\oracle.obj" "/Fe:$out\oracle.exe" tools\etl-hard-fault-oracle.cpp
 if ($LASTEXITCODE -ne 0) { throw 'ETW reader build failed' }
-$adapter = (Get-Item .\.build\traceprocessor-markers\TraceProcessorMarkers.zip).FullName
-$adapterPin = (Get-FileHash -LiteralPath $adapter -Algorithm SHA256).Hash
-python -B tools/test-etl-handoff.py --package "$out\originals.zip" --sha256 $capture.package_sha256 --plan-sha256 $plan.plan_sha256 --exe $reader --oracle "$out\oracle.exe" --traceprocessor $adapter $adapterPin --check-controls
+python -B tools/test-etl-handoff.py --package "$out\originals.zip" --sha256 $capture.package_sha256 --plan-sha256 $plan.plan_sha256 --exe $reader --oracle "$out\oracle.exe" --traceprocessor $adapter $adapterPin --check-marker-report --check-controls
 ```
 
 ### Inspect context switches from a saved ETL

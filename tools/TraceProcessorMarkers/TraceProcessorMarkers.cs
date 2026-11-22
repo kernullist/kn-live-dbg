@@ -16,18 +16,19 @@ internal static class TraceProcessorMarkers
     private static int Main(string[] args)
     {
         Guid provider, activity;
-        uint pid, tid;
-        byte channel;
-        ushort task;
-        long begin, end;
+        uint pid = 0, tid = 0;
+        byte channel = 0;
+        ushort task = 0;
+        long begin = 0, end = 0;
         var style = NumberStyles.None;
         var culture = CultureInfo.InvariantCulture;
-        if (args.Length != 9 || !Guid.TryParseExact(args[1], "D", out provider) || provider == Guid.Empty ||
+        bool wholeActivity = args.Length == 4 && args[3] == "--all-markers";
+        if ((!wholeActivity && args.Length != 9) || !Guid.TryParseExact(args[1], "D", out provider) || provider == Guid.Empty ||
             !Guid.TryParseExact(args[2], "D", out activity) || activity == Guid.Empty ||
-            !UInt32.TryParse(args[3], style, culture, out pid) || !UInt32.TryParse(args[4], style, culture, out tid) ||
-            !Byte.TryParse(args[5], style, culture, out channel) || !UInt16.TryParse(args[6], style, culture, out task) ||
-            !Int64.TryParse(args[7], style, culture, out begin) || !Int64.TryParse(args[8], style, culture, out end) ||
-            begin <= 0 || end <= begin)
+            (!wholeActivity && (!UInt32.TryParse(args[3], style, culture, out pid) || !UInt32.TryParse(args[4], style, culture, out tid) ||
+             !Byte.TryParse(args[5], style, culture, out channel) || !UInt16.TryParse(args[6], style, culture, out task) ||
+             !Int64.TryParse(args[7], style, culture, out begin) || !Int64.TryParse(args[8], style, culture, out end) ||
+             begin <= 0 || end <= begin)))
         {
             return 2;
         }
@@ -49,6 +50,8 @@ internal static class TraceProcessorMarkers
                 };
                 using (var trace = TraceProcessor.Create(args[0], settings))
                 {
+                    var metadata = wholeActivity ? trace.UseMetadata() : null;
+                    var clock = wholeActivity ? trace.UseTraceTimestampContext() : null;
                     var pending = trace.UseGenericEvents(new[] { provider });
                     trace.Process();
                     var table = pending.Result.Events;
@@ -70,14 +73,14 @@ internal static class TraceProcessorMarkers
                             continue;
                         }
                         ++activityMarkers;
-                        if (unchecked((uint)e.ProcessId) != pid || unchecked((uint)e.ThreadId) != tid ||
-                            e.Channel != channel || e.Task != task)
+                        if (!wholeActivity && (unchecked((uint)e.ProcessId) != pid || unchecked((uint)e.ThreadId) != tid ||
+                            e.Channel != channel || e.Task != task))
                         {
                             continue;
                         }
                         ++scoped;
                         var stamp = e.Timestamp;
-                        if (stamp.HasValue && !stamp.IsPartial && stamp.Context.ClockType == TraceClockType.PerformanceCounter &&
+                        if (!wholeActivity && stamp.HasValue && !stamp.IsPartial && stamp.Context.ClockType == TraceClockType.PerformanceCounter &&
                             (stamp.Value.RawValue < begin || stamp.Value.RawValue > end))
                         {
                             continue;
@@ -97,16 +100,25 @@ internal static class TraceProcessorMarkers
                         });
                     }
 
-                    var result = new {
-                        schema = "kn.traceprocessor_activity_rows.v1", source_sha256 = pin, source_bytes = source.Length,
-                        table = "IGenericEventDataSource.Events", provider_guid = provider.ToString("D"), activity_id = activity.ToString("D"),
-                        query_filter = new { header_process_id = pid, header_thread_id = tid, channel = channel, task = task,
-                                             begin_raw = begin.ToString(culture), end_raw = end.ToString(culture) },
-                        loaded_processing_modules = TraceProcessorModules.Loaded(toolkit, new[] {
-                             typeof(TraceProcessor).Assembly, typeof(IGenericEvent).Assembly, typeof(IProcess).Assembly }),
-                        provider_rows = table.Count, activity_marker_rows = activityMarkers, scoped_marker_rows = scoped,
-                        matched_rows = matched, row_limit = RowLimit, rows = rows
+                    object filter = wholeActivity ? (object)new { opcodes = new[] { 1, 2 } } :
+                        new { header_process_id = pid, header_thread_id = tid, channel = channel, task = task,
+                              begin_raw = begin.ToString(culture), end_raw = end.ToString(culture) };
+                    var result = new Dictionary<string, object> {
+                        { "schema", wholeActivity ? "kn.traceprocessor_activity_markers.v1" : "kn.traceprocessor_activity_rows.v1" },
+                        { "source_sha256", pin }, { "source_bytes", source.Length }, { "table", "IGenericEventDataSource.Events" },
+                        { "provider_guid", provider.ToString("D") }, { "activity_id", activity.ToString("D") }, { "query_filter", filter },
+                        { "loaded_processing_modules", TraceProcessorModules.Loaded(toolkit, new[] {
+                            typeof(TraceProcessor).Assembly, typeof(IGenericEvent).Assembly, typeof(IProcess).Assembly }) },
+                        { "provider_rows", table.Count }, { "activity_marker_rows", activityMarkers }, { "scoped_marker_rows", scoped },
+                        { "matched_rows", matched }, { "row_limit", RowLimit }, { "rows", rows }
                     };
+                    if (wholeActivity)
+                    {
+                        result.Add("trace_metadata", new {
+                            clock_type = metadata.ClockType.ToString(), context_clock_type = clock.ClockType.ToString(),
+                            timestamp_context_partial = clock.IsPartial, performance_counter_hz = metadata.PerformanceCounterFrequency.Hertz.ToString(culture),
+                            lost_events = metadata.LostEventCount, lost_buffers = metadata.LostBufferCount });
+                    }
                     Console.WriteLine(new JavaScriptSerializer().Serialize(result));
                     return 0;
                 }
