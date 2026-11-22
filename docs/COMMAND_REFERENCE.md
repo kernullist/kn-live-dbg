@@ -1399,6 +1399,37 @@ which condition ran first. Exit 1 preserves a partial study or reports a
 digest mismatch. Exit 2 reports an admission, argument or output failure.
 [Timing fields and interpretation](TRACE_IMPORT.md#paired-timing-of-an-owned-thread-handoff)
 
+### Identify the last prerequisite at a thread join
+
+From an x64 Visual Studio Developer PowerShell at the repository root,
+choose a new private output directory. This example compares two worker
+timer settings while requesting the same 25 ms pause on the caller.
+
+```powershell
+$out = '.\.build\handoff-join-example'
+New-Item -ItemType Directory -Path $out -ErrorAction Stop | Out-Null
+cl /nologo /std:c++17 /EHsc /O2 /W4 /WX /DUNICODE /D_UNICODE "/Fo:$out\recorder.obj" "/Fe:$out\recorder.exe" tools\etl-statement-capture.cpp
+$recorder = (Get-Item "$out\recorder.exe").FullName
+$reader = (Get-Item .\x64\Release\KnLiveDbg.exe).FullName
+$recorderPin = (Get-FileHash -LiteralPath $recorder -Algorithm SHA256).Hash
+$readerPin = (Get-FileHash -LiteralPath $reader -Algorithm SHA256).Hash
+$tool = 'tools/measure-etl-handoff.py'
+$plan = python -B $tool plan --pairs 8 --steps 20000 --baseline-ms 2 --candidate-ms 80 --caller-delay-ms 25 --recorder-sha256 $recorderPin --exe-sha256 $readerPin --output "$out\plan.json" | ConvertFrom-Json
+$capture = python -B $tool capture --plan "$out\plan.json" --plan-sha256 $plan.plan_sha256 --recorder $recorder --output "$out\originals.zip" | ConvertFrom-Json
+$query = @('replay', '--package', "$out\originals.zip", '--sha256', $capture.package_sha256, '--plan-sha256', $plan.plan_sha256, '--exe', $reader)
+$receipt = python -B $tool @query --output "$out\report.json" | ConvertFrom-Json
+$report = Get-Content -LiteralPath "$out\report.json" -Raw | ConvertFrom-Json
+$report.join_path_summary.last_prerequisites
+$report.join_path_summary.changes.exposed_worker
+python -B $tool @query --check-report $receipt.report_sha256
+```
+
+Passing `--caller-delay-ms 0` records both probes and skips the caller
+pause. The v2 report identifies the original probe rows and bounds the
+worker time exposed after caller arrival. Add `--join-path` to a v1
+archive's replay command to derive bounds from its original ten events.
+The default replay of that archive reproduces the v1 report. [Field definitions](TRACE_IMPORT.md#critical-path-at-a-joined-worker)
+
 ### Inspect context switches from a saved ETL
 
 ```powershell

@@ -4,6 +4,7 @@ from fractions import Fraction
 import hashlib
 from pathlib import Path
 import runpy
+from statistics import median
 from uuid import UUID, uuid5
 
 from owned_module_benchmark import check, decimal, encoded, fields, uint
@@ -17,6 +18,8 @@ MATCHED_IMAGE = dict(status="matched", win32_status=0)
 UINT32 = (1 << 32) - 1
 MAX_QPC = (1 << 63) - 1
 MAX_PAIRS = 16
+WAIT_OBJECT_0 = 0
+WAIT_TIMEOUT = 258
 
 
 def guid(value):
@@ -24,7 +27,7 @@ def guid(value):
     return value
 
 
-def plan(study, pairs, steps, baseline_ms, candidate_ms, timeout_ms, recorder_pin, reader_pin):
+def plan(study, pairs, steps, baseline_ms, candidate_ms, timeout_ms, recorder_pin, reader_pin, caller_delay_ms=None):
     namespace = UUID(guid(study))
     check(2 <= uint(pairs, MAX_PAIRS) and 1 <= uint(steps, 1_000_000) and 1 <= uint(timeout_ms, 120_000), "invalid study bounds")
     delays = {"baseline": uint(baseline_ms, 1000), "candidate": uint(candidate_ms, 1000)}
@@ -35,13 +38,18 @@ def plan(study, pairs, steps, baseline_ms, candidate_ms, timeout_ms, recorder_pi
         for role in order:
             slots.append(dict(slot=len(slots) + 1, pair=pair, role=role, seed=seed, delay_ms=delays[role],
                               ticket=str(uuid5(namespace, f"{pair}/{role}"))))
-    return dict(schema="kn.etl_handoff_plan.v1", study_id=study, pairs=pairs, steps=steps, baseline_ms=baseline_ms,
-                candidate_ms=candidate_ms, timeout_ms=timeout_ms, recorder_sha256=digest(recorder_pin),
-                reader_sha256=digest(reader_pin), slots=slots)
+    result = dict(schema="kn.etl_handoff_plan.v1", study_id=study, pairs=pairs, steps=steps, baseline_ms=baseline_ms,
+                  candidate_ms=candidate_ms, timeout_ms=timeout_ms, recorder_sha256=digest(recorder_pin),
+                  reader_sha256=digest(reader_pin), slots=slots)
+    if caller_delay_ms is not None:
+        result.update(schema="kn.etl_handoff_plan.v2", caller_delay_ms=uint(caller_delay_ms, 1000))
+    return result
 
 
 def registered(value):
     keys = "study_id pairs steps baseline_ms candidate_ms timeout_ms recorder_sha256 reader_sha256".split()
+    if type(value) is dict and value.get("schema") == "kn.etl_handoff_plan.v2":
+        keys.append("caller_delay_ms")
     fields(value, "schema slots " + " ".join(keys), "handoff plan")
     expected = plan(*(value[k] for k in keys))
     check(encoded(value) == encoded(expected), "plan differs from its registered workloads and arm order")
@@ -89,9 +97,53 @@ def overlap(a, b):
     return max(0, min(a[1], b[1]) - max(a[0], b[0]))
 
 
-def measure(cfg, slot, activity, truth, process, page, source_hash, size):
-    require(truth["schema"] == "kn.owned_etl_handoff.v1" and truth["provider_id"] == PROVIDER and
+def bound_join(ticks, ordinals, worker_write_end, join, timer, probes):
+    arrival = ticks[9]
+    join_start, join_return = join
+    # Windows documents one ambiguous QPC tick when comparing different threads.
+    earliest, latest = max(ticks[1], worker_write_end - 1), join_return
+    seen_signaled = False
+    for probe in probes:
+        if probe["wait_result"] == WAIT_OBJECT_0:
+            seen_signaled = True
+            latest = min(latest, int(probe["call_end_qpc"]))
+        else:
+            require(not seen_signaled, "thread_signal_reversed")
+            earliest = max(earliest, int(probe["call_start_qpc"]))
+    require(earliest <= latest, "inconsistent_thread_signal_bounds")
+    if latest < arrival or (probes and probes[0]["wait_result"] == WAIT_OBJECT_0):
+        last = "caller"
+    elif earliest > arrival or (probes and probes[1]["wait_result"] == WAIT_TIMEOUT):
+        last = "worker"
+    else:
+        last = "unresolved"
+
+    def partition(signal):
+        ready = max(arrival, signal)
+        return dict(start_to_caller_ticks=str(arrival - ticks[1]), exposed_worker_ticks=str(ready - arrival),
+                    join_return_delay_ticks=str(join_return - ready), return_to_stop_ticks=str(ticks[2] - join_return))
+
+    duration = timer[1] - timer[0]
+    timer_low = min(duration, max(0, timer[1] - 1 - arrival))
+    timer_high = min(duration, max(0, timer[1] + 1 - arrival), max(0, latest - arrival))
+    require(timer_low <= timer_high and timer_low <= max(0, earliest - arrival), "timer_outside_worker_path")
+    return dict(activity_start_record=ordinals[1], activity_stop_record=ordinals[2], caller_arrival_record=ordinals[9],
+                worker_stop_record=ordinals[6], join_stop_record=ordinals[10], caller_arrival_qpc=str(arrival),
+                worker_signal_earliest_qpc=str(earliest), worker_signal_latest_qpc=str(latest),
+                join_call_start_qpc=str(join_start), join_return_qpc=str(join_return),
+                probes=probes, last_prerequisite=last, at_earliest_signal=partition(earliest),
+                at_latest_signal=partition(latest), worker_timer_after_arrival_ticks=dict(lower=str(timer_low), upper=str(timer_high)),
+                worker_after_join_call_start_ticks=dict(lower=str(max(0, earliest-join_start)), upper=str(max(0, latest-join_start))))
+
+
+def measure(cfg, slot, activity, truth, process, page, source_hash, size, join_path=False):
+    probed = "caller_delay_ms" in cfg
+    count = 14 if probed else 10
+    expected_schema = "kn.owned_etl_handoff.v2" if probed else "kn.owned_etl_handoff.v1"
+    require(truth["schema"] == expected_schema and truth["provider_id"] == PROVIDER and
             guid(truth["session_id"]) != activity and truth["activity_id"] == activity, "workload_identity_mismatch")
+    if probed:
+        require(uint(truth["caller_delay_ms"], 1000) == cfg["caller_delay_ms"], "workload_mismatch")
     require((uint(truth["seed"], UINT32), uint(truth["steps"]), uint(truth["delay_ms"])) ==
             (slot["seed"], cfg["steps"], slot["delay_ms"]) and
             uint(truth["caller_result"], UINT32) == checksum(slot["seed"], cfg["steps"]) and
@@ -115,15 +167,17 @@ def measure(cfg, slot, activity, truth, process, page, source_hash, size):
             qpc(page["clock"]["header_perf_frequency"]) == hz, "clock_unqualified")
     rows, writes = page["markers"], truth["write_brackets"]
     require(type(rows) is list and type(writes) is list and
-            len(writes) == len(rows) == uint(page["matched_markers"]) == uint(page["decoded_activity_markers"]) == 10 and
+            len(writes) == len(rows) == uint(page["matched_markers"]) == uint(page["decoded_activity_markers"]) == count and
             uint(page["excluded_start_stop_records"]) == 0, "incomplete_marker_set")
     spans = list(map(bracket, writes))
-    ticks, ordinals, loggers = {}, {}, set()
+    ticks, ordinals, descriptors, loggers = {}, {}, {}, set()
     previous = 0
     for i, row in enumerate(rows, 1):
         event = row["event"]
-        eid, index = uint(event["event_id"], 10), uint(event["record_ordinal"], uint(page["records_seen"], 2_000_000))
-        require(0 < eid and eid not in ticks and uint(row["marker_ordinal"]) == i and previous < index and
+        descriptor = uint(event["event_id"], 17 if probed else 10)
+        eid = {16: 12, 17: 14}.get(descriptor, descriptor)
+        index = uint(event["record_ordinal"], uint(page["records_seen"], 2_000_000))
+        require(0 < eid <= count and eid not in ticks and uint(row["marker_ordinal"]) == i and previous < index and
                 event["provider_guid"] == PROVIDER and event["activity_id"] == activity and
                 uint(event["header_flags"], 65535) & 2 and not uint(event["header_flags"], 65535) & (4 | 8 | 128 | 256) and
                 not uint(event["event_property"], 65535) & 7 and
@@ -135,9 +189,10 @@ def measure(cfg, slot, activity, truth, process, page, source_hash, size):
         lo, hi = spans[eid-1]
         require(lo <= tick <= hi, "marker_outside_producer_write")
         loggers.add(uint(event["logger_id"], 65535))
-        ticks[eid], ordinals[eid] = tick, index
+        ticks[eid], ordinals[eid], descriptors[eid] = tick, index, descriptor
     require(len(loggers) == 1, "logger_mismatch")
-    for order in ((1, 3, 4, 9, 10, 2), (1, 5, 7, 8, 6, 10, 2)):
+    caller_order = (1, 3, 4, 11, 12, 9, 13, 14, 10, 2) if probed else (1, 3, 4, 9, 10, 2)
+    for order in (caller_order, (1, 5, 7, 8, 6, 10, 2)):
         for left, right in zip(order, order[1:]):
             require(ordinals[left] < ordinals[right] and spans[left-1][1] <= spans[right-1][0], "dependency_order_mismatch")
     join, timer = bracket(truth["join_call"]), bracket(truth["timer_call"])
@@ -147,7 +202,32 @@ def measure(cfg, slot, activity, truth, process, page, source_hash, size):
     values = dict(activity=ticks[2]-ticks[1], caller_work=ticks[4]-ticks[3], worker_span=ticks[6]-ticks[5],
                   join_call=join[1]-join[0], timer_call=timer[1]-timer[0], join_timer_overlap=overlap(join, timer),
                   work_window_overlap=overlap((ticks[3], ticks[4]), (ticks[5], ticks[7])))
-    return dict(frequency=str(hz), ticks={k: str(v) for k, v in values.items()})
+    measurement = dict(frequency=str(hz), ticks={k: str(v) for k, v in values.items()})
+    if probed or join_path:
+        probes = []
+        if probed:
+            pause_ticks = 0
+            if cfg["caller_delay_ms"]:
+                pause = bracket(truth["caller_delay_call"])
+                require(spans[3][1] <= pause[0] <= pause[1] <= spans[10][0], "caller_delay_outside_markers")
+                pause_ticks = pause[1] - pause[0]
+            else:
+                require(truth["caller_delay_call"] is None, "unexpected_caller_delay")
+            measurement["ticks"]["caller_delay_call"] = str(pause_ticks)
+            require(type(truth["join_probes"]) is list and len(truth["join_probes"]) == 2 and
+                    spans[13][1] <= join[0], "join_probe_order_mismatch")
+            for slot_index, probe in enumerate(truth["join_probes"]):
+                fields(probe, "wait_result call", "thread handle probe")
+                start = 11 + 2 * slot_index
+                call = bracket(probe["call"])
+                result = uint(probe["wait_result"], UINT32)
+                require(spans[start-1][1] <= call[0] <= call[1] <= spans[start][0], "probe_outside_markers")
+                signaled = descriptors[start+1] == 16 + slot_index
+                require(result == (WAIT_OBJECT_0 if signaled else WAIT_TIMEOUT), "probe_result_disagrees_with_etl")
+                probes.append(dict(start_record=ordinals[start], result_record=ordinals[start+1],
+                                   wait_result=result, call_start_qpc=str(call[0]), call_end_qpc=str(call[1])))
+        measurement["join_path"] = bound_join(ticks, ordinals, spans[5][1], join, timer, probes)
+    return measurement
 
 
 def rational(value):
@@ -168,7 +248,53 @@ def distribution(values):
                 median_ns=rational((ordered[(n-1)//2]+ordered[n//2])/2) if n else None)
 
 
-def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations):
+def path_ranges(row):
+    measurement = row["measurement"]
+    path = measurement["join_path"]
+    scale = Fraction(1_000_000_000, int(measurement["frequency"]))
+    early, late = path["at_earliest_signal"], path["at_latest_signal"]
+    ranges = {key.removesuffix("_ticks"): sorted((scale * int(early[key]), scale * int(late[key]))) for key in early}
+    for phase in ("worker_timer_after_arrival", "worker_after_join_call_start"):
+        interval = path[phase + "_ticks"]
+        ranges[phase] = (scale * int(interval["lower"]), scale * int(interval["upper"]))
+    return ranges
+
+
+def summarize_paths(report):
+    phases = ("start_to_caller", "exposed_worker", "join_return_delay", "return_to_stop", "worker_timer_after_arrival", "worker_after_join_call_start")
+    groups = {group: {phase: [] for phase in phases} for group in ("all", "baseline", "candidate")}
+    counts = {role: dict(caller=0, worker=0, unresolved=0, unavailable=0) for role in ("baseline", "candidate")}
+    for pair in report["pairs"]:
+        index = (pair["pair"] - 1) * 2
+        arms = {r["selection"]["role"]: r for r in report["observations"][index:index+2]}
+        for role, row in arms.items():
+            measure = row["measurement"]
+            counts[role][measure["join_path"]["last_prerequisite"] if measure else "unavailable"] += 1
+        pair["join_path_change_ns"] = None
+        if not pair["measured"]:
+            continue
+        base, candidate = path_ranges(arms["baseline"]), path_ranges(arms["candidate"])
+        changes = {}
+        for phase in phases:
+            lo, hi = candidate[phase][0] - base[phase][1], candidate[phase][1] - base[phase][0]
+            changes[phase] = dict(lower=rational(lo), upper=rational(hi))
+            groups["all"][phase].append((lo, hi))
+            groups[pair["order"][0]][phase].append((lo, hi))
+        pair["join_path_change_ns"] = changes
+
+    def bounds(values):
+        longer, shorter, equal = sum(lo > 0 for lo, hi in values), sum(hi < 0 for lo, hi in values), values.count((0, 0))
+        return dict(pairs=len(values), longer=longer, shorter=shorter, equal=equal, unresolved=len(values)-longer-shorter-equal,
+                    median_lower_ns=rational(median(lo for lo, hi in values)) if values else None,
+                    median_upper_ns=rational(median(hi for lo, hi in values)) if values else None)
+
+    summaries = {group: {phase: bounds(values) for phase, values in data.items()} for group, data in groups.items()}
+    report.update(schema="kn.etl_handoff_study.v2", join_path_summary=dict(last_prerequisites=counts, changes=summaries["all"],
+                  by_first_arm={role: summaries[role] for role in counts}))
+    report["qualification"]["join_path"] = "caller_arrival_and_worker_thread_termination"
+
+
+def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations, join_path=False):
     # A reused capture or producer process invalidates all measurements sharing it.
     for identity in ("session_id", "process", "etl_sha256"):
         by_identity = {}
@@ -181,8 +307,9 @@ def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations
             if len(shared) > 1:
                 for row in shared:
                     row.update(status="unqualified", reason="reused_" + identity, measurement=None)
-    deltas = {name: [] for name in METRICS}
-    orders = {role: {name: [] for name in METRICS} for role in ("baseline", "candidate")}
+    metrics = (*METRICS, "caller_delay_call") if "caller_delay_ms" in cfg else METRICS
+    deltas = {name: [] for name in metrics}
+    orders = {role: {name: [] for name in metrics} for role in ("baseline", "candidate")}
     planned_order = Counter()
     pairs = []
     for index in range(cfg["pairs"]):
@@ -194,7 +321,7 @@ def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations
                     measured=all(r["measurement"] is not None for r in arms.values()), candidate_minus_baseline_ns=None)
         if item["measured"]:
             change = {}
-            for key in METRICS:
+            for key in metrics:
                 delta = nanoseconds(arms["candidate"], key) - nanoseconds(arms["baseline"], key)
                 deltas[key].append(delta)
                 orders[first_role][key].append(delta)
@@ -202,7 +329,7 @@ def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations
             item["candidate_minus_baseline_ns"] = change
         pairs.append(item)
     measured = len(deltas["activity"])
-    return dict(schema="kn.etl_handoff_study.v1", status="complete" if measured == len(pairs) else "partial",
+    report = dict(schema="kn.etl_handoff_study.v1", status="complete" if measured == len(pairs) else "partial",
                 plan_sha256=plan_pin, package_sha256=package_pin, acquisition_id=acquisition, acquisition_environment=environment,
                 plan=cfg, planned_pairs=len(pairs), measured_pairs=measured,
                 unavailable_pairs=len(pairs)-measured, observations=observations, pairs=pairs,
@@ -212,3 +339,6 @@ def summarize(cfg, plan_pin, package_pin, acquisition, environment, observations
                               for role, group in orders.items()},
                 qualification=dict(workload="owned_fixed_work_with_worker_timer", wait_dependency="joined_worker_handle",
                                    scheduler_residency=None, product_regression=None, producer_authenticity="unverified"))
+    if "caller_delay_ms" in cfg or join_path:
+        summarize_paths(report)
+    return report

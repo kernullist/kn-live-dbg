@@ -668,6 +668,62 @@ process identities remain visible. Kernel scheduler residency, whole-product
 latency and producer authenticity require separate evidence.
 [Build, capture and replay](COMMAND_REFERENCE.md#measure-a-caller-waiting-for-a-worker)
 
+### Critical path at a joined worker
+
+With `plan --caller-delay-ms N`, both arms request the same caller pause
+after their calculation. Zero skips the pause. The recorder checks the
+worker thread handle with two zero-timeout waits, one before and one after
+the caller's join Start event. Each probe has its own ETW Start and Stop.
+The first probe starts at event ID 11 and ends at 12 for a timeout or
+16 for a signaled thread. The second uses Start 13 and Stop 14 or 17
+respectively. Replay checks that each call lies inside its event pair
+and that the recorder's return code agrees with the original Stop
+descriptor. The caller uses the same handle for its final join. [Thread termination](https://learn.microsoft.com/en-us/windows/win32/procthread/terminating-a-thread) · [Windows wait results](https://learn.microsoft.com/en-us/windows/win32/api/synchapi/nf-synchapi-waitforsingleobject)
+
+`last_prerequisite` identifies which occurred last, the caller reaching
+the join marker or the worker thread terminating. A signaled first probe
+establishes caller arrival last. A timeout on the second establishes
+worker termination last. When the state changes between probes, the
+worker's last event write may still establish the order. If the evidence
+permits both orders, the result is `unresolved`.
+
+The report bounds the worker's signal time using its last completed write,
+the caller's successful join, and each observed probe. A timeout supplies
+its call start as a lower bound. A signaled result supplies its call end as
+an upper bound. Comparisons with the worker's QPC readings allow one tick
+of cross-thread ordering uncertainty. The file times used to identify the
+worker retain their original clock. [Windows QPC ordering](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps#guidance-for-acquiring-time-stamps)
+
+Each of `at_earliest_signal` and `at_latest_signal` accounts for the entire
+marked activity in four successive intervals.
+
+| Interval | Elapsed time |
+| --- | --- |
+| `start_to_caller_ticks` | Activity Start to the caller's join Start marker. Includes the observed caller pause when requested. |
+| `exposed_worker_ticks` | Time after caller arrival for which the worker still had to terminate. Zero when the worker had already exited. |
+| `join_return_delay_ticks` | Time from the later prerequisite to return from the Windows join. Can include instrumentation and scheduling. |
+| `return_to_stop_ticks` | Join return to the outer activity Stop marker. |
+
+Use the four values from the same endpoint when adding intervals.
+`worker_after_join_call_start_ticks` bounds how long the worker still
+had to terminate after the QPC reading immediately before the final
+wait call. This excludes both handle probes. A worker can terminate
+after the caller's marker and still finish before that wait begins.
+`worker_timer_after_arrival_ticks` bounds the part of the worker's timer
+wait within the second interval. It is already included there. The
+measured `caller_delay_call` reports how long the requested pause took.
+These timings describe wall time in the recorded dependency. CPU residency
+and the time a different implementation could save require other evidence.
+
+For each complete pair, `join_path_change_ns` compares the candidate's
+range with the baseline's range at their respective QPC frequencies.
+The summary gives bounds on the median paired difference, direction
+counts, and results by which arm ran first. These bounds come from the
+observed signal intervals. Sampling uncertainty is a separate question.
+Unavailable arms retain their places in the study. For older ten-event
+archives, `replay --join-path` uses the worker's last write and the
+successful join, with no probe observations. [Capture and replay](COMMAND_REFERENCE.md#identify-the-last-prerequisite-at-a-thread-join)
+
 ## Saved Windows context switches
 
 `KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [--after N] [--limit N]`

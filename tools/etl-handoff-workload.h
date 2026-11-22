@@ -16,7 +16,8 @@ namespace handoff
     struct Config
     {
         GUID activity{};
-        uint32_t seed = 0, steps = 0, delayMs = 0;
+        uint32_t seed = 0, steps = 0, delayMs = 0, callerDelayMs = 0;
+        bool probeJoin = false;
 
         static bool Number(const wchar_t* input, uint32_t maximum, uint32_t& value)
         {
@@ -90,18 +91,35 @@ namespace handoff
         uint32_t callerResult{}, workerResult{};
         uint64_t processCreated{}, workerCreated{}, workerExited{};
         LONGLONG frequency{};
-        std::array<Bracket, 10> markers{};
-        Bracket joinCall{}, timerCall{};
+        std::array<Bracket, 14> markers{};
+        Bracket joinCall{}, timerCall{}, callerDelayCall{};
+        std::array<Bracket, 2> probeCalls{};
+        std::array<DWORD, 2> probeResults{};
 
-        ULONG Mark(size_t index)
+        ULONG Mark(size_t index, USHORT eventId = 0)
         {
-            const EVENT_DESCRIPTOR descriptor{static_cast<USHORT>(index + 1), 1, 0, TRACE_LEVEL_INFORMATION,
+            const EVENT_DESCRIPTOR descriptor{eventId ? eventId : static_cast<USHORT>(index + 1), 1, 0, TRACE_LEVEL_INFORMATION,
                 static_cast<UCHAR>(1 + index % 2), static_cast<USHORT>(1 + index / 2), 0};
             auto& span = markers[index];
             span.begin = Tick();
             const auto status = EventWriteTransfer(registration, &descriptor, &settings.activity, nullptr, 0, nullptr);
             span.end = Tick();
             return status;
+        }
+
+        ULONG Probe(HANDLE worker, size_t slot)
+        {
+            const size_t marker = 10 + 2 * slot;
+            auto status = Mark(marker);
+            if (status) { return status; }
+            probeCalls[slot].begin = Tick();
+            const DWORD result = WaitForSingleObject(worker, 0);
+            const DWORD error = result == WAIT_FAILED ? GetLastError() : ERROR_SUCCESS;
+            probeCalls[slot].end = Tick();
+            if (result != WAIT_TIMEOUT && result != WAIT_OBJECT_0) { return error ? error : ERROR_INVALID_DATA; }
+            probeResults[slot] = result;
+            // The Stop descriptor in the original ETL identifies the observed state.
+            return Mark(marker + 1, static_cast<USHORT>(result == WAIT_OBJECT_0 ? 16 + slot : marker + 2));
         }
 
         static DWORD WINAPI Worker(void* context)
@@ -150,7 +168,15 @@ namespace handoff
             if (!SetEvent(go) && !status) { status = GetLastError(); }
             if (!status) { status = Mark(2); }
             if (!status) { callerResult = Calculate(settings.seed, settings.steps); status = Mark(3); }
+            if (!status && settings.callerDelayMs)
+            {
+                callerDelayCall.begin = Tick();
+                Sleep(settings.callerDelayMs);
+                callerDelayCall.end = Tick();
+            }
+            if (!status && settings.probeJoin) { status = Probe(worker.value, 0); }
             if (!status) { status = Mark(8); }
+            if (!status && settings.probeJoin) { status = Probe(worker.value, 1); }
             joinCall.begin = Tick();
             const auto joined = Wait(worker.value);
             joinCall.end = Tick();
@@ -171,15 +197,30 @@ namespace handoff
 
         void Json(const std::wstring& activity) const
         {
-            std::wcout << L",\"schema\":\"kn.owned_etl_handoff.v1\",\"activity_id\":\"" << activity
+            std::wcout << L",\"schema\":\"kn.owned_etl_handoff." << (settings.probeJoin ? L"v2" : L"v1") << L"\",\"activity_id\":\"" << activity
                 << L"\",\"seed\":" << settings.seed << L",\"steps\":" << settings.steps << L",\"delay_ms\":" << settings.delayMs
                 << L",\"caller_result\":" << callerResult << L",\"worker_result\":" << workerResult
                 << L",\"pid\":" << GetCurrentProcessId() << L",\"process_created\":\"" << processCreated
                 << L"\",\"caller_tid\":" << callerTid << L",\"joined_tid\":" << workerTid << L",\"worker_created\":\"" << workerCreated
                 << L"\",\"worker_exited\":\"" << workerExited << L"\",\"frequency\":\"" << frequency << L"\",\"write_brackets\":[";
-            for (size_t i = 0; i < markers.size(); ++i) { if (i) { std::wcout << L','; } markers[i].Json(); }
+            const size_t count = settings.probeJoin ? markers.size() : 10;
+            for (size_t i = 0; i < count; ++i) { if (i) { std::wcout << L','; } markers[i].Json(); }
             std::wcout << L"],\"join_call\":"; joinCall.Json();
             std::wcout << L",\"timer_call\":"; timerCall.Json();
+            if (settings.probeJoin)
+            {
+                std::wcout << L",\"caller_delay_ms\":" << settings.callerDelayMs << L",\"caller_delay_call\":";
+                if (settings.callerDelayMs) { callerDelayCall.Json(); } else { std::wcout << L"null"; }
+                std::wcout << L",\"join_probes\":[";
+                for (size_t i = 0; i < probeCalls.size(); ++i)
+                {
+                    if (i) { std::wcout << L','; }
+                    std::wcout << L"{\"wait_result\":" << probeResults[i] << L",\"call\":";
+                    probeCalls[i].Json();
+                    std::wcout << L'}';
+                }
+                std::wcout << L']';
+            }
         }
     };
 }

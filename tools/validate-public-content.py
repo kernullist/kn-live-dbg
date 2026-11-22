@@ -94,8 +94,9 @@ FAULT_QUERY_SCHEMAS = ("kn.etl_hard_faults.v1", "kn.etl_hard_faults.v2", "kn.etl
                        "kn.etl_activity_comparison.v1", "kn.etl_activity_comparison_receipt.v1",
                        "kn.etl_activity_comparison.v2", "kn.etl_activity_comparison_receipt.v2", "kn.traceprocessor_activity_rows.v1")
 ETL_ROTATION_SCHEMAS = ("kn.etl_rotation_inventory.v1", "kn.etl_rotation_set.v1")
-HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", *(f"kn.etl_handoff_{kind}{receipt}.v1" for kind in ("plan", "capture", "study")
-                                               for receipt in ("", "_receipt")))
+HANDOFF_SCHEMAS = ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2", "kn.etl_handoff_capture.v1", "kn.etl_handoff_capture_receipt.v1",
+                   *(f"kn.etl_handoff_{kind}{receipt}.v{version}" for kind in ("plan", "study")
+                     for receipt in ("", "_receipt") for version in (1, 2)))
 ACTIVITY_WAITS_SCHEMAS = ("kn.etl_activity_waits.v1", "kn.etl_activity_waits_receipt.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
 TRACE_QUERY_SCHEMAS = (*ACTIVITY_WAITS_SCHEMAS, "kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
@@ -195,6 +196,11 @@ HANDOFF_FIELDS = tuple(frozenset(keys) for keys in (
     ("candidate_minus_baseline_ns", "order"), ("join_timer_overlap", "work_window_overlap"),
     ("longer", "shorter", "median_ns"), ("frequency", "ticks"), ("planned_pairs", "measured_pairs"),
     ("windows_version", "controller_pointer_bytes"), ("acquisition_id", "outcomes"),
+    ("wait_result", "call"), ("result_record", "call_start_qpc"), ("caller_delay_call", "caller_delay_ms"),
+    ("worker_signal_earliest_qpc", "worker_signal_latest_qpc"), ("start_to_caller_ticks", "exposed_worker_ticks"),
+    ("last_prerequisites", "changes"), ("exposed_worker", "join_return_delay"), ("median_lower_ns", "median_upper_ns"),
+    ("caller", "worker", "unresolved", "unavailable"), ("join_path_change_ns",), ("worker_timer_after_arrival_ticks",),
+    ("worker_after_join_call_start_ticks",),
 ))
 HANDOFF_MARKERS = (*HANDOFF_SCHEMAS, *(f'"{key}"' for keys in HANDOFF_FIELDS for key in keys))
 DISK_IO_FIELDS = tuple(frozenset(fields) for fields in (
@@ -506,7 +512,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
         if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_rows\.v1|owned_etl_handoff\.v1|etl_handoff_(?:plan|capture|study)(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing)?\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_rows\.v1|owned_etl_handoff\.v[12]|etl_handoff_(?:plan|study)(?:_receipt)?\.v[12]|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:

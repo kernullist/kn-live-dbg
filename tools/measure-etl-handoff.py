@@ -52,7 +52,7 @@ def recorder_document(attempt):
     raw, complete = original(attempt["stdout"], LIMIT)
     check(complete, "recorder output truncated")
     value = study.DECODE(raw)
-    check(type(value) is dict and value["schema"] == "kn.owned_etl_handoff.v1", "unexpected recorder output")
+    check(type(value) is dict and value["schema"] in ("kn.owned_etl_handoff.v1", "kn.owned_etl_handoff.v2"), "unexpected recorder output")
     study.guid(value["session_id"])
     return value
 
@@ -62,6 +62,9 @@ def capture_slot(cfg, slot, activity, program, binary, directory, files, stack, 
     folder.mkdir()
     files.parents(stack, folder, held)
     args = [".", "--handoff", activity, str(slot["seed"]), str(cfg["steps"]), str(slot["delay_ms"])]
+    if "caller_delay_ms" in cfg:
+        args[1] = "--handoff-join"
+        args.append(str(cfg["caller_delay_ms"]))
     attempt = run_reader(program, args, folder, cfg["timeout_ms"], LIMIT, files, binary, capture_identity=True)
     record = dict(slot=slot["slot"], ticket=slot["ticket"], attempt=attempt, retention="not_located",
                   source_sha256=None, source_bytes=None)
@@ -181,7 +184,7 @@ def structure(archive, source, bounds, expected_plan):
     return cfg, acquisition, env, outcomes
 
 
-def observe(cfg, slot, activity, record, archive, reader, binary, directory, files):
+def observe(cfg, slot, activity, record, archive, reader, binary, directory, files, join_path):
     attempt = record["attempt"]
     result = dict(selection=slot, expected_activity_id=activity, status="unavailable", reason=record["retention"], etl_sha256=record["source_sha256"],
                   session_id=None, process=attempt["process_identity"], recorder=reader_receipt(attempt),
@@ -215,7 +218,7 @@ def observe(cfg, slot, activity, record, archive, reader, binary, directory, fil
         check(type(page) is dict and page["source_sha256"] == record["source_sha256"] and
               native["exit_code"] == (0 if page["status"] == "read" else 1), "unexpected reader output")
         result["marker_page"] = page
-        result["measurement"] = study.measure(cfg, slot, activity, truth, result["process"], page, record["source_sha256"], len(raw))
+        result["measurement"] = study.measure(cfg, slot, activity, truth, result["process"], page, record["source_sha256"], len(raw), join_path)
         result.update(status="measured", reason=None)
     except study.Unqualified as exc:
         result.update(status="unqualified", reason=str(exc))
@@ -232,9 +235,9 @@ def replay(args, output, files, stack, held, directory):
     with zipfile.ZipFile(source) as archive:
         cfg, acquisition, env, outcomes = structure(archive, source, bounds, plan_pin)
         exe, binary = pinned_image(args.exe, cfg["reader_sha256"], files, stack, held)
-        rows = [observe(cfg, slot, study.activity_id(acquisition, plan_pin, slot), result, archive, exe, binary, directory, files)
+        rows = [observe(cfg, slot, study.activity_id(acquisition, plan_pin, slot), result, archive, exe, binary, directory, files, args.join_path)
                 for slot, result in zip(cfg["slots"], outcomes, strict=True)]
-    report = study.summarize(cfg, plan_pin, expected, acquisition, env, rows)
+    report = study.summarize(cfg, plan_pin, expected, acquisition, env, rows, args.join_path)
     data = encoded(report)
     if output:
         report_pin = publish_new(output, lambda out: out.write(data))
@@ -242,7 +245,7 @@ def replay(args, output, files, stack, held, directory):
     else:
         report_pin = sha(data)
         state = "matched" if report_pin == digest(args.check_report.lower()) else "mismatch"
-    receipt = dict(schema="kn.etl_handoff_study_receipt.v1", status=state, study_status=report["status"],
+    receipt = dict(schema=report["schema"].replace("study.", "study_receipt."), status=state, study_status=report["status"],
                    report_sha256=report_pin, plan_sha256=plan_pin, package_sha256=expected,
                    planned_pairs=report["planned_pairs"], measured_pairs=report["measured_pairs"])
     return receipt, int(state == "mismatch" or report["status"] != "complete")
@@ -260,9 +263,9 @@ def execute(args):
             check(not os.path.lexists(output), "choose a new private output file")
         if args.command == "plan":
             cfg = study.plan(str(uuid4()), args.pairs, args.steps, args.baseline_ms, args.candidate_ms, args.timeout_ms,
-                             args.recorder_sha256.lower(), args.exe_sha256.lower())
+                             args.recorder_sha256.lower(), args.exe_sha256.lower(), args.caller_delay_ms)
             pin = publish_new(output, lambda out: out.write(encoded(cfg)))
-            return dict(schema="kn.etl_handoff_plan_receipt.v1", plan_sha256=pin, planned_pairs=cfg["pairs"]), 0
+            return dict(schema=cfg["schema"].replace("plan.", "plan_receipt."), plan_sha256=pin, planned_pairs=cfg["pairs"]), 0
         if args.command == "replay" and not output:
             digest(args.check_report.lower())
         directory = Path(stack.enter_context(tempfile.TemporaryDirectory(dir=parent, prefix=".kn-handoff-")))
@@ -282,6 +285,7 @@ def main():
     new.add_argument("--steps", type=int, default=20000, help="fixed iterations per thread and arm (1..1000000)")
     new.add_argument("--baseline-ms", type=int, required=True, help="baseline relative timer delay (0..1000 ms)")
     new.add_argument("--candidate-ms", type=int, required=True, help="candidate relative timer delay (0..1000 ms)")
+    new.add_argument("--caller-delay-ms", type=int, help="record two thread-handle probes around the join after this fixed caller delay (0..1000 ms)")
     new.add_argument("--timeout-ms", type=int, default=15000, help="deadline per process (1..120000 ms)")
     for flag in ("--recorder-sha256", "--exe-sha256", "--output"):
         new.add_argument(flag, required=True)
@@ -289,6 +293,7 @@ def main():
     for flag in ("--plan", "--plan-sha256", "--recorder", "--output"):
         acquire.add_argument(flag, required=True)
     verify = sub.add_parser("replay", help="read original ETLs and compute paired differences", allow_abbrev=False)
+    verify.add_argument("--join-path", action="store_true", help="also bound the join path for original ten-event recordings")
     for flag in ("--package", "--sha256", "--plan-sha256", "--exe"):
         verify.add_argument(flag, required=True)
     target = verify.add_mutually_exclusive_group(required=True)

@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Critical path at a joined worker on 2026-11-22
+
+On Windows `10.0.28000`, the x64 Release recorder (SHA-256 prefix
+`8505d57164ba`) recorded 44 private ETLs across three paired studies.
+Each run emitted 14 activity markers. The Release reader
+(`e83dfa97dacf`) and a separate Windows ETW reader agreed on all 616
+original headers, including the outcome of each thread-handle probe.
+Independent calculations reproduced the signal bounds, the partition of
+each complete activity and the paired differences. The table shows
+candidate minus baseline in milliseconds. [ETW and interval checks](../tools/test-etl-handoff.py)
+
+| Worker timers, caller pause (ms) | Pairs | Last prerequisite, baseline / candidate | Median activity change | Median change in worker time after caller arrival |
+| --- | ---: | --- | ---: | ---: |
+| 2 to 80, caller 25 | 8 | caller / worker in all 8 | +53.2925 | +50.4889 to +50.7701 |
+| 2 to 18, caller 90 | 8 | caller / caller in all 8 | −2.9512 | 0 |
+| 35 to 35, caller 0 | 6 | worker / worker in all 6 | +3.1886 | +2.9466 to +5.1535 |
+
+Starting the measurement immediately before the final Windows wait
+excluded both probes. On that basis the median increase in outstanding
+worker time in the first study was 50.4881 to 50.7694 ms.
+In the second study the worker timer call grew by a median of 16.7615 ms,
+but every worker had already terminated before the caller's join marker.
+In the identical-settings study the exposed worker time increased in four
+pairs and decreased in two. The measurements describe these acquisitions
+of one caller and one joined worker. Scheduler residency and latency
+effects in a product workload remain open.
+
+The MSVC `/RTC1` recorder added two pairs and 56 independently checked
+headers. Three previously retained v1 reports reproduced their digests.
+The optional join analysis of an older eight-pair archive used all 160
+original markers. Reversing a probe outcome in a rehashed recorder receipt
+withheld that arm's comparison against the original ETL. A session-start
+failure across 16 launches retained all eight missing pairs and returned
+empty timing estimates. Exact replay, publication checks for private
+report fragments and the signed capture-statement regression passed.
+[Capture and replay](COMMAND_REFERENCE.md#identify-the-last-prerequisite-at-a-thread-join) · [Timing model](TRACE_IMPORT.md#critical-path-at-a-joined-worker)
+
 ## Whole-activity wait accounting on 2026-11-22
 
 On Windows `10.0.28000`, the x64 Release reader (SHA-256 prefix

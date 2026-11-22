@@ -1,5 +1,6 @@
 """Check a pinned handoff study against an independent Windows event reader and exercise partial studies."""
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from fractions import Fraction
@@ -45,9 +46,97 @@ def sweep(left, right):
     return covered
 
 
+def fraction(value):
+    return Fraction(int(value["numerator"]), int(value["denominator"]))
+
+
+def independent_path(events, truth, measurement):
+    path = measurement["join_path"]
+    source = {e["event_id"]: e for e in events}
+    start, arrival, stop = (int(source[i]["raw_timestamp"]) for i in (1, 9, 2))
+    join_start, returned = map(int, truth["join_call"])
+    ids = (1, 2, 9, 6, 10)
+    assert [source[i]["record_ordinal"] for i in ids] == [path[k] for k in (
+        "activity_start_record", "activity_stop_record", "caller_arrival_record", "worker_stop_record", "join_stop_record")]
+    assert (arrival, join_start, returned) == tuple(int(path[k]) for k in ("caller_arrival_qpc", "join_call_start_qpc", "join_return_qpc"))
+    lower, upper = [start, int(truth["write_brackets"][5][1])-1], [returned]
+    results = []
+    for i, entry in enumerate(truth.get("join_probes", [])):
+        first, pending, signaled = ((11, 12, 16), (13, 14, 17))[i]
+        assert (pending in source) != (signaled in source)
+        stop_id = signaled if signaled in source else pending
+        lo, hi = map(int, entry["call"])
+        left, right = (source[k] for k in (first, stop_id))
+        assert int(left["raw_timestamp"]) <= lo <= hi <= int(right["raw_timestamp"])
+        if i == 0:
+            assert right["record_ordinal"] < source[9]["record_ordinal"]
+        else:
+            assert source[9]["record_ordinal"] < left["record_ordinal"]
+        code = 0 if stop_id == signaled else 258
+        assert entry["wait_result"] == code
+        results.append(code)
+        assert path["probes"][i] == dict(start_record=left["record_ordinal"], result_record=right["record_ordinal"],
+                                         wait_result=code, call_start_qpc=str(lo), call_end_qpc=str(hi))
+        (upper if code == 0 else lower).append(hi if code == 0 else lo)
+    assert len(results) == len(path["probes"])
+    a, b = max(lower), min(upper)
+    assert a <= b and (a, b) == (int(path["worker_signal_earliest_qpc"]), int(path["worker_signal_latest_qpc"]))
+    who = "unresolved"
+    if b < arrival or results[:1] == [0]:
+        who = "caller"
+    if a > arrival or results[1:] == [258]:
+        who = "worker"
+    assert path["last_prerequisite"] == who
+    phases = ("start_to_caller", "exposed_worker", "join_return_delay", "return_to_stop")
+    samples = {k: [] for k in phases}
+    for signal, key in ((a, "at_earliest_signal"), (b, "at_latest_signal")):
+        marks = sorted({start, signal, arrival, returned, stop})
+        parts = dict.fromkeys(phases, 0)
+        for left, right in zip(marks, marks[1:]):
+            band = 0 if right <= arrival else 1 if right <= signal else 2 if right <= returned else 3
+            parts[phases[band]] += right - left
+        assert {k + "_ticks": str(v) for k, v in parts.items()} == path[key]
+        assert sum(parts.values()) == int(measurement["ticks"]["activity"])
+        for phase in phases:
+            samples[phase].append(parts[phase])
+    t0, t1 = map(int, truth["timer_call"])
+    timer_widths = [sweep((arrival, max(arrival, b)), (t0+d, t1+d)) for d in (-1, 0, 1) if t1+d <= b]
+    timer = path["worker_timer_after_arrival_ticks"]
+    assert (min(timer_widths), max(timer_widths)) == (int(timer["lower"]), int(timer["upper"]))
+    samples["worker_timer_after_arrival"] = timer_widths
+    samples["worker_after_join_call_start"] = [sweep((start, s), (join_start, returned)) for s in (a, b)]
+    assert samples["worker_after_join_call_start"] == [int(path["worker_after_join_call_start_ticks"][k]) for k in ("lower", "upper")]
+    hz = int(truth["frequency"])
+    return who, {k: [Fraction(t*10**9, hz) for t in v] for k, v in samples.items()}
+
+
+def independent_differences(report, arms):
+    counts = {role: dict(caller=0, worker=0, unresolved=0, unavailable=0) for role in ("baseline", "candidate")}
+    groups = {}
+    for pair in report["pairs"]:
+        baseline, candidate = (arms[pair["pair"], r] for r in counts)
+        counts["baseline"][baseline[0]] += 1
+        counts["candidate"][candidate[0]] += 1
+        for phase, values in candidate[1].items():
+            alternatives = [v-b for v in values for b in baseline[1][phase]]
+            low, high = min(alternatives), max(alternatives)
+            change = pair["join_path_change_ns"][phase]
+            assert (fraction(change["lower"]), fraction(change["upper"])) == (low, high)
+            for group in ("all", pair["order"][0]):
+                groups.setdefault((group, phase), []).append((low, high))
+    summary = report["join_path_summary"]
+    assert counts == summary["last_prerequisites"]
+    for (group, phase), values in groups.items():
+        dest = (summary["changes"] if group == "all" else summary["by_first_arm"][group])[phase]
+        assert dest["pairs"] == len(values)
+        assert [fraction(dest[k]) for k in ("median_lower_ns", "median_upper_ns")] == [statistics.median(col) for col in zip(*values)]
+        expected = [sum(lo > 0 for lo, hi in values), sum(hi < 0 for lo, hi in values), values.count((0, 0))]
+        assert [dest[k] for k in ("longer", "shorter", "equal", "unresolved")] == [*expected, len(values)-sum(expected)]
+
+
 def independent(package, report, oracle, folder):
     cfg = report["plan"]
-    by_pair = {}
+    by_pair, paths = {}, {}
     with zipfile.ZipFile(package) as archive:
         for row in report["observations"]:
             slot, truth = row["selection"], row["workload"]
@@ -57,13 +146,22 @@ def independent(package, report, oracle, folder):
             footer, _, groups, _ = WINDOW["read_oracle"](oracle, path)
             events = sorted((e for group in groups.values() for e in group), key=lambda e: e["record_ordinal"])
             assert [r["event"] for r in row["marker_page"]["markers"]] == events
-            assert len(events) == 10 and footer["records_seen"] == row["marker_page"]["records_seen"]
+            assert len(events) == (14 if "caller_delay_ms" in cfg else 10) and footer["records_seen"] == row["marker_page"]["records_seen"]
             assert footer["clock_type"] == 1 and footer["frequency"] == int(truth["frequency"])
             t = {e["event_id"]: int(e["raw_timestamp"]) for e in events}
             join, timer = (tuple(map(int, truth[k])) for k in ("join_call", "timer_call"))
             expected = {"activity": t[2]-t[1], "caller_work": t[4]-t[3], "worker_span": t[6]-t[5],
                         "join_call": join[1]-join[0], "timer_call": timer[1]-timer[0],
                         "join_timer_overlap": sweep(join, timer), "work_window_overlap": sweep((t[3], t[4]), (t[5], t[7]))}
+            if "caller_delay_ms" in cfg:
+                delay = truth["caller_delay_call"]
+                if cfg["caller_delay_ms"]:
+                    lo, hi = map(int, delay)
+                    assert t[4] <= lo <= hi <= t[11]
+                    expected["caller_delay_call"] = hi-lo
+                else:
+                    assert delay is None
+                    expected["caller_delay_call"] = 0
             assert {k: int(v) for k, v in row["measurement"]["ticks"].items()} == expected
             assert expected["join_timer_overlap"] <= min(expected["join_call"], expected["timer_call"])
             for seed, name in ((slot["seed"], "caller_result"), (slot["seed"] ^ 0x9e3779b9, "worker_result")):
@@ -71,6 +169,10 @@ def independent(package, report, oracle, folder):
                     seed = (1664525*seed + 1013904223) % 2**32
                 assert seed == truth[name]
             by_pair.setdefault(slot["pair"], {})[slot["role"]] = {k: Fraction(v*10**9, footer["frequency"]) for k, v in expected.items()}
+            if report["schema"] == "kn.etl_handoff_study.v2":
+                paths[slot["pair"], slot["role"]] = independent_path(events, truth, row["measurement"])
+    if paths:
+        independent_differences(report, paths)
     def value(r):
         return Fraction(int(r["numerator"]), int(r["denominator"]))
     for name, distribution in report["changes"].items():
@@ -133,6 +235,66 @@ def semantic_controls(report):
         assert all(r["reason"] == "reused_"+field and r["measurement"] is None for r in observations[:2])
 
 
+def join_controls(report):
+    ticks = {1: 10, 9: 30, 2: 60}
+    records = {n: n for n in (1, 9, 2, 6, 10)}
+    def probes(first, second):
+        return [dict(wait_result=code, call_start_qpc=str(lo), call_end_qpc=str(hi))
+                for code, lo, hi in ((first, 24, 26), (second, 34, 36))]
+    # Enumerate every feasible integer signal tick and cross-thread timer-end reading.
+    for before, after in ((0, 0), (258, 0), (258, 258)):
+        for worker_end in (24, 30, 31, 35):
+            signals = [s for s in range(10, 51) if s >= worker_end-1 and
+                       (s <= 26 if before == 0 else s >= 24) and (s <= 36 if after == 0 else s >= 34)]
+            try:
+                path = study.bound_join(ticks, records, worker_end, (40, 50), (20, worker_end), probes(before, after))
+            except study.Unqualified:
+                assert not signals
+                continue
+            assert signals and (int(path["worker_signal_earliest_qpc"]), int(path["worker_signal_latest_qpc"])) == (min(signals), max(signals))
+            who = "worker" if min(signals) > 30 else "caller" if max(signals) < 30 else "unresolved"
+            assert path["last_prerequisite"] == who
+            tails = [len(range(30, s)) for s in signals]
+            assert (min(tails), max(tails)) == tuple(int(path[k]["exposed_worker_ticks"]) for k in ("at_earliest_signal", "at_latest_signal"))
+            calls = [len(range(40, s)) for s in signals]
+            assert (min(calls), max(calls)) == tuple(int(path["worker_after_join_call_start_ticks"][k]) for k in ("lower", "upper"))
+            timers = [len(set(range(30, s)) & set(range(20+d, worker_end+d))) for s in signals
+                      for d in (-1, 0, 1) if worker_end+d <= s]
+            assert (min(timers), max(timers)) == tuple(int(path["worker_timer_after_arrival_ticks"][k]) for k in ("lower", "upper"))
+    try:
+        study.bound_join(ticks, records, 24, (40, 50), (10, 20), probes(0, 258))
+        raise AssertionError("accepted a nonsignaled thread after a signaled observation")
+    except study.Unqualified as error:
+        assert str(error) == "thread_signal_reversed"
+    if "caller_delay_ms" not in report["plan"]:
+        return
+    row = report["observations"][0]
+    def reject(truth, page, expected):
+        try:
+            study.measure(report["plan"], row["selection"], row["expected_activity_id"], truth, row["process"], page,
+                          row["etl_sha256"], row["marker_page"]["source_bytes"])
+        except study.Unqualified as error:
+            assert str(error) == expected, error
+        else:
+            raise AssertionError("accepted " + expected)
+    truth, page = row["workload"], row["marker_page"]
+    changed = deepcopy(truth)
+    changed["join_probes"][0]["wait_result"] ^= 258
+    reject(changed, page, "probe_result_disagrees_with_etl")
+    altered_page = deepcopy(page)
+    result_record = row["measurement"]["join_path"]["probes"][0]["result_record"]
+    event = next(r["event"] for r in altered_page["markers"] if r["event"]["record_ordinal"] == result_record)
+    event["event_id"] = 16 if event["event_id"] == 12 else 12
+    reject(truth, altered_page, "probe_result_disagrees_with_etl")
+    changed = deepcopy(truth)
+    changed["join_probes"][0]["call"] = changed["join_call"]
+    reject(changed, page, "probe_outside_markers")
+    reject(dict(truth, caller_delay_ms=(truth["caller_delay_ms"]+1) % 1001), page, "workload_mismatch")
+    reject(dict(truth, schema="kn.owned_etl_handoff.v1"), page, "workload_identity_mismatch")
+    bad_delay = "caller_delay_outside_markers" if truth["caller_delay_ms"] else "unexpected_caller_delay"
+    reject(dict(truth, caller_delay_call=truth["join_call"]), page, bad_delay)
+
+
 def archive_controls(args, folder, replay, report):
     def repack(target, mutate):
         with zipfile.ZipFile(args.package) as archive:
@@ -158,7 +320,28 @@ def archive_controls(args, folder, replay, report):
     assert result["measured_pairs"] == report["planned_pairs"]-1 and result["unavailable_pairs"] == 1
     assert result["observations"][0]["reason"] == "not_located" and result["observations"][1]["measurement"] is not None
     assert result["pairs"][0]["candidate_minus_baseline_ns"] is None
+    if "join_path_summary" in report:
+        assert result["pairs"][0]["join_path_change_ns"] is None
+        summary = result["join_path_summary"]
+        assert summary["last_prerequisites"][result["observations"][0]["selection"]["role"]]["unavailable"] == 1
+        assert summary["changes"]["exposed_worker"]["pairs"] == result["measured_pairs"]
     assert invoke([*limited, "--check-report", receipt["report_sha256"]], 1)["status"] == "matched"
+    if "caller_delay_ms" in report["plan"]:
+        def change_probe(_parts, outcomes):
+            captured = outcomes[0]["attempt"]["stdout"]
+            raw = json.loads(base64.b64decode(captured["base64"], validate=True))
+            raw["join_probes"][0]["wait_result"] ^= 258
+            changed = study.encoded(raw)
+            digest = hashlib.sha256(changed).hexdigest()
+            captured.update(byte_count=len(changed), original_sha256=digest, retained_sha256=digest,
+                            base64=base64.b64encode(changed).decode("ascii"))
+        altered = repack(folder/"changed-probe.zip", change_probe)
+        output = folder/"changed-probe.json"
+        mismatch = invoke([*altered, "--output", output], 1)
+        partial = json.loads(output.read_bytes())
+        assert partial["observations"][0]["reason"] == "probe_result_disagrees_with_etl"
+        assert partial["measured_pairs"] == report["planned_pairs"]-1 and partial["pairs"][0]["join_path_change_ns"] is None
+        assert invoke([*altered, "--check-report", mismatch["report_sha256"]], 1)["status"] == "matched"
     def reversed_order(_parts, outcomes):
         outcomes[0], outcomes[1] = outcomes[1], outcomes[0]
     def bad_binding(_parts, outcomes):
@@ -248,8 +431,11 @@ def main():
     parser.add_argument("--plan-sha256", required=True)
     parser.add_argument("--recorder", type=Path, help="include new same-plan acquisitions and actual failed launches")
     parser.add_argument("--check-controls", action="store_true")
+    parser.add_argument("--join-path", action="store_true", help="check optional join analysis of a legacy archive")
     args = parser.parse_args()
     replay = ["replay", "--package", args.package, "--sha256", args.sha256, "--plan-sha256", args.plan_sha256, "--exe", args.exe]
+    if args.join_path:
+        replay.append("--join-path")
     with tempfile.TemporaryDirectory() as temp:
         folder = Path(temp)
         output = folder/"report.json"
@@ -265,7 +451,15 @@ def main():
         assert WINDOW["AUDIT"]["inspect"]("renamed.bin", args.package.read_bytes()[:100])[0]["rule"] == "private-benchmark-package"
         if args.check_controls:
             semantic_controls(report)
+            if "join_path_summary" in report:
+                join_controls(report)
             archive_controls(args, folder, replay, report)
+        if "join_path_summary" in report:
+            path = row["measurement"]["join_path"]
+            for part in (path, path["at_latest_signal"], *path["probes"], *row["workload"].get("join_probes", []),
+                         report["join_path_summary"], report["join_path_summary"]["changes"],
+                         report["join_path_summary"]["changes"]["exposed_worker"], report["join_path_summary"]["last_prerequisites"]["baseline"]):
+                WINDOW["private"](part)
         if args.recorder:
             acquisition_controls(args, folder)
         print(f'{report["measured_pairs"]} pairs and {markers} original markers matched the independent Windows reader and interval calculations.')
