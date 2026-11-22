@@ -361,6 +361,73 @@ records describe the local controller's observations. Independent provenance
 and detection accuracy require other evidence.
 [Registered cohort validation](VALIDATION.md#registered-etl-reader-cohort-on-2026-11-22)
 
+## Evaluate development and heldout ETLs separately
+
+Register a private [benchmark corpus](#imported-input-schemas) before either
+reader evaluates the heldout files. The campaign checks the complete corpus
+for a sample family, independence group or identical artifact assigned to
+both partitions. This includes cases outside the requested slots. Two
+whole-file cases that share the same bytes must also declare the same sample
+family and independence group. Use the same pinned corpus for campaigns
+whose split should be comparable.
+
+For each ETL case use layer `independent_comparison`, task
+`saved_etl_descriptor_counts` and unit `case`. Set `artifact_sha256` to the
+complete file hash and `holes_sha256` to the SHA-256 of the two ASCII bytes
+`[]`, with no newline. The reader compares the whole file. The registered
+event families determine how many comparisons each file contributes.
+The corpus may also contain cases for other tasks. Supply `--case-id` once
+per planned slot, in order, to select eligible cases. Repeating an ID
+registers another attempt in its original group. Omitting the option selects
+the entire corpus in declaration order. A campaign accepts up to 32 slots.
+
+The following example expects a private corpus containing case IDs `control`
+and `external` with the corresponding local files below. It registers a
+second heldout attempt and leaves it unissued.
+
+```powershell
+$inputsDir = '.build/etl-study-example'
+$roster = Join-Path $inputsDir 'corpus.json'
+$files = @((Join-Path $inputsDir 'development.etl'), (Join-Path $inputsDir 'heldout.etl'))
+$exe = 'x64/Release/KnLiveDbg.exe'
+$exePin = (Get-FileHash -LiteralPath $exe).Hash.ToLowerInvariant()
+$systemPin = (Get-FileHash -LiteralPath (Join-Path $env:SystemRoot 'System32/tracerpt.exe')).Hash.ToLowerInvariant()
+$studyPin = (Get-FileHash -LiteralPath $roster).Hash.ToLowerInvariant()
+$series = Join-Path '.build' ('study-' + [guid]::NewGuid().ToString('N'))
+$plan = python tools/saved_etl_campaign.py create --directory $series --study-corpus $roster --study-sha256 $studyPin --case-id control --case-id external --case-id external --exe-sha256 $exePin --tracerpt-sha256 $systemPin --include-disk-io | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$plan.plan_sha256) { throw 'Study registration failed' }
+for ($i = 0; $i -lt $files.Count; $i++) {
+    python tools/saved_etl_campaign.py run --directory $series --plan-sha256 $plan.plan_sha256 --slot ($i + 1) --etl $files[$i] --exe $exe | Out-Null
+    if ($LASTEXITCODE -gt 1) { throw 'Study slot command failed' }
+}
+$snap = Join-Path $series 'frozen.knruns'
+$frozen = python tools/saved_etl_campaign.py snapshot --directory $series --plan-sha256 $plan.plan_sha256 --out $snap | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$frozen.snapshot_sha256) { throw 'Study snapshot failed' }
+$r = python tools/evaluate-corpus.py --etl-reader-campaign $snap --plan-sha256 $plan.plan_sha256 --sha256 $frozen.snapshot_sha256 --study-sha256 $studyPin | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Study replay failed' }
+$r.partitions.heldout | Select-Object planned_slots, selected_cases_per_eligible, agreement_per_planned_family, agreement_per_planned_group
+```
+
+The plan retains the exact corpus bytes and selected IDs. Offline replay
+verifies the corpus hash, checks every case again and matches the slot
+sources to the selected cases. An independently retained `--study-sha256`
+can also be supplied at replay. Store the snapshot alongside its ticket-named
+packages as in the [cohort procedure](#register-a-cohort-of-saved-etls).
+
+Read each partition separately. Each reports distinct selected cases over
+eligible corpus cases, the IDs of omitted eligible cases, the original slot
+numbers and results by sample family and independence group. A group agrees
+only when every planned file and event family in it agrees. A group is fully
+comparable when all those comparisons are comparable. Each declared group
+counts once even when a case runs repeatedly. Failed or unissued
+slots stay in the planned group denominator. A pin mismatch against known
+bytes from the other partition is recorded in `cross_partition_input_mismatches`.
+
+Partition checks use the declared identities and actual file hashes. The
+history outside the pinned corpus, relationships between differently named
+workloads and detection ground truth require separate evidence.
+[Partitioned evaluation on public traces](VALIDATION.md#partitioned-etl-reader-study-on-2026-11-22)
+
 ## Run the synthetic example
 
 Python 3.11 and the standard library are sufficient. From the repository root:

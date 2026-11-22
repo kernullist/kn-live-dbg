@@ -7,6 +7,51 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Partitioned ETL reader study on 2026-11-22
+
+On Windows `10.0.28000`, a corpus registered seven source hashes in two
+partitions. Before either reader examined the heldout file, the plan fixed
+the corpus hash, both reader hashes, eight ordered slots and three event
+families. The native x64 Release reader was built from `ab0d56e`. The
+descriptor comparison code matched `c0473ac`.
+
+The development partition selected four of six eligible cases. The two CPU
+workloads (x64 and x86) shared one group. The control, its repeat and its
+one-byte-short variant shared another. Allocator and scheduler remained in
+the corpus as unselected cases. The heldout partition used the 212,992-byte
+PowerShell example from Microsoft KrabsETW at revision `43864e6`. Its file
+SHA-256 was `da682ce23ce8afe3d81e5a773d2f77ddfd3525e23a3a09178be02f4b29c48051`.
+[Microsoft KrabsETW input at the tested revision](https://github.com/microsoft/krabsetw/blob/43864e67d592779f05cd982b637ca660923e0e09/examples/NativeExamples/powershell.etl)
+
+| Partition | Planned slots | Declared groups in those slots | Observed / planned readers | Agreed / planned families | Agreed / comparable families | Fully agreed / planned groups |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Development | 5 | 2 | 10/10 | 12/15 | 12/12 | 1/2 |
+| Heldout | 3 | 1 | 1/6 | 0/9 | 0/0, unavailable | 0/1 |
+
+For the first heldout slot, Windows `tracerpt` reported 114 records in 26
+buffers and zero matching descriptors for the three families. KnLiveDbg
+opened the same file and returned `segmented_source` with exit 1. A separate
+Windows SDK `OpenTraceW` check read log mode `0x00000009` and 26 declared
+buffers. The rotating-file flag was set on the heldout file and clear on
+the development control. The native reader requires separate segment
+provenance. All three comparisons retained `reader_unavailable`.
+For the second slot the harness deliberately supplied the development
+control. Acquisition kept both hashes and replay identified the supplied
+source as development. The third slot remained unissued.
+[Single-file ETL acquisition](TRACE_IMPORT.md#saved-windows-cpu-samples)
+
+Registration rejected partition leakage through an unselected case. Replay
+kept a mismatched pair from an earlier plan outside the new study's score.
+Regression tests also
+checked zero denominators, disagreements on a repeat, an 8 MiB corpus with
+32 damaged receipt pairs and replay after removal of the input corpus.
+The prior ten-slot campaign reproduced its original report bytes.
+
+The heldout result covers this declared workload and reader build. External
+producer authentication, complete rotating-session coverage, detection
+accuracy and host-wide overhead remain open.
+[Study registration and report fields](BENCHMARK_CORPUS.md#evaluate-development-and-heldout-etls-separately)
+
 ## Registered ETL reader cohort on 2026-11-22
 
 A development run on Windows `10.0.28000` registered ten slots before opening

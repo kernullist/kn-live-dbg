@@ -1,5 +1,6 @@
 """Check registered ETL acquisition, evidence survival and planned-family denominators."""
 import argparse
+import base64
 import copy
 import errno
 from concurrent.futures import ThreadPoolExecutor
@@ -114,6 +115,9 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(r["families"]["disk_io"]["verdicts"]["native_family_unavailable"], 1)
         self.assertTrue(r["campaign_plan_checked"])
         self.assertFalse(r["attempts"][0]["pair"]["campaign_plan_checked"])
+        cmd = ["--etl-reader-campaign", snap, "--sha256", sp, "--plan-sha256", pin, "--study-sha256", PIN]
+        rejected = call("evaluate-corpus.py", *cmd)
+        self.assertEqual((rejected.returncode, rejected.stdout), (2, b""))
         with self.assertRaises(FileExistsError):
             campaign.reserve(root, plan, pin, 2)
         with self.assertRaises(FileExistsError):
@@ -296,6 +300,196 @@ class CampaignTests(unittest.TestCase):
         r = json.loads((moved/"report.json").read_bytes())
         self.assertEqual(r["agreement_per_planned_family"], EVALUATOR["ratio"](2, 2))
         self.assertFalse((moved / campaign.PLAN_FILE).exists())
+
+
+class StudyTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        self.folder = Path(temp.name).resolve()
+        self.file = self.folder / "corpus.json"
+        self.root = self.folder / "campaign"
+        def case(key, source, family, group, split):
+            return dict(id=key, artifact_sha256=source, family=family, independence_group=group, partition=split,
+                        layer="independent_comparison", task="saved_etl_descriptor_counts", unit="case",
+                        holes_sha256=campaign.EMPTY_HOLES, truth="unknown", truth_ref_sha256=None)
+        self.corpus = dict(schema="kn.benchmark_corpus.v1", corpus_id="study", cohort_id="test",
+                           environment=dict(target_id="reader", snapshot_id="test", os_build=None, architecture="unknown",
+                                            hvci=None, vbs=None, verifier=None),
+                           cases=[case("dev", PIN, "controls", "control-recording", "development"),
+                                  case("variant", "1"*64, "controls", "control-recording", "development"),
+                                  case("held", "2"*64, "separate", "separate-recording", "heldout"),
+                                  case("unused", "3"*64, "unused", "unused-recording", "development")])
+
+    def register(self, ids):
+        raw = json.dumps(self.corpus, indent=2).encode("utf-8") + b"\r\n"
+        self.file.write_bytes(raw)
+        study_pin = pair.sha(raw)
+        binding, sources = campaign.load_study(self.file, study_pin, ids)
+        pin = campaign.create(self.root, sources, PIN, PIN, 3000, False, study=binding)["plan_sha256"]
+        return json.loads((self.root / campaign.PLAN_FILE).read_bytes()), pin, study_pin
+
+    def test_binding_and_denominators_survive_loss_of_corpus_file(self):
+        self.corpus["cases"][0].update(truth="positive", truth_ref_sha256="4"*64)
+        plan, pin, cp = self.register(["dev", "variant", "dev", "held", "held"])
+        fixture_package(self.root, plan, pin, 1)
+        admission = campaign.reserve(self.root, plan, pin, 4)
+        end = dict(schema=campaign.OUTCOME, admission_sha256=pair.sha(pair.encoded(admission)), tick_ns=admission["tick_ns"],
+                   outcome="pin_mismatch", package_sha256=None, error=dict(domain="admission", role="etl", code=None,
+                   expected_sha256="2"*64, observed_sha256=PIN))
+        campaign.receipt_path(self.root, plan["tickets"][3], "ended").write_bytes(pair.encoded(end))
+        self.file.unlink()
+        frozen = self.root / "frozen.knruns"
+        sp = campaign.freeze(self.root, pin, frozen)["snapshot_sha256"]
+        cmd = ["--etl-reader-campaign", frozen, "--plan-sha256", pin, "--sha256", sp]
+        good = call("evaluate-corpus.py", *cmd, "--study-sha256", cp)
+        self.assertEqual(good.returncode, 0, good.stderr)
+        r = json.loads(good.stdout)
+        self.assertEqual(r["schema"], campaign.STUDY_EVALUATION)
+        self.assertNotIn("agreement_per_planned_family", r)
+        self.assertEqual(r["corpus_sha256"], cp)
+        self.assertFalse(r["partition_assignments_authenticated"])
+        self.assertFalse(r["ground_truth_authenticated"])
+        self.assertNotIn("precision_known_truth", r)
+        dev, held = r["partitions"]["development"], r["partitions"]["heldout"]
+        self.assertEqual((dev["planned_slots"], dev["distinct_cases"], dev["unselected_corpus_cases"]), (3, 2, 1))
+        self.assertEqual(dev["by_independence_group"]["control-recording"]["slots"], [1, 2, 3])
+        self.assertEqual(dev["by_sample_family"]["controls"]["distinct_source_hashes"], 2)
+        self.assertEqual(dev["selected_cases_per_eligible"], EVALUATOR["ratio"](2, 3))
+        self.assertEqual(dev["unselected_eligible_case_ids"], ["unused"])
+        self.assertEqual(dev["agreement_per_planned_group"], EVALUATOR["ratio"](0, 1))
+        self.assertEqual(dev["agreement_per_comparable_group"], EVALUATOR["ratio"](0, 0))
+        self.assertEqual(dev["agreement_per_planned_family"], EVALUATOR["ratio"](2, 6))
+        self.assertEqual(dev["agreement_per_comparable_family"], EVALUATOR["ratio"](2, 2))
+        self.assertEqual(held["declared_independence_groups"], 1)
+        self.assertEqual(held["agreement_per_planned_family"], EVALUATOR["ratio"](0, 4))
+        self.assertEqual(held["agreement_per_comparable_family"], EVALUATOR["ratio"](0, 0))
+        self.assertEqual(held["cross_partition_input_mismatches"], 1)
+        self.assertEqual(r["attempts"][3]["supplied_source_partition"], "development")
+        bad = call("evaluate-corpus.py", *cmd, "--study-sha256", "0"*64)
+        self.assertEqual((bad.returncode, bad.stdout), (2, b""))
+
+    def test_checks_whole_registry_and_selected_scope_before_creating_plan(self):
+        for key in ("artifact_sha256", "family", "independence_group"):
+            bad = copy.deepcopy(self.corpus)
+            bad["cases"][3][key] = bad["cases"][2][key]
+            raw = pair.encoded(bad)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "leakage"):
+                campaign.select_cases(raw, pair.sha(raw), ["dev"])
+        bad = copy.deepcopy(self.corpus)
+        bad["cases"][3]["artifact_sha256"] = PIN
+        raw = pair.encoded(bad)
+        with self.assertRaisesRegex(ValueError, "conflicting"):
+            campaign.select_cases(raw, pair.sha(raw), ["dev"])
+        for key, value in (("layer", "synthetic"), ("unit", "event"), ("task", "other"), ("holes_sha256", "0"*64)):
+            bad = copy.deepcopy(self.corpus)
+            bad["cases"][0][key] = value
+            raw = pair.encoded(bad)
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "scope"):
+                campaign.select_cases(raw, pair.sha(raw), ["dev"])
+        raw = pair.encoded(self.corpus)
+        self.file.write_bytes(raw)
+        cp = pair.sha(raw)
+        cmd = ["create", "--directory", self.root, "--study-corpus", self.file, "--exe-sha256", PIN, "--tracerpt-sha256", PIN]
+        for opts in ([], ["--study-sha256", "0"*64], ["--study-sha256", cp, "--case-id", "absent"],
+                     ["--study-sha256", cp, "--source-sha256", PIN]):
+            proc = call("saved_etl_campaign.py", *cmd, *opts)
+            self.assertEqual((proc.returncode, proc.stdout), (2, b""))
+            self.assertFalse(self.root.exists())
+        alias = self.folder / "diagnostic.bin"
+        os.link(self.file, alias)
+        with alias.open("ab", buffering=0) as sink:
+            proc = call("saved_etl_campaign.py", *cmd, "--unknown", stderr=sink)
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(self.file.read_bytes(), raw)
+        leaked = copy.deepcopy(self.corpus)
+        leaked["cases"][3]["independence_group"] = leaked["cases"][2]["independence_group"]
+        self.file.write_bytes(pair.encoded(leaked))
+        proc = call("saved_etl_campaign.py", *cmd, "--study-sha256", pair.sha(self.file.read_bytes()), "--case-id", "dev")
+        self.assertEqual((proc.returncode, proc.stdout), (2, b""))
+        self.assertIn(b"leakage", proc.stderr)
+        self.assertFalse(self.root.exists())
+        self.file.write_bytes(raw)
+        proc = call("saved_etl_campaign.py", *cmd, "--study-sha256", cp)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        plan = json.loads((self.root / campaign.PLAN_FILE).read_bytes())
+        self.assertEqual(plan["study"]["case_ids"], ["dev", "variant", "held", "unused"])
+
+    def test_group_cannot_select_the_best_repeat(self):
+        plan, pin, _ = self.register(["dev", "dev"])
+        fixture_package(self.root, plan, pin, 1)
+        def disagree(manifest):
+            doc = FIXTURE["native"]()
+            doc["capabilities"][0]["record_evidence"]["decoded"] = 1
+            manifest["attempts"]["native"]["stdout"] = FIXTURE["retained"](pair.encoded(doc))
+        fixture_package(self.root, plan, pin, 2, change=disagree)
+        path = self.root / "frozen.knruns"
+        sp = campaign.freeze(self.root, pin, path)["snapshot_sha256"]
+        panel = evaluate(path, sp, pin)["partitions"]["development"]
+        self.assertEqual(panel["agreement_per_planned_family"], EVALUATOR["ratio"](3, 4))
+        self.assertEqual(panel["agreement_per_planned_group"], EVALUATOR["ratio"](0, 1))
+        self.assertEqual(panel["agreement_per_comparable_group"], EVALUATOR["ratio"](0, 1))
+
+    def test_repinned_study_cannot_relabel_a_previous_reader_pair(self):
+        plan, pin, cp = self.register(["dev"])
+        fixture_package(self.root, plan, pin, 1)
+        path = self.root / "first.knruns"
+        original = campaign.freeze(self.root, pin, path)["snapshot_sha256"]
+        self.assertEqual(evaluate(path, original, pin)["partitions"]["heldout"]["planned_slots"], 0)
+        frozen = json.loads(path.read_bytes())
+        new_plan = frozen["plan"]
+        for case in self.corpus["cases"][:2]:
+            case["partition"] = "heldout"
+        raw_corpus = pair.encoded(self.corpus)
+        new_plan["study"].update(corpus_sha256=pair.sha(raw_corpus), corpus_base64=base64.b64encode(raw_corpus).decode("ascii"))
+        new_pin = pair.sha(pair.encoded(new_plan))
+        frozen["plan_sha256"] = new_pin
+        row = frozen["attempts"][0]
+        row["admitted"]["registration"]["plan_sha256"] = new_pin
+        row["ended"]["admission_sha256"] = pair.sha(pair.encoded(row["admitted"]))
+        changed = self.root / "changed.knruns"
+        raw = pair.encoded(frozen)
+        changed.write_bytes(raw)
+        r = evaluate(changed, pair.sha(raw), new_pin)
+        self.assertEqual(r["attempts"][0]["evidence"], "binding_mismatch")
+        self.assertEqual(r["partitions"]["heldout"]["agreement_per_planned_family"], EVALUATOR["ratio"](0, 2))
+        self.assertNotEqual(r["corpus_sha256"], cp)
+        for edit in ("sources", "corpus", "selection", "schema"):
+            variant = copy.deepcopy(new_plan)
+            if edit == "sources":
+                variant["sources"][0] = "7"*64
+            elif edit == "corpus":
+                variant["study"]["corpus_base64"] += "="
+            elif edit == "selection":
+                variant["study"]["case_ids"] = None
+            else:
+                variant["schema"] = campaign.PLAN
+            with self.subTest(edit=edit), self.assertRaises(ValueError):
+                campaign.validate_plan(variant, pair.sha(pair.encoded(variant)))
+
+    def test_full_corpus_extent_and_empty_heldout_scope(self):
+        raw = pair.encoded(self.corpus).ljust(campaign.CORPUS["MAX_BYTES"], b" ")
+        self.file.write_bytes(raw)
+        cp = pair.sha(raw)
+        binding, sources = campaign.load_study(self.file, cp, ["dev"]*pair.MAX_REGISTERED_SLOTS)
+        pin = campaign.create(self.root, sources, PIN, PIN, 3000, True, study=binding)["plan_sha256"]
+        plan = json.loads((self.root / campaign.PLAN_FILE).read_bytes())
+        oversized = b"x"*(campaign.MAX_RECEIPT+1)
+        for ticket in plan["tickets"]:
+            for phase in ("admitted", "ended"):
+                campaign.receipt_path(self.root, ticket, phase).write_bytes(oversized)
+        frozen = self.root / "upper.knruns"
+        sp = campaign.freeze(self.root, pin, frozen)["snapshot_sha256"]
+        self.assertLessEqual(frozen.stat().st_size, campaign.MAX_STUDY_SNAPSHOT)
+        r = evaluate(frozen, sp, pin)
+        dev, held = r["partitions"]["development"], r["partitions"]["heldout"]
+        self.assertEqual(dev["evidence_counts"]["unusable_receipts"], 32)
+        self.assertEqual(dev["agreement_per_planned_family"], EVALUATOR["ratio"](0, 96))
+        self.assertEqual(held["agreement_per_planned_family"], EVALUATOR["ratio"](0, 0))
+        with self.file.open("ab") as f:
+            f.write(b" ")
+        with self.assertRaises(ValueError):
+            campaign.load_study(self.file, cp, ["dev"])
 
 
 def live(args):

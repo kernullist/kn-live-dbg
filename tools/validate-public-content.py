@@ -23,7 +23,8 @@ ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.
                           "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2", "kn.etl_reader_comparison.v3",
                           "kn.etl_reader_evaluation.v3", "kn.etl_reader_plan.v1", "kn.etl_reader_admission.v1",
                           "kn.etl_reader_outcome.v1", "kn.etl_reader_campaign.v1", "kn.etl_reader_campaign_evaluation.v1",
-                          "kn.etl_reader_plan_receipt.v1", "kn.etl_reader_slot_receipt.v1", "kn.etl_reader_snapshot_receipt.v1")
+                          "kn.etl_reader_plan_receipt.v1", "kn.etl_reader_slot_receipt.v1", "kn.etl_reader_snapshot_receipt.v1",
+                          "kn.etl_reader_plan.v2", "kn.etl_reader_campaign.v2", "kn.etl_reader_campaign_evaluation.v2")
 BENCHMARK_RECORD_SCHEMAS = frozenset(ETL_COMPARISON_SCHEMAS) | frozenset(
     f"kn.owned_module_{kind}.{version}"
     for version, kinds in (
@@ -131,7 +132,9 @@ WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
 DUMP_EVIDENCE_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
 ETL_COMPARISON_MARKERS = (*ETL_COMPARISON_SCHEMAS, '"retained_sha256"', '"before_sha256"', '"supported_descriptors"',
                           '"verdict"', '"process_state"', '"started_ns"', '"unresolved_opcode_names"', '"admission_id"',
-                          '"admission_sha256"', '"planned_slots"', '"distinct_source_hashes"', '"agreement_per_planned"', '"acquisition"', '"prefix_sha256"', '"observed_sha256"')
+                          '"admission_sha256"', '"planned_slots"', '"distinct_source_hashes"', '"agreement_per_planned"', '"acquisition"', '"prefix_sha256"', '"observed_sha256"',
+                          '"corpus_base64"', '"supplied_source_partition"', '"by_independence_group"', '"sample_family"',
+                          '"agreement_per_planned_group"', '"unselected_eligible_case_ids"')
 ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
     ("retained_sha256", "byte_count"), ("retained_sha256", "base64"),
     ("before_sha256", "after_sha256", "expected_sha256"), ("verdict", "native", "tracerpt"),
@@ -141,6 +144,9 @@ ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
     ("observation", "prefix_sha256", "file_bytes"), ("domain", "role", "expected_sha256", "observed_sha256"),
     ("planned_slots", "plan_sha256"), ("distinct_source_hashes", "reader_statuses"),
     ("agreement_per_planned", "agreement_per_comparable"), ("source_sha256", "acquisition", "evidence", "pair"),
+    ("corpus_base64",), ("unselected_eligible_case_ids",), ("by_independence_group", "unselected_corpus_cases"),
+    ("agreement_per_planned_group", "agreement_per_comparable_group"),
+    ("case_id", "sample_family", "partition", "independence_group"), ("supplied_source_partition", "case_id", "acquisition"),
 ))
 DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')

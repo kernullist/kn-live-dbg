@@ -354,7 +354,10 @@ def main():
     parser.add_argument("--results", type=Path)
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
+    parser.add_argument("--study-sha256", help="independently retained corpus hash for a partitioned ETL campaign")
     args = parser.parse_args()
+    if args.study_sha256 is not None and args.etl_reader_campaign is None:
+        parser.error("--study-sha256 requires --etl-reader-campaign")
     if args.etl_reader_campaign and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):
         parser.error("--etl-reader-campaign requires --sha256 and --plan-sha256")
     if args.saved_etl_comparison and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
@@ -383,7 +386,8 @@ def main():
                 return write_result((json.dumps(report, indent=2, allow_nan=False) + "\n").encode("utf-8"))
         elif args.etl_reader_campaign:
             from saved_etl_comparison import local_path
-            report = saved_etl_campaign.evaluate(local_path(args.etl_reader_campaign), args.sha256, args.plan_sha256, decode_document, ratio)
+            report = saved_etl_campaign.evaluate(local_path(args.etl_reader_campaign), args.sha256, args.plan_sha256,
+                                                 decode_document, ratio, args.study_sha256)
         elif args.owned_module_campaign:
             report = evaluate_campaign(args.owned_module_campaign, args.sha256, args.plan_sha256)
         elif args.owned_module_run:

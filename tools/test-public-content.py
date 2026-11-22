@@ -39,6 +39,11 @@ class PublicContentTests(unittest.TestCase):
                     dict(planned_slots=2, plan_sha256="a"),
                     dict(observation="read", file_bytes=11, prefix_sha256="digest"),
                     dict(domain="admission", role="etl", expected_sha256="a", observed_sha256="b"),
+                    dict(corpus_base64="example"), dict(unselected_eligible_case_ids=["a"]),
+                    dict(agreement_per_planned_group=None, agreement_per_comparable_group=None),
+                    dict(by_independence_group={}, unselected_corpus_cases=1),
+                    dict(case_id="a", sample_family="family", partition="heldout", independence_group="group"),
+                    dict(case_id="a", supplied_source_partition="development", acquisition="pin_mismatch"),
                     dict(agreement_per_planned=None, agreement_per_comparable=None),
                     dict(acquisition="published", source_sha256="s", evidence="missing", pair=None))
         for value in [*distinct, *(dict(schema=s) for s in AUDIT.ETL_COMPARISON_SCHEMAS)]:
