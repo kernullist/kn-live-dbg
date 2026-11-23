@@ -35,6 +35,7 @@ A dash means the binary declares no standalone probe for that operation.
 | memory / analyze_dump | dump | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | offline_dump | — |
 | memory / read_virtual | dump | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | offline_dump | `saved_dump_range` |
 | evidence / query | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle | — |
+| evidence / build_inventory | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | offline_artifacts | — |
 | schema / export_type | local_pdb | implemented | not_an_address_reader | offline_artifacts | — |
 | evidence / replay | bundle | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_bundle | — |
 | evidence / replay_irp | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | recorded_ordered_reads | — |

@@ -78,6 +78,7 @@ def main():
                     ["--connect", address], ["remote", "on"], ["mcp", "on"], ["--cloak"],
                     ["--schema-worker"], ["--symbol-index-worker"], ["--self-test", "all"],
                     ["--offline", "!kmon", "init-store", str(root / "denied-store"), "/acl-only"],
+                    ["--offline", "!kmon", "inventory", str(root), str(root / "denied-index"), "/resume", "/chunks", "1"],
                     ["--offline", "!kmon", "gc", str(root), "PRIVATE-SENTINEL", "/apply", "1"],
                     ["--crash-diagnose", str(trace), "--sha256", digest],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--whea"],
@@ -89,6 +90,7 @@ def main():
                 ):
                     denied([*prefix, *operation], mode)
                 assert not (root / "denied-store").exists()
+                assert not (root / "denied-index").exists()
                 with trace.open("rb") as stream:
                     stream.seek(7)
                     first = call([*prefix, "trace", "-", "/limit", "2"], source=stream)

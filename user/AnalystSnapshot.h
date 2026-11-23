@@ -13,6 +13,9 @@ bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std
     const std::function<bool(HANDLE)>& admitOutput = {});
 bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error,
     size_t maximumBytes = 32 * 1024 * 1024, size_t* bytesRead = nullptr, bool directFile = false);
+// Hash the complete on-disk bytes before UTF-8 decoding, including a possible BOM.
+bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error,
+    size_t maximumBytes, size_t* bytesRead, bool directFile, std::wstring* byteDigest);
 
 struct AnalystSnapshotChange
 {

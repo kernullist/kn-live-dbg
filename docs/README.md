@@ -14,6 +14,11 @@ revalidate either terminal receipt while applying a private policy.
 and [retention validation](VALIDATION.md#retention-with-terminal-scan-receipts-on-2026-11-23)
 record the tested store sizes, interruption behavior and remaining limits.
 
+For legacy case and session directories, the direct offline inventory builder
+can resume at a committed chunk and verify the originals before publishing a
+v1 manifest. See the [command reference](COMMAND_REFERENCE.md#capability-reports-and-evidence-commands)
+and [interruption tests](VALIDATION.md#restartable-legacy-evidence-inventories-on-2026-11-24).
+
 ## Operation
 
 | Guide | Contents |

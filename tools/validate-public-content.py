@@ -148,19 +148,23 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"plan_line_sha256"', '"native_calls"', '"waiting_samples"', '"sample_slot"', '"waiting_inside_call_samples"',
                      '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
-STORE_REPORT_MARKERS = ("kn.store_catalog_scan.v1", "kn.store_file_scan.v1", "kn.evidence_gc_result.v1", "kn.evidence_retirement_result.v1",
+INVENTORY_WORK_SCHEMAS = ("kn.evidence_inventory_work.v1", "kn.evidence_inventory_window.v1",
+                          "kn.evidence_inventory_build.v1", "kn.evidence_inventory_build_resume.v1")
+STORE_REPORT_MARKERS = (*INVENTORY_WORK_SCHEMAS, "kn.store_catalog_scan.v1", "kn.store_file_scan.v1", "kn.evidence_gc_result.v1", "kn.evidence_retirement_result.v1",
                         "kncs1.", "kncr1.", "knfs1.", "knfr1.")
 STORE_REPORT_RECORD = re.compile(r'"schema"\s*:\s*"kn\.store_(?:catalog|file)_scan\.v1"'
+                                 r'|"schema"\s*:\s*"kn\.evidence_inventory_(?:work|window|build(?:_resume)?)\.v1"(?=\s*(?:[,}]|$))'
                                  r'|"schema"\s*:\s*"kn\.evidence_(?:gc|retirement)_result\.v1"(?=\s*(?:[,}]|$))'
                                  r'|\bknc[sr]1\.[0-9]{1,5}\.[0-9a-f]{32,64}|\bknf[sr]1\.[0-9]{1,5}\.[0-9]{1,10}\.[0-9a-f]{32,64}',
                                  re.MULTILINE)
-STORE_RETENTION_MARKERS = ('"file_namespace_sha256"', '"next_file_cursor"', '"file_receipt"', '"block_sha256"',
+STORE_RETENTION_MARKERS = ('"output_id"', '"originals_sha256"', '"reused_entries"', '"file_namespace_sha256"', '"next_file_cursor"', '"file_receipt"', '"block_sha256"',
                            '"namespace_sha256"', '"next_scan_cursor"', '"scan_receipt"', '"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
                            '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"',
                            '"retired_original_matched"', '"retirement_sha256"', '"exclusive_nonledger"', '"exclusive_byte_limit"',
                            '"next_artifact_cursor"', '"artifact_page_status"', '"routine_paths"', '"routine_named_byte_target"',
                            '"routine_named_bytes_before"', '"named_bytes"')
 STORE_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
+    ("source_id", "output_id", "catalog_sha256"), ("chunk_sha256", "originals_sha256"), ("reused_entries", "verified_entries"),
     ("path", "sha256", "input_matched"), ("artifact", "uncommitted_approval_referrers"), ("artifact", "approval_catalog"),
     ("artifact", "uncommitted_image_referrers"), ("artifact", "image_catalog"), ("path", "expected_sha256", "digest_basis"),
     ("artifact", "irp_catalog"), ("artifact", "irp_referrers"), ("path", "expected_bytes", "root_committed"),
@@ -606,7 +610,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     add("private-runtime-probe")
                 if isinstance(schema, str) and (schema in BENCHMARK_RECORD_SCHEMAS or schema in {
                     "kmon.bundle.v1", "kmon.bundle.v2", "kmon.evidence.v1", "kmon.evidence.v2", "kn.temporal_facts.v1", "kmon.evidence_session.v1",
-                    "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
+                    "kn.evidence_inventory.v1", "kn.evidence_inventory_chunk.v1", *INVENTORY_WORK_SCHEMAS, "kn.observation_read.v1", "kn.read_set.v1", "kn.type_schema.v1",
                     "kn.evidence_session.v1", "kn.evidence_journal_segment.v1", "kn.evidence_journal_recovery.v1",
                     "kn.evidence_journal_index.v1", "kn.evidence_journal_index_chunk.v1", "kn.evidence_store_inventory.v1",
                     "kn.evidence_gc_policy.v1", "kn.evidence_gc_policy.v2", "kn.evidence_retirement_policy.v1", "kn.evidence_retirement_policy.v2", "kn.evidence_retirement.v1", "kn.evidence_retirement.v2", "kn.evidence_collection_retention.v1", "kn.evidence_retirement_result.v1", "kn.evidence_gc_operation.v1", "kn.evidence_gc_intent.v1", "kn.evidence_gc_receipt.v1", "kn.evidence_gc_result.v1", "kn.image_retention.v1", "kn.evidence_private_store.v1", "kn.evidence_privacy.v1",

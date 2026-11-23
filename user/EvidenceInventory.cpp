@@ -1,4 +1,5 @@
 #include "EvidenceInventory.h"
+#include "EvidenceInventoryFiles.h"
 #include "AnalystSnapshot.h"
 #include "ContentHash.h"
 #include "McpJson.h"
@@ -9,7 +10,7 @@
 namespace
 {
     constexpr size_t ChunkEntries = 128;
-    constexpr size_t MaximumChunks = 8192;
+    constexpr size_t MaximumChunks = EvidenceInventoryMaxChunks;
     constexpr size_t ChunkBytes = 256 * 1024;
     constexpr size_t ManifestBytes = 2 * 1024 * 1024;
 
@@ -37,13 +38,13 @@ namespace
     {
     public:
         bool Read(const std::wstring& path, EvidenceBundle* bundle, std::wstring* digest,
-            size_t maximumBytes, size_t* read)
+            size_t maximumBytes, size_t* read, std::wstring* byteDigest = nullptr)
         {
             *bundle = {};
             digest->clear();
             std::wstring json, error;
             if (!ReadAnalystSnapshot(path, &json, &error,
-                (std::min)(maximumBytes, EvidenceBundleMaxJsonBytes), read, true))
+                (std::min)(maximumBytes, EvidenceBundleMaxJsonBytes), read, true, byteDigest))
             {
                 return false;
             }
@@ -88,6 +89,31 @@ namespace
     std::wstring Number(uint64_t value)
     {
         return mcpjson::Quote(std::to_wstring(value));
+    }
+
+    Entry ReadEntry(const std::filesystem::path& path, BundleReader& reader, std::wstring* byteDigest = nullptr)
+    {
+        Entry entry;
+        entry.Name = path.filename().wstring();
+        size_t read = 0;
+        if (path.extension() == L".kncase")
+        {
+            EvidenceBundle bundle;
+            entry.Valid = reader.Read(path.wstring(), &bundle, &entry.Digest, EvidenceBundleMaxJsonBytes, &read, byteDigest);
+        }
+        else
+        {
+            std::wstring json, error;
+            EvidenceSessionSummary session;
+            if (ReadAnalystSnapshot(path.wstring(), &json, &error, 32768, &read, true, byteDigest) && ParseEvidenceSession(json, &session))
+            {
+                entry.Digest = Hash(json);
+                entry.Valid = entry.Digest.size() == 64;
+            }
+        }
+        entry.Bytes = read;
+        if (!entry.Valid) { entry.Digest.clear(); }
+        return entry;
     }
 
     bool ParseNumber(const std::wstring& json, const wchar_t* name, uint64_t* value)
@@ -237,13 +263,14 @@ namespace
         return count == manifest->Entries && digest->size() == 64 && ManifestJson(*manifest) == json;
     }
 
-    bool ReadChunk(const std::wstring& directory, const Chunk& chunk, std::vector<Entry>* entries)
+    bool ReadChunk(const std::wstring& directory, const Chunk& chunk, std::vector<Entry>* entries, bool exactBytes = false)
     {
         entries->clear();
-        std::wstring json, error;
+        std::wstring json, error, bytesDigest;
         std::vector<std::wstring> rows;
         if (!ReadAnalystSnapshot((std::filesystem::path(directory) / (chunk.Digest + L".knchunk")).wstring(),
-            &json, &error, ChunkBytes, nullptr, true) || Hash(json) != chunk.Digest || !mcpjson::ValidateDocument(json) ||
+            &json, &error, ChunkBytes, nullptr, true, exactBytes ? &bytesDigest : nullptr) ||
+            (exactBytes && bytesDigest != chunk.Digest) || Hash(json) != chunk.Digest || !mcpjson::ValidateDocument(json) ||
             !Array(json, L"entries", ChunkEntries, &rows) || rows.size() != chunk.Entries)
         {
             return false;
@@ -268,12 +295,291 @@ namespace
         }
         return ChunkJson(*entries) == json;
     }
+
+    class ResumableInventory
+    {
+    public:
+        explicit ResumableInventory(const EvidenceInventoryBuildOptions& options) : Options(options)
+        {
+            Result.Resume = true;
+        }
+
+        EvidenceInventoryBuildResult Run(const std::wstring& directory, const std::wstring& destination)
+        {
+            if (!inventory_files::LocalPath(directory, Source) || !inventory_files::LocalPath(destination, Output) ||
+                Output == Output.root_path() || !Pins.Ancestors(Source) || !Pins.Ancestors(Output.parent_path()))
+            {
+                Fail(L"invalid_path");
+                return Result;
+            }
+            Index.DirectoryId = DirectoryId(Source.wstring());
+            std::wstring catalog;
+            if (Index.DirectoryId.empty() || !Catalog(Names, catalog)) { return Result; }
+            const auto extension = Output.extension();
+            if ((extension == L".kncase" || extension == L".knledger") &&
+                DirectoryId(Output.parent_path().wstring()) == Index.DirectoryId) { Fail(L"invalid_path"); return Result; }
+            const bool created = CreateDirectoryW(Output.c_str(), nullptr) != FALSE;
+            if (!created && GetLastError() != ERROR_ALREADY_EXISTS) { return Result; }
+            if (!Pins.Directory(Output))
+            {
+                Fail(L"output_busy_or_unavailable");
+                return Result;
+            }
+            const auto outputId = DirectoryId(Output.wstring());
+            if (outputId.empty() || outputId == Index.DirectoryId) { Fail(L"invalid_path"); return Result; }
+            const auto header = L"{\"schema\":\"kn.evidence_inventory_work.v1\",\"source_id\":" +
+                mcpjson::Quote(Index.DirectoryId) + L",\"output_id\":" + mcpjson::Quote(outputId) +
+                L",\"catalog_sha256\":" + mcpjson::Quote(catalog) + L",\"entries\":" + Number(Names.size()) + L"}";
+            const auto marker = Output / L"build.knindex";
+            const auto writer = Output / L"writer.knindex";
+            const bool needWriter = inventory_files::Missing(writer);
+            if (needWriter)
+            {
+                if (!inventory_files::Missing(marker)) { Fail(L"invalid_checkpoint"); return Result; }
+                if (!UncommittedOutput()) { return Result; }
+            }
+            if (!Pins.Writer(writer, needWriter)) { Fail(L"output_busy_or_unavailable"); return Result; }
+            const bool initializing = inventory_files::Missing(marker);
+            if (initializing && !UncommittedOutput()) { return Result; }
+            if (!MatchFile(marker, header, 2048, initializing, L"resume_scope_mismatch")) { return Result; }
+
+            const auto manifest = Output / L"manifest.knindex";
+            const bool finalExists = !inventory_files::Missing(manifest);
+            auto previous = Hash(header);
+            if (previous.empty()) { return Result; }
+            size_t added = 0;
+            for (size_t offset = 0; offset < Names.size(); offset += ChunkEntries)
+            {
+                if (!Running()) { return Result; }
+                const auto count = (std::min)(ChunkEntries, Names.size() - offset);
+                const auto checkpoint = Output / (L"window-" + std::to_wstring(offset) + L".knindex");
+                std::vector<Entry> rows;
+                std::wstring originals, document, digest;
+                if (inventory_files::Missing(checkpoint))
+                {
+                    if (finalExists) { Fail(L"invalid_checkpoint"); return Result; }
+                    if (added == Options.NewChunkLimit) { break; }
+                    if (!OriginalWindow(offset, count, rows, originals)) { return Result; }
+                    const auto data = ChunkJson(rows);
+                    digest = Hash(data);
+                    if (digest.empty() || !MatchFile(Output / (digest + L".knchunk"), data, ChunkBytes, true,
+                        L"corrupt_inventory_chunk")) { return Result; }
+                    document = Record(previous, offset, count, digest, originals);
+                    if (!MatchFile(checkpoint, document, 2048, true, L"invalid_checkpoint")) { return Result; }
+                    ++added;
+                }
+                else
+                {
+                    if (!LoadFile(checkpoint, 2048, document) ||
+                        !mcpjson::GetString(document, L"chunk_sha256", &digest) || !KmonHuntHash(digest) ||
+                        !mcpjson::GetString(document, L"originals_sha256", &originals) || !KmonHuntHash(originals) ||
+                        document != Record(previous, offset, count, digest, originals))
+                    { Fail(L"invalid_checkpoint"); return Result; }
+                    if (!Pins.ReadFile(Output / (digest + L".knchunk")) ||
+                        !ReadChunk(Output.wstring(), {digest, count}, &rows, true))
+                    { Fail(L"corrupt_inventory_chunk"); return Result; }
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        if (rows[i].Name != Names[offset + i]) { Fail(L"invalid_checkpoint"); return Result; }
+                    }
+                    Result.ReusedEntries += count;
+                }
+                previous = Hash(document);
+                if (previous.empty()) { return Result; }
+                Index.Chunks.push_back({digest, count});
+                OriginalDigests.push_back(std::move(originals));
+                for (const auto& row : rows) { if (!row.Valid) { ++Result.InvalidFiles; } }
+                Result.Entries += count;
+            }
+
+            // The sidecars are private, unauthenticated derived data. Reconstruct every row
+            // and its raw-byte witness before allowing an immutable manifest to represent it.
+            if (Result.Entries == Names.size() && !VerifyOriginals()) { return Result; }
+            std::wstring current;
+            std::vector<std::wstring> currentNames;
+            if (!Catalog(currentNames, current)) { return Result; }
+            if (current != catalog || currentNames != Names) { Fail(L"source_changed"); return Result; }
+            if (!Running()) { return Result; }
+            if (Result.Entries != Names.size()) { Result.Status = L"checkpointed"; return Result; }
+            Index.Entries = Result.Entries;
+            const auto json = ManifestJson(Index);
+            const auto digest = Hash(json);
+            if (digest.empty() || !MatchFile(manifest, json, ManifestBytes, !finalExists, L"manifest_mismatch")) { return Result; }
+            Result.Status = L"ok";
+            Result.Digest = digest;
+            return Result;
+        }
+
+    private:
+        bool Fail(const wchar_t* status) { Result.Status = status; return false; }
+
+        bool Running()
+        {
+            if (Options.Cancellation && Options.Cancellation->load()) { return Fail(L"cancelled"); }
+            if (GetTickCount64() - Started >= Options.DeadlineMs) { return Fail(L"deadline_exhausted"); }
+            return true;
+        }
+
+        bool UncommittedOutput()
+        {
+            // A stop during the very first atomic marker write can leave its temporary file.
+            // Start at zero only in an empty directory or beside these unpublished names.
+            static const std::wstring prefix = L"build.knindex.pending-";
+            std::error_code error;
+            std::filesystem::directory_iterator iterator(Output, error), end;
+            size_t traversed = 0;
+            while (!error && iterator != end)
+            {
+                if (!Running()) { return false; }
+                const auto path = iterator->path();
+                const auto name = path.filename().wstring();
+                if (++traversed > Options.MaximumEntries) { return Fail(L"budget_exhausted"); }
+                if (name == L"writer.knindex") { iterator.increment(error); continue; }
+                if (name.compare(0, prefix.size(), prefix) != 0)
+                { return Fail(L"resume_marker_missing"); }
+                size_t at = prefix.size();
+                for (size_t part = 0; part < 3; ++part)
+                {
+                    const size_t begin = at;
+                    while (at < name.size() && name[at] >= L'0' && name[at] <= L'9') { ++at; }
+                    if (at == begin || at - begin > 20 || (part < 2 && (at == name.size() || name[at++] != L'-')))
+                    { return Fail(L"resume_marker_missing"); }
+                }
+                // Pending files are never inputs. Inspect one literal handle at a time.
+                auto pending = inventory_files::Open(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+                BY_HANDLE_FILE_INFORMATION info{};
+                if (at != name.size() || !pending || GetFileType(pending.get()) != FILE_TYPE_DISK ||
+                    !GetFileInformationByHandle(pending.get(), &info) ||
+                    (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+                    info.nFileSizeHigh != 0 || info.nFileSizeLow > 2048)
+                { return Fail(L"resume_marker_missing"); }
+                iterator.increment(error);
+            }
+            return !error || Fail(L"resume_marker_missing");
+        }
+
+        bool Catalog(std::vector<std::wstring>& names, std::wstring& digest)
+        {
+            constexpr size_t maximumNameChars = 16 * 1024 * 1024;
+            auto directory = inventory_files::Open(Source, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE);
+            FILE_BASIC_INFO before{}, after{};
+            if (!directory || !GetFileInformationByHandleEx(directory.get(), FileBasicInfo, &before, sizeof(before)))
+            { return Fail(L"source_unavailable"); }
+            std::error_code error;
+            size_t traversed = 0, chars = 0;
+            std::filesystem::directory_iterator iterator(Source, error), end;
+            while (!error && iterator != end)
+            {
+                if (!Running()) { return false; }
+                if (++traversed > Options.MaximumEntries) { return Fail(L"budget_exhausted"); }
+                const auto leaf = iterator->path().filename();
+                const auto extension = leaf.extension();
+                if (extension == L".kncase" || extension == L".knledger")
+                {
+                    if (!NameValid(leaf.native())) { return Fail(L"unsupported_file_name"); }
+                    chars += leaf.native().size();
+                    if (chars > maximumNameChars) { return Fail(L"budget_exhausted"); }
+                    names.push_back(leaf.native());
+                }
+                iterator.increment(error);
+            }
+            if (error) { return Fail(L"source_unavailable"); }
+            std::sort(names.begin(), names.end());
+            if (std::adjacent_find(names.begin(), names.end()) != names.end()) { return Fail(L"source_changed"); }
+            ContentHash hash;
+            for (const auto& name : names)
+            {
+                if (!Running()) { return false; }
+                if (!inventory_files::AddGeneration(hash, Source / name, name)) { return Fail(L"source_unavailable"); }
+            }
+            if (!GetFileInformationByHandleEx(directory.get(), FileBasicInfo, &after, sizeof(after)))
+            { return Fail(L"source_unavailable"); }
+            if (before.ChangeTime.QuadPart != after.ChangeTime.QuadPart || before.LastWriteTime.QuadPart != after.LastWriteTime.QuadPart)
+            { return Fail(L"source_changed"); }
+            digest = hash.Finish();
+            return !digest.empty() && Running();
+        }
+
+        bool OriginalWindow(size_t offset, size_t count, std::vector<Entry>& rows, std::wstring& originals)
+        {
+            std::wstring witnesses;
+            for (size_t i = 0; i < count; ++i)
+            {
+                if (!Running()) { return false; }
+                const auto path = Source / Names[offset + i];
+                const size_t maximum = path.extension() == L".knledger" ? 32768 : EvidenceBundleMaxJsonBytes;
+                if (Options.ReadBudget - Result.ReadBytes < maximum) { return Fail(L"budget_exhausted"); }
+                std::wstring raw;
+                rows.push_back(ReadEntry(path, Reader, &raw));
+                const auto bytes = rows.back().Bytes;
+                Result.ReadBytes += bytes;
+                if (bytes != 0 && raw.size() != 64) { return Fail(L"source_read_incomplete"); }
+                witnesses += raw + L"\n";
+            }
+            originals = Hash(witnesses);
+            return !originals.empty();
+        }
+
+        bool VerifyOriginals()
+        {
+            size_t offset = 0;
+            for (size_t i = 0; i < Index.Chunks.size(); ++i)
+            {
+                const auto& chunk = Index.Chunks[i];
+                std::vector<Entry> rows;
+                std::wstring digest;
+                if (!OriginalWindow(offset, static_cast<size_t>(chunk.Entries), rows, digest)) { return false; }
+                if (digest != OriginalDigests[i] || Hash(ChunkJson(rows)) != chunk.Digest) { return Fail(L"original_mismatch"); }
+                offset += rows.size();
+                Result.VerifiedEntries = offset;
+            }
+            return true;
+        }
+
+        bool LoadFile(const std::filesystem::path& path, size_t limit, std::wstring& json)
+        {
+            std::wstring raw, error;
+            return Pins.ReadFile(path) && ReadAnalystSnapshot(path.wstring(), &json, &error, limit, nullptr, true, &raw) &&
+                raw.size() == 64 && Hash(json) == raw;
+        }
+
+        bool MatchFile(const std::filesystem::path& path, const std::wstring& expected, size_t limit,
+            bool canCreate, const wchar_t* status)
+        {
+            if (canCreate && inventory_files::Missing(path))
+            {
+                std::wstring error;
+                if (mcpjson::WideToUtf8(expected).size() > limit) { return Fail(L"budget_exhausted"); }
+                if (!SaveObservationJson(path.wstring(), expected, &error)) { return Fail(L"output_unavailable"); }
+            }
+            std::wstring actual;
+            return (LoadFile(path, limit, actual) && actual == expected) || Fail(status);
+        }
+
+        static std::wstring Record(const std::wstring& previous, size_t offset, size_t count,
+            const std::wstring& chunk, const std::wstring& originals)
+        {
+            return L"{\"schema\":\"kn.evidence_inventory_window.v1\",\"previous_sha256\":" + mcpjson::Quote(previous) +
+                L",\"offset\":" + Number(offset) + L",\"entries\":" + Number(count) + L",\"chunk_sha256\":" +
+                mcpjson::Quote(chunk) + L",\"originals_sha256\":" + mcpjson::Quote(originals) + L"}";
+        }
+
+        const EvidenceInventoryBuildOptions& Options;
+        const uint64_t Started = GetTickCount64();
+        EvidenceInventoryBuildResult Result;
+        inventory_files::Pins Pins;
+        std::filesystem::path Source, Output;
+        std::vector<std::wstring> Names, OriginalDigests;
+        Manifest Index;
+        BundleReader Reader;
+    };
 }
 
 EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& directory,
     const std::wstring& newSnapshotDirectory, const EvidenceInventoryBuildOptions& options)
 {
     EvidenceInventoryBuildResult result;
+    result.Resume = options.Resume;
     if (options.Cancellation != nullptr && options.Cancellation->load())
     {
         result.Status = L"cancelled";
@@ -281,7 +587,8 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
     }
     if (options.MaximumEntries == 0 || options.MaximumEntries > ChunkEntries * MaximumChunks ||
         options.ReadBudget == 0 || options.ReadBudget > 8ull * 1024 * 1024 * 1024 ||
-        options.DeadlineMs == 0 || options.DeadlineMs > 120000)
+        options.DeadlineMs == 0 || options.DeadlineMs > 120000 ||
+        (options.Resume && (options.NewChunkLimit == 0 || options.NewChunkLimit > MaximumChunks)))
     {
         result.Status = L"invalid_budget";
         return result;
@@ -291,6 +598,7 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
         result.Status = L"invalid_path";
         return result;
     }
+    if (options.Resume) { return ResumableInventory(options).Run(directory, newSnapshotDirectory); }
     Manifest manifest;
     manifest.DirectoryId = DirectoryId(directory);
     std::error_code error;
@@ -348,9 +656,7 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
         const auto extension = path.extension();
         if (extension == L".kncase" || extension == L".knledger")
         {
-            Entry entry;
-            entry.Name = path.filename().wstring();
-            if (!NameValid(entry.Name))
+            if (!NameValid(path.filename().wstring()))
             {
                 result.Status = L"unsupported_file_name";
                 return result;
@@ -360,31 +666,9 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
                 result.Status = L"budget_exhausted";
                 return result;
             }
-            size_t read = 0;
-            std::wstring failure;
-            if (extension == L".kncase")
-            {
-                EvidenceBundle bundle;
-                entry.Valid = reader.Read(path.wstring(), &bundle, &entry.Digest, EvidenceBundleMaxJsonBytes, &read);
-            }
-            else
-            {
-                std::wstring json;
-                EvidenceSessionSummary session;
-                entry.Valid = ReadAnalystSnapshot(path.wstring(), &json, &failure, 32768, &read, true) && ParseEvidenceSession(json, &session);
-                if (entry.Valid)
-                {
-                    entry.Digest = Hash(json);
-                    entry.Valid = entry.Digest.size() == 64;
-                }
-            }
-            entry.Bytes = read;
-            result.ReadBytes += read;
-            if (!entry.Valid)
-            {
-                entry.Digest.clear();
-                ++result.InvalidFiles;
-            }
+            auto entry = ReadEntry(path, reader);
+            result.ReadBytes += entry.Bytes;
+            if (!entry.Valid) { ++result.InvalidFiles; }
             entries.push_back(std::move(entry));
             ++result.Entries;
             if (entries.size() == ChunkEntries && !publishChunk())
@@ -424,10 +708,16 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
 
 std::wstring EvidenceInventoryBuildJson(const EvidenceInventoryBuildResult& result)
 {
-    return L"{\"schema\":\"kn.evidence_inventory_build.v1\",\"status\":" + mcpjson::Quote(result.Status) +
+    const auto schema = result.Resume ? L"kn.evidence_inventory_build_resume.v1" : L"kn.evidence_inventory_build.v1";
+    std::wstring progress;
+    if (result.Resume)
+    {
+        progress = L",\"reused_entries\":" + Number(result.ReusedEntries) + L",\"verified_entries\":" + Number(result.VerifiedEntries);
+    }
+    return L"{\"schema\":" + mcpjson::Quote(schema) + L",\"status\":" + mcpjson::Quote(result.Status) +
         L",\"snapshot_digest\":" + mcpjson::Quote(result.Digest) + L",\"entries\":" + Number(result.Entries) +
         L",\"invalid_files\":" + Number(result.InvalidFiles) + L",\"read_bytes\":" + Number(result.ReadBytes) +
-        L",\"source_capture_atomic\":false,\"collector_authenticated\":false}";
+        progress + L",\"source_capture_atomic\":false,\"collector_authenticated\":false}";
 }
 
 EvidenceQueryResult QueryEvidenceInventory(const std::wstring& directory, const KmonHuntFilter& filter,

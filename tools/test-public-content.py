@@ -17,6 +17,17 @@ SPEC.loader.exec_module(AUDIT)
 
 
 class PublicContentTests(unittest.TestCase):
+    def test_inventory_checkpoints_and_build_reports(self):
+        for schema in AUDIT.INVENTORY_WORK_SCHEMAS:
+            record = json.dumps(dict(offset="0", schema=schema))
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                for text in (record, "report\n" + record[:-1]):
+                    self.assertTrue(AUDIT.inspect("renamed.txt", text.encode(encoding)), (schema, encoding))
+            self.assertFalse(AUDIT.inspect("guide.md", ("The format is " + schema).encode()))
+        for fields in (dict(source_id="a", output_id="b", catalog_sha256="c"),
+                       dict(chunk_sha256="a", originals_sha256="b"), dict(reused_entries="1", verified_entries="0")):
+            self.assertTrue(AUDIT.inspect("fragment.txt", ("log\n" + json.dumps(fields)[:-1]).encode()))
+
     def test_release_path_rule_export(self):
         cli = [sys.executable, "-B", str(Path(AUDIT.__file__).resolve()), "--package-path-rules"]
         result = subprocess.run(cli, cwd=tempfile.gettempdir(), capture_output=True, check=True)

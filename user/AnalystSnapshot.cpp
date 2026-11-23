@@ -1,4 +1,5 @@
 #include "AnalystSnapshot.h"
+#include "ContentHash.h"
 #include "McpJson.h"
 
 #include <Windows.h>
@@ -677,6 +678,13 @@ bool SaveObservationJson(const std::wstring& path, const std::wstring& json, std
 bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error,
     size_t maximumBytes, size_t* bytesRead, bool directFile)
 {
+    return ReadAnalystSnapshot(path, json, error, maximumBytes, bytesRead, directFile, nullptr);
+}
+
+bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstring* error,
+    size_t maximumBytes, size_t* bytesRead, bool directFile, std::wstring* byteDigest)
+{
+    if (byteDigest != nullptr) { byteDigest->clear(); }
     if (bytesRead != nullptr) { *bytesRead = 0; }
     bool ok = false;
     std::wstring ignored;
@@ -714,6 +722,11 @@ bool ReadAnalystSnapshot(const std::wstring& path, std::wstring* json, std::wstr
             if (bytesRead != nullptr) { *bytesRead = read; }
             if (complete)
             {
+                if (byteDigest != nullptr)
+                {
+                    ContentHash hash;
+                    if (hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size())) { *byteDigest = hash.Finish(); }
+                }
                 if (bytes.size() >= 3 && bytes.compare(0, 3, "\xEF\xBB\xBF") == 0)
                 {
                     bytes.erase(0, 3);

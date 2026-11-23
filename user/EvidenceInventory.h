@@ -3,12 +3,16 @@
 #include "EvidenceInvestigation.h"
 #include <atomic>
 
+inline constexpr size_t EvidenceInventoryMaxChunks = 8192;
+
 struct EvidenceInventoryBuildOptions
 {
     size_t MaximumEntries = 1024 * 1024;
     uint64_t ReadBudget = 8ull * 1024 * 1024 * 1024;
     uint64_t DeadlineMs = 120000;
     const std::atomic<bool>* Cancellation = nullptr;
+    bool Resume = false;
+    size_t NewChunkLimit = EvidenceInventoryMaxChunks;
 };
 
 struct EvidenceInventoryBuildResult
@@ -18,6 +22,9 @@ struct EvidenceInventoryBuildResult
     size_t Entries = 0;
     size_t InvalidFiles = 0;
     uint64_t ReadBytes = 0;
+    bool Resume = false;
+    size_t ReusedEntries = 0;
+    size_t VerifiedEntries = 0;
 };
 
 EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& directory,

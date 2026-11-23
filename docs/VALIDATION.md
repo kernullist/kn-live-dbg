@@ -7,6 +7,56 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Restartable legacy evidence inventories on 2026-11-24
+
+The preceding x64 Release CLI (`ff4a73ee3b27`) wrote a chunk for a directory
+of 1,536 valid session ledgers. After process termination, a retry in the same
+output returned `output_exists_or_unavailable`. A fresh output accepted all
+1,536 originals.
+
+With `/resume`, the x64 Release CLI (`1cc0333124db`) resumed a build of 4,225
+ledgers after the test observed a committed window and terminated the writer.
+The test verified the hashes and write times of the existing checkpoints. The
+final v1 manifest matched an uninterrupted build byte for byte. The preceding
+CLI read it in pages of 4,096 and 129 members. On a separate seven-file input,
+the ordinary create-new command produced identical output JSON, chunks and
+manifest with both binaries.
+
+An independent reader reconstructed the three chunks of a 303-member
+inventory from the filesystem. It matched each original byte witness, v1 row,
+checkpoint link and the manifest digest, including a UTF-8 BOM, a Unicode
+filename, an empty file and malformed bytes. The second call reused 128
+members and read only the next 128 source payloads. The final call reused 256
+members and verified all 303 rows. When a test replaced a file with an
+identical copy after observing the last checkpoint of a 1,536-member build,
+the final catalog check returned `source_changed` and left the manifest absent.
+
+Other controls covered an incomplete first marker, a valid and a damaged
+orphan chunk, copied workspaces, another source directory, a resealed invalid
+row, an occupied manifest, writer exclusion and directory junctions. The
+initial directory-based writer lock also blocked Windows' own publication
+rename with sharing violation 32. A no-share handle to a separate file
+allowed publication and continued to exclude the competing writer. Windows
+PowerShell and PowerShell 7 ran the four-chunk example against the same 513
+ledgers, advancing from 512 acknowledged entries to a verified manifest.
+
+The native and AddressSanitizer evidence suites each passed 527 checks and
+reopened a published case in a fresh process. The default Windows sanitizer
+stopped during interceptor startup. The completed run used
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` and
+`ASAN_OPTIONS=halt_on_error=1`. The runtime reported the skipped interceptor.
+Command and console suites passed 3,085 and 570 checks.
+Restricted launches passed 84 checks, compiled capabilities passed 69
+contracts across 261 command routes, and the generated support matrix
+matched. All 45 public-content tests passed. The release packaging fixture
+passed 272 checks in each PowerShell edition using its standard modules.
+
+These runs used synthetic local files and process termination. Media power
+loss, an atomic snapshot of a live producer, and terminal verification beyond
+the per-invocation limits remain unverified. See the
+[CLI regression](../tools/test-evidence-inventory-resume.py) and the
+[native case controls](../tools/evidence-inventory-selftest.h).
+
 ## Retention with terminal scan receipts on 2026-11-23
 
 The preceding Release CLI (`f2eb6acd7097`) returned exit 2 when either

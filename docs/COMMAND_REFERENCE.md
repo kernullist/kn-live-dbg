@@ -154,6 +154,14 @@ publish a private inventory, then add `/inventory <snapshot-directory>` to
 [offline investigation workflow](KMON_ANALYST_SURFACES.md#영구-증거와-오프라인-조사).
 See [offline evidence and interpretation limits](KMON_ANALYST_SURFACES.md).
 
+To build an inventory across processes, include `/resume` on the first
+direct offline call and repeat it with the same source and output. For example,
+`KnLiveDbg.exe --offline !kmon inventory cases index-001 /resume /chunks 4 /json`
+commits up to four new 128-entry chunks per call. Both `checkpointed` and `ok`
+return exit 0. Wait for `ok` and a nonempty `snapshot_digest` before using
+`/inventory index-001`. Keep the source stopped throughout. A different
+membership or file generation needs a fresh output directory.
+
 `KnLiveDbg.exe --offline !kmon init-store <new-root> [/acl-only] [/json]`
 creates a new private local root under an existing directory. By default it
 requires EFS encryption and a protected current-user/SYSTEM ACL. `/acl-only`

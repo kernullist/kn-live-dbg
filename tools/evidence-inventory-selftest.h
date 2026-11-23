@@ -120,6 +120,37 @@ namespace evidence_inventory_test
             copies = CopyFileW(original.c_str(), destination.c_str(), TRUE) != FALSE && copies;
         }
         check(copies, "large inventory fixture exceeds legacy enumeration cap");
+        const auto workSource = root + L"\\resume-source";
+        const auto workIndex = root + L"\\resume-index";
+        bool workReady = CreateDirectoryW(workSource.c_str(), nullptr) != FALSE;
+        for (size_t i = 0; i < 129; ++i)
+        {
+            const auto name = workSource + L"\\case-" + std::to_wstring(i) + L".kncase";
+            workReady = CopyFileW(original.c_str(), name.c_str(), TRUE) != FALSE && workReady;
+        }
+        check(workReady, "owned case files span two resumable windows");
+        EvidenceInventoryBuildOptions resume;
+        resume.Resume = true;
+        resume.NewChunkLimit = 1;
+        resume.Cancellation = &cancel;
+        check(BuildEvidenceInventory(workSource, workIndex, resume).Status == L"cancelled" &&
+            GetFileAttributesW(workIndex.c_str()) == INVALID_FILE_ATTRIBUTES, "cancelled resumable request creates no directory");
+        resume.Cancellation = nullptr;
+        resume.ReadBudget = EvidenceBundleMaxJsonBytes - 1;
+        const auto budgeted = BuildEvidenceInventory(workSource, workIndex, resume);
+        check(budgeted.Status == L"budget_exhausted" && budgeted.Entries == 0 && budgeted.ReadBytes == 0,
+            "resumable original reader respects the per-invocation byte budget");
+        resume.ReadBudget = EvidenceInventoryBuildOptions{}.ReadBudget;
+        const auto firstWork = BuildEvidenceInventory(workSource, workIndex, resume);
+        check(firstWork.Status == L"checkpointed" && firstWork.Entries == 128 && firstWork.VerifiedEntries == 0 &&
+            firstWork.Digest.empty(), "an incomplete case inventory carries only committed progress");
+        const auto lastWork = BuildEvidenceInventory(workSource, workIndex, resume);
+        EvidenceInventoryOptions caseIndex;
+        caseIndex.Path = workIndex;
+        const auto verifiedCases = QueryEvidenceDirectory(workSource, {}, {}, caseIndex);
+        check(lastWork.Status == L"ok" && lastWork.ReusedEntries == 128 && lastWork.VerifiedEntries == 129 &&
+            lastWork.InvalidFiles == 0 && verifiedCases.ImportedFiles == 129 && verifiedCases.DuplicateFiles == 128 &&
+            verifiedCases.SnapshotDigest == lastWork.Digest, "v1 queries recheck case bytes after a resumed build");
         const auto largeBuilt = BuildEvidenceInventory(large, largeIndex);
         check(largeBuilt.Status == L"ok" && largeBuilt.Entries == 4101, "snapshot retains files beyond legacy directory cap");
         inventory = {};

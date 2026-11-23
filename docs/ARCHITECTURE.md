@@ -1951,8 +1951,30 @@ members. Content-addressed `.knchunk` files precede atomic publication of
 `manifest.knindex`; incomplete builds have no readable final manifest. Chunk
 and manifest hashes detect damage, not a malicious collector. Source directory
 identity is bound using its volume/file ID, and final reparse points are rejected.
-Directory enumeration itself is non-atomic. Interrupted construction must be
-restarted in a new output directory; no build-resume claim is made.
+Directory enumeration is non-atomic. The ordinary create-new command requires
+a fresh output directory after interruption.
+
+The direct offline `inventory /resume` mode binds a sorted catalog of source
+names, volume/file IDs, creation, change and write times, attributes and sizes
+to the source and output directories. The writer pins non-reparse ancestors
+and holds a no-share handle to the zero-length `writer.knindex` file. An empty output
+can start at offset zero, including after an interrupted first marker write.
+An existing partial inventory must have its matching `build.knindex` marker.
+Each `window-<offset>.knindex` binds the previous record, the canonical v1
+chunk and the SHA-256 witnesses of the original bounded reads. An existing
+orphan chunk qualifies only when the reconstructed bytes match. A retry
+checks the committed prefix and reads new source payloads from the next offset.
+
+Before publishing or accepting the final v1 manifest, the builder reads all
+members again, reconstructs every row and byte witness, and repeats the
+catalog comparison. The catalog requires readable member identity and
+generation metadata. Unreadable or malformed payloads remain explicit invalid
+rows. Files whose contents exceed the legacy reader limits contribute their
+metadata and an invalid row. The terminal pass shares the invocation's 8 GiB
+read budget and 120-second deadline. The sorted member names have a combined
+limit of 16,777,216 UTF-16 code units. These observations describe a stopped
+source. They provide neither an atomic filesystem snapshot nor collector
+authentication.
 
 With `/inventory`, a query verifies the manifest and consumes at most 4,096
 members and 64 MiB of source bytes per window. Metadata reads are separately
