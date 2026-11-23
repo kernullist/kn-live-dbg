@@ -3,6 +3,20 @@
 #include "EvidenceStore.h"
 #include <functional>
 
+struct EvidenceStoreReceipts
+{
+    std::wstring Catalog, Files;
+};
+
+struct EvidenceRetentionOptions
+{
+    EvidenceStoreReceipts Receipts;
+    bool Apply = false;
+    std::wstring OperationId;
+};
+
+bool ParseEvidenceRetentionOptions(const std::vector<std::wstring>& flags, bool retireCollection, EvidenceRetentionOptions& options);
+
 // Explicit operator selection, never inferred from a released inventory.
 // Retired originals require a separate policy bound to the retirement receipt.
 struct EvidenceGcPolicy
@@ -38,7 +52,8 @@ bool ParseEvidenceGcPolicy(const std::wstring& json, EvidenceGcPolicy* policy);
 // that exact policy under the exclusive store barrier. Observer runs synchronously
 // under the leases and must not reenter the store. Exceptions stop further work.
 EvidenceGcResult CollectEvidenceStore(const std::wstring& root, const std::wstring& policyPath,
-    const std::wstring& operationId = L"", const std::function<void(const wchar_t*)>& observer = {});
+    const std::wstring& operationId = L"", const std::function<void(const wchar_t*)>& observer = {},
+    const EvidenceStoreReceipts& receipts = {});
 std::wstring EvidenceGcResultJson(const EvidenceGcResult& result);
 
 struct EvidenceRetirementResult
@@ -49,5 +64,5 @@ struct EvidenceRetirementResult
 
 // A single create-new record withdraws a closed root. Physical cleanup uses GC.
 EvidenceRetirementResult RetireEvidenceCollection(const std::wstring& root, const std::wstring& policyPath,
-    bool apply, const std::function<void(const wchar_t*)>& observer = {});
+    bool apply, const std::function<void(const wchar_t*)>& observer = {}, const EvidenceStoreReceipts& receipts = {});
 std::wstring EvidenceRetirementResultJson(const EvidenceRetirementResult& result);

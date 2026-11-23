@@ -358,6 +358,39 @@ def main():
             expanded = run(large, "/file-receipt", finished, "/artifacts", "/limit", "1")
             check(expanded["status"] == "verified" and expanded["observed_artifact_files"] == "513" and expanded["unverified_artifact_files"] == "0"
                   and int(expanded["read_bytes"]) == int(expanded["verified_unattributed_bytes"]) == 513*len(data), "all 513 named originals re-read in one bounded inventory")
+            subprocess.run([writer, "--produce-collection", large, "700"], capture_output=True, check=True, timeout=90)
+            page = window(large, 1024)
+            while page["status"] == "more":
+                page = window(large, 1024, page["next_file_cursor"])
+            file_flags = ["/file-receipt", page["file_receipt"]]
+            large_policy = sandbox / "large-retirement.json"
+            large_gc = sandbox / "large-deletion.json"
+            selected = "image-sweeps/sweep-700-1.knsweep"
+            original = (large / selected).read_bytes()
+            make_rule = [sys.executable, "-B", Path(__file__).with_name("new-evidence-gc-policy.py"), "--inventory", page_json,
+                         "--reason", "owned byte budget test", "--minimum-age-seconds", "0"]
+
+            def mutate(name, rule, flags):
+                command = ([exe, "--offline", "!kmon", name, large, rule, "/apply", *(["1"] if name == "gc" else [])] if args.cli else
+                           [exe, "--" + name, large, rule, "1" if name == "gc" else "apply"])
+                result = subprocess.run([*command, *flags], capture_output=True, timeout=180)
+                check(result.returncode == (0 if flags else 1), "mutation exit with original byte budget")
+                return json.loads(result.stdout)
+
+            page_json.write_text(json.dumps(run(large, *file_flags, "/artifacts")), encoding="utf-8")
+            subprocess.run([*make_rule, "--retire-collection", "700", "--output", large_policy], capture_output=True, check=True)
+            marker = large / "collections/700/retirement.knretirement"
+            check(mutate("retire-collection", large_policy, [])["issue"] == "retirement_requires_complete_closed_store" and
+                  not marker.exists(), "default physical byte ceiling prevents withdrawal")
+            check(mutate("retire-collection", large_policy, file_flags)["status"] == "retired" and marker.is_file(),
+                  "file receipt permits retirement beyond the default loose-file budget")
+            page_json.write_text(json.dumps(run(large, *file_flags, "/artifacts")), encoding="utf-8")
+            subprocess.run([*make_rule, "--from-retired-collection", "700", "--path", selected, "--output", large_gc], capture_output=True, check=True)
+            check(mutate("gc", large_gc, [])["issue"] == "gc_requires_complete_closed_store" and (large / selected).read_bytes() == original,
+                  "default physical byte ceiling preserves selected file")
+            result = mutate("gc", large_gc, file_flags)
+            check(result["deleted_this_call"] == "1" and result["entries"][0]["artifact"]["sha256"] == hashlib.sha256(original).hexdigest() and
+                  not (large / selected).exists() and base.stat().st_nlink == 513, "only the policy-selected original is removed")
     print(f"[store.files] checks={checks} large={args.large} product={args.cli}")
 
 

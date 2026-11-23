@@ -152,10 +152,10 @@ def main():
         cmd = [*cli, "store", root, "/artifacts"] if args.cli else [exe, "--store", root]
         return json.loads(call(cmd + list(flags), code))
 
-    def retire(root, rule, apply=False, code=0):
+    def retire(root, rule, apply=False, code=0, flags=()):
         cmd = [*cli, "retire-collection", root, rule] + (["/apply"] if apply else []) if args.cli else [
             exe, "--retire-collection", root, rule, "apply" if apply else "-"]
-        return json.loads(call(cmd, code))
+        return json.loads(call([*cmd, *flags], code))
 
     def originals(folder):
         return {f.relative_to(folder).as_posix(): sha(f.read_bytes()) for f in folder.rglob("*") if f.is_file()}
@@ -282,7 +282,15 @@ def main():
             check(retire(branch, rule, True)["reused_receipt"] == (stage == "retire_published"), "interruption retry " + stage)
 
         receipt = store / "collections/7/retirement.knretirement"
-        result = retire(store, rule, True)
+        store_cmd = [*cli, "store", store] if args.cli else [exe, "--store", store]
+        catalog = json.loads(call([*store_cmd, "/scan-catalog", "/limit", "1024"]))
+        physical = json.loads(call([*store_cmd, "/scan-files", "/limit", "1024"]))
+        flags = ["/scan-receipt", catalog["scan_receipt"], "/file-receipt", physical["file_receipt"]]
+        check(catalog["status"] == physical["status"] == "complete" and
+              retire(store, rule, flags=flags)["status"] == "planned", "receipted preflight independently ranks all priority classes")
+        result = retire(store, rule, True, flags=flags)
+        check(retire(store, rule, True, 1, flags)["issue"] == "store_scan_recovery_mismatch",
+              "a changed catalog must be rechecked before reusing the budget retirement")
         data = receipt.read_bytes()
         record = json.loads(data)
         audit = record["payload"]

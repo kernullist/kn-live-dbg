@@ -565,7 +565,8 @@ matches. A late namespace change moves previously absent retired paths into
 the unobserved count. Ownership, deduplication and retention come from the
 original journals and the full inventory. The page reports historical ranges and gaps.
 
-The default inventory, retirement and GC allow 1,024 catalog entries. Full
+Inventory, retirement and GC allow 1,024 catalog entries by default and
+up to 16,384 with a reverified terminal catalog receipt. Full
 inventory modes bound work to 65,536 managed artifact paths/observed directory
 entries, 262,144 accepted member/dependency references and 8 GiB aggregate reads.
 The unattributed-file reader ordinarily stops at 1 GiB. When revalidating a
@@ -602,6 +603,19 @@ and scans the managed files. It counts each selected path once, partitioned by
 sole active owner, additional active owners or failure-ledger membership.
 These counts describe ownership at that observation. Surviving archive inputs
 can still protect a file whose journal owner was exclusive.
+
+Retirement and explicit file GC can take either or both terminal scan receipts.
+Under the exclusive store lease each operation reopens the originals, verifies
+the supplied catalog rows or physical byte ranges, and checks the namespaces
+again before evaluating its policy. The physical namespace check precedes the
+final catalog enumeration when both receipts are supplied. A nonparticipating
+writer can still change a directory after its last check.
+The same lease and pinned originals cover
+the policy decision and publication. An incomplete store or a receipt mismatch
+stops the operation before it creates a retirement record or GC intent.
+On retry, the caller refreshes any receipt whose rows or file set changed.
+Existing withdrawal records, GC intents and outcomes continue to identify
+the original operation.
 
 `/apply` publishes the create-new `collections/<id>/retirement.knretirement`
 receipt. It includes the exact policy, observed closure and evaluation times,

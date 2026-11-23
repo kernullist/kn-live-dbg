@@ -7,6 +7,58 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Retention with terminal scan receipts on 2026-11-23
+
+The preceding Release CLI (`f2eb6acd7097`) returned exit 2 when either
+retention command received a scan receipt. On a store of 1,025 closed native
+collections, its ordinary retirement and GC preflights stopped at 1,024.
+The clean x64 Release build (`ff4a73ee3b27`) rechecked the complete catalog
+and physical-file receipts and applied both policies. The test read the original transaction members,
+recounted exclusive, shared and failure-ledger bytes, and matched the
+retirement record and per-file outcome against their on-disk SHA-256 values.
+Only the selected retired sweep disappeared.
+
+A separate store held 513 named links to one 2 MiB failure ledger. After a
+native image collection was added, the ordinary preflights exhausted the
+loose-file read budget. With a fresh file receipt, retirement published its
+record and GC removed the selected sweep. All 513 links to the ledger remained.
+The routine-budget test also applied a receipt-checked policy across 17 image
+and IRP collections and checked the before and after byte totals.
+
+During review, a collection created at the end of the physical scan initially
+produced a successful retirement plan. Repeating the case after moving the
+catalog check returned `store_scan_namespace_changed`. A managed file added
+at the same boundary stopped GC before it wrote an intent. The interruption
+test stopped the process after the selected name disappeared and before the
+outcome was published. Retry preserved a replacement with the original bytes.
+When the name was subsequently absent, the audit recorded `absent_after_intent`
+and attributed zero deletions to the retry.
+
+The Release CLI passed 106 small-store and 67 large-catalog retention checks,
+201 physical-file checks including the large-file case, 168 catalog checks,
+110 routine-budget checks, 219 retirement checks and 898 GC checks. Journal,
+IRP journal and store regressions passed 2,152, 400 and 553 checks respectively.
+The command tests passed 3,083 checks across 261 routes. The console tests
+passed 570 checks with the owned process fixture. The generated support
+matrix matched all 68 compiled contracts.
+
+The native journal harness (`389130724175`) and ASan harness (`1f3fca2e3fbe`)
+each passed 107 small-store retention checks. The default Windows ASan
+interceptor stopped at startup. The instrumented run used
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` and `halt_on_error=1`.
+The failed interceptor remains outside that coverage.
+
+One actual GC preflight report encoded as UTF-16BE without a BOM initially
+passed the public-content scanner. The corrected scanner classified all six
+UTF-8, UTF-16LE and UTF-16BE exports of retirement and GC preflights as
+private. It accepted the Release executable and passed all 44 scanner tests.
+
+The results cover stopped local stores and cooperating publishers. The full
+inspection retains its 8 GiB aggregate read limit, path and reference limits
+and cooperative deadline. Power-loss durability and concurrent changes by
+nonparticipating writers after the final checks remain unverified.
+[Retention receipt tests](../tools/test-store-retention-receipts.py)
+
 ## Resumable physical file reads on 2026-11-23
 
 In a stopped test store, 513 ledger paths were hard links to one 2 MiB file.

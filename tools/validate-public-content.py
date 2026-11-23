@@ -148,9 +148,12 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"plan_line_sha256"', '"native_calls"', '"waiting_samples"', '"sample_slot"', '"waiting_inside_call_samples"',
                      '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
-STORE_SCAN_MARKERS = ("kn.store_catalog_scan.v1", "kn.store_file_scan.v1", "kncs1.", "kncr1.", "knfs1.", "knfr1.")
-STORE_SCAN_RECORD = re.compile(r'"schema"\s*:\s*"kn\.store_(?:catalog|file)_scan\.v1"|\bknc[sr]1\.[0-9]{1,5}\.[0-9a-f]{32,64}'
-                               r'|\bknf[sr]1\.[0-9]{1,5}\.[0-9]{1,10}\.[0-9a-f]{32,64}')
+STORE_REPORT_MARKERS = ("kn.store_catalog_scan.v1", "kn.store_file_scan.v1", "kn.evidence_gc_result.v1", "kn.evidence_retirement_result.v1",
+                        "kncs1.", "kncr1.", "knfs1.", "knfr1.")
+STORE_REPORT_RECORD = re.compile(r'"schema"\s*:\s*"kn\.store_(?:catalog|file)_scan\.v1"'
+                                 r'|"schema"\s*:\s*"kn\.evidence_(?:gc|retirement)_result\.v1"(?=\s*(?:[,}]|$))'
+                                 r'|\bknc[sr]1\.[0-9]{1,5}\.[0-9a-f]{32,64}|\bknf[sr]1\.[0-9]{1,5}\.[0-9]{1,10}\.[0-9a-f]{32,64}',
+                                 re.MULTILINE)
 STORE_RETENTION_MARKERS = ('"file_namespace_sha256"', '"next_file_cursor"', '"file_receipt"', '"block_sha256"',
                            '"namespace_sha256"', '"next_scan_cursor"', '"scan_receipt"', '"input_matched"', '"uncommitted_approval_referrers"', '"approval_catalog"',
                            '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"',
@@ -559,14 +562,14 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
-                                                                  "kn.wait_", "ey", "ew", "Files Processed:", *IO_TIMING_MARKERS, *STORE_SCAN_MARKERS, *STORE_RETENTION_MARKERS, *DISCLOSURE_MARKERS, *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
+                                                                  "kn.wait_", "ey", "ew", "Files Processed:", *IO_TIMING_MARKERS, *STORE_REPORT_MARKERS, *STORE_RETENTION_MARKERS, *DISCLOSURE_MARKERS, *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
                                                                  "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
     for text in text_views(view):
-        if (not binary or view is not data) and any(marker in text for marker in STORE_SCAN_MARKERS):
-            match = STORE_SCAN_RECORD.search(text)
+        if (not binary or view is not data) and any(marker in text for marker in STORE_REPORT_MARKERS):
+            match = STORE_REPORT_RECORD.search(text)
             if match:
                 add("private-evidence-bundle", text.count("\n", 0, match.start()) + 1)
         if "Files Processed:" in text and re.search(r"(?m)^[ \t]*Files Processed:\r?\n[ \t]+(?:[^\r\n]+\.etl(?:\r?$)|[^\r\n]+\r?\nTotal Buffers Processed[ \t]+[0-9]+)", text, re.I):

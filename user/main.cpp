@@ -23134,8 +23134,8 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon journal <collection-directory> [/index] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> /scan-catalog|/scan-files [/limit 1..1024] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon store <artifact-root> [/scan-receipt token] [/file-receipt token] [/retention] [/artifacts [/limit 1..4096] [/cursor token]] [/json]\n";
-    std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json] (offline CLI only)\n";
-    std::wcout << L"  --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json] (offline CLI only)\n";
+    std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] [/apply operation-id] [/json] (offline CLI only)\n";
+    std::wcout << L"  --offline !kmon retire-collection <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] [/apply] [/json] (offline CLI only)\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
@@ -23917,54 +23917,26 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         std::wcout << (imageSweep ? ImageSweepGraphJson(imageGraph, query, page) : EvidenceGraphJson(graph, query, page)) << L"\n";
         return page.Status == L"ok" ? 0 : 1;
     }
-    if (action == L"retire-collection" && directJsonOutput)
+    if ((action == L"retire-collection" || action == L"gc") && directJsonOutput)
     {
-        bool apply = false, json = false, valid = args.size() >= 4 && args.size() <= 6;
-        for (size_t i = 2; valid && i < 4; ++i) { valid = !args[i].empty() && args[i][0] != L'/'; }
-        for (size_t i = 4; valid && i < args.size(); ++i)
+        const bool retire = action == L"retire-collection";
+        EvidenceRetentionOptions options;
+        if (args.size() < 4 || args.size() > 11 || args[2].empty() || args[3].empty() ||
+            (retire && (args[2].front() == L'/' || args[3].front() == L'/')) ||
+            !ParseEvidenceRetentionOptions({args.begin() + 4, args.end()}, retire, options))
         {
-            const auto option = ToLower(args[i]);
-            if (option == L"/apply" && !apply) { apply = true; }
-            else if (option == L"/json" && !json) { json = true; }
-            else { valid = false; }
-        }
-        if (!valid)
-        {
-            std::wcerr << L"usage: --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json]\n";
+            std::wcerr << L"usage: --offline !kmon " << action << L" <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] "
+                << (retire ? L"[/apply]" : L"[/apply operation-id]") << L" [/json]\n";
             return 2;
         }
-        const auto result = RetireEvidenceCollection(args[2], args[3], apply);
-        if (!WriteCapabilityJson(EvidenceRetirementResultJson(result))) { return 3; }
-        return result.Status == L"planned" || result.Status == L"retired" ? 0 : 1;
-    }
-    if (action == L"gc")
-    {
-        bool valid = args.size() >= 4 && args.size() <= 7 && !args[2].empty() && !args[3].empty();
-        std::wstring operation;
-        std::set<std::wstring> seen;
-        for (size_t i = 4; valid && i < args.size(); ++i)
+        if (retire)
         {
-            const auto option = ToLower(args[i]);
-            valid = seen.insert(option).second;
-            if (option == L"/apply")
-            {
-                valid = valid && ++i < args.size();
-                if (valid)
-                {
-                    operation = args[i];
-                    valid = !operation.empty() && operation.size() <= 20 && operation.find_first_not_of(L"0123456789") == std::wstring::npos &&
-                        (operation.size() == 1 || operation.front() != L'0');
-                }
-            }
-            else { valid = valid && option == L"/json"; }
+            const auto result = RetireEvidenceCollection(args[2], args[3], options.Apply, {}, options.Receipts);
+            if (!WriteCapabilityJson(EvidenceRetirementResultJson(result))) { return 3; }
+            return result.Status == L"planned" || result.Status == L"retired" ? 0 : 1;
         }
-        if (!valid)
-        {
-            std::wcerr << L"usage: --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]\n";
-            return 2;
-        }
-        const auto result = CollectEvidenceStore(args[2], args[3], operation);
-        std::wcout << EvidenceGcResultJson(result) << L"\n";
+        const auto result = CollectEvidenceStore(args[2], args[3], options.OperationId, {}, options.Receipts);
+        if (!WriteCapabilityJson(EvidenceGcResultJson(result))) { return 3; }
         return result.Status == L"planned" || result.Status == L"completed" ? 0 : 1;
     }
     if (action == L"store")

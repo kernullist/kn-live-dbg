@@ -51,6 +51,7 @@ A dash means the binary declares no standalone probe for that operation.
 | evidence / journal_image_scope_approval | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | one_archived_temporal_assessment | — |
 | image / replay_scope_approval | recipe | implemented | recorded_descriptor;legacy_la48_when_declared;decoder_specific | recorded_assessment_time | — |
 | evidence / gc | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_explicit_policy | — |
+| evidence / retire_collection | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | coordinated_closed_collection | — |
 | image / capture_verification | dump | implemented | collector_specific;extended_address_pipeline_unvalidated | offline_dump | — |
 | evidence / privacy | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | observed_os_access_controls | — |
 | evidence / disclosure | local_files | implemented | collector_specific;extended_address_pipeline_unvalidated | reviewed_historical_image_counts | — |

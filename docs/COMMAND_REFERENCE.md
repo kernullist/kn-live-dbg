@@ -276,7 +276,7 @@ inventory, cursor mismatch and a row exceeding the page budget. Exit 2 means
 invalid grammar and exit 3 means offline output failure. The returned
 report grants no deletion authority. See [scope, coordination and bounds](ARCHITECTURE.md#image-store-membership-inventory).
 
-`KnLiveDbg.exe --offline !kmon retire-collection <artifact-root> <policy.json> [/apply] [/json]`
+`KnLiveDbg.exe --offline !kmon retire-collection <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] [/apply] [/json]`
 ends an identified closed collection's retention. Save a verified store
 inventory and prepare the private policy with
 `python tools/new-evidence-gc-policy.py --inventory inventory.json --retire-collection 7 --reason "retention period ended" --output retire.json`.
@@ -287,6 +287,14 @@ in the collection's retirement receipt. Exit 0 means planned, retired or a
 matching receipt was reused. Exit 1 means denied or incomplete, 2 means
 invalid grammar and 3 means output failure. Inspect the receipt after an
 interrupted apply or output failure. [Retirement semantics](ARCHITECTURE.md#closed-collection-retirement)
+
+For a store with more than 1,024 collections, pass the terminal `scan_receipt`
+from `store /scan-catalog` on both preflight and apply. For more than 1 GiB of
+loose-file reads, pass the terminal `file_receipt` from `store /scan-files`.
+The two options can be combined and also apply to `gc`. Each command reads the
+current originals under its own exclusive lease and evaluates the policy only
+after the supplied receipts verify. A catalog supports up to 16,384 entries
+and the full inspection has an aggregate 8 GiB read budget.
 
 To budget routine originals across closed KMON image and IRP collections,
 save a successful `store <artifact-root> /retention` report as UTF-8 in a
@@ -301,7 +309,7 @@ Add `/apply` to publish the retirement receipt. Refresh the inventory before
 selecting another collection. A separate file GC policy is required to reclaim
 physical files. [Cross-collection routine budget](ARCHITECTURE.md#cross-collection-routine-budget)
 
-`KnLiveDbg.exe --offline !kmon gc <artifact-root> <policy.json> [/apply operation-id] [/json]`
+`KnLiveDbg.exe --offline !kmon gc <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] [/apply operation-id] [/json]`
 preflights an explicit policy by default. Prepare one with
 `python tools/new-evidence-gc-policy.py --inventory inventory.json --path image-reads/reads-123-4.knreads --reason "obsolete unpublished observation" --output policy.json`.
 The input must be a successful `store /artifacts` page containing all selected
@@ -311,6 +319,11 @@ age and 128 MiB total named bytes. Repeat `--path` for explicit additional membe
 Review the generated policy and preflight result before using `/apply` with a
 canonical decimal operation ID of at most 20 digits. The same ID resumes that
 exact operation; it cannot select a new policy or another physical root.
+
+Retirement changes the catalog recovery rows. Removing a named file changes
+the file scan. Before retrying with receipts, repeat the affected scan and
+pass its new terminal token with the original policy and, for GC, the same
+operation ID. GC checks the durable intent and per-file outcome on that retry.
 
 GC denies removal of inputs held by uncommitted image archives, approvals and IRP captures
 on initial preflight and retry. An unreadable declaration protects possible
@@ -328,8 +341,10 @@ receipt and current dependencies again. The inventory reports historical
 membership and distinguishes verified replacements, absent paths and paths
 whose current contents or presence could not be established.
 
-Exit 0 means planned or historically completed; exit 1 includes denied,
-incomplete and unresolved deletion outcomes; exit 2 means invalid grammar.
+Exit 0 means planned or historically completed. Exit 1 covers denial,
+incomplete work and unresolved deletion outcomes. Exit 2 means invalid
+grammar. Exit 3 means the CLI could not write the result. After an output
+failure during apply, inspect the private operation history before retrying.
 `deleted_this_call` excludes old receipts and absence after an interrupted
 intent. Receipt reuse never deletes a later replacement. This command is
 offline-only and does not remove committed roots or failure ledgers. See

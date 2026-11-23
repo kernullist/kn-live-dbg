@@ -64,6 +64,16 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("export.txt", sample.encode(encoding))})
         self.assertFalse(AUDIT.inspect("guide.md", b"Use the kn.store_file_scan.v1 schema."))
 
+    def test_store_retention_operation_output(self):
+        for schema in ("kn.evidence_gc_result.v1", "kn.evidence_retirement_result.v1"):
+            sample = json.dumps(dict(schema=schema, status="planned", issue=""))
+            for text in (sample, "retention log\n" + sample[:sample.index(",") + 1]):
+                for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                    self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("export.txt", text.encode(encoding))})
+            self.assertFalse(AUDIT.inspect("guide.md", ("The command returns " + schema).encode()))
+            prefix = json.dumps(dict(schema=schema), separators=(",", ":"))[:-1]
+            self.assertFalse(AUDIT.inspect("consumer.py", f"matches = line.startswith({prefix!r})".encode()))
+
     def test_detached_store_retention(self):
         rows = (dict(input_matched=True, sha256="synthetic", path="fixture"),
                 dict(artifact={}, uncommitted_approval_referrers=[]), dict(approval_catalog="resolved", artifact={}),

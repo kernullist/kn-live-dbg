@@ -35,8 +35,7 @@ namespace
         {
             std::wcout << L"[journal.stage] " << current << std::endl;
             std::string input;
-            std::getline(std::cin, input); // Parent observes this exact stage before terminating us.
-            ExitProcess(91); // No continuation if the parent closes its pipe unexpectedly.
+            if (!std::getline(std::cin, input) || input != "continue") { ExitProcess(91); }
         }
     }
     const std::vector<uint8_t> Blob{0x4d, 0x5a, 0, 0, 0x7f}; // Non-executable storage fixture.
@@ -474,21 +473,26 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if ((argc == 5 || argc == 6) && std::wstring(argv[1]) == L"--retire-collection")
+        if (argc >= 5 && (std::wstring(argv[1]) == L"--retire-collection" || std::wstring(argv[1]) == L"--gc"))
         {
-            const std::wstring stage = argc == 6 ? argv[5] : L"";
-            const auto result = RetireEvidenceCollection(argv[2], argv[3], std::wstring(argv[4]) == L"apply",
-                [&](const wchar_t* current) { Stage(stage, current); });
-            std::cout << mcpjson::WideToUtf8(EvidenceRetirementResultJson(result)) << std::endl;
+            const bool retire = std::wstring(argv[1]) == L"--retire-collection";
+            const bool hasStage = argc > 5 && argv[5][0] != L'/';
+            const std::wstring stage = hasStage ? argv[5] : L"";
+            const auto observe = [&](const wchar_t* current) { Stage(stage, current); };
+            const std::wstring mode = argv[4];
+            const std::vector<std::wstring> flags(argv + (hasStage ? 6 : 5), argv + argc);
+            EvidenceRetentionOptions options;
+            if (!ParseEvidenceRetentionOptions(flags, retire, options) || options.Apply) { return 2; }
+            if (retire)
+            {
+                const auto result = RetireEvidenceCollection(argv[2], argv[3], mode == L"apply", observe, options.Receipts);
+                std::cout << mcpjson::WideToUtf8(EvidenceRetirementResultJson(result)) << std::endl;
+                if (!std::cout) { return 3; }
+                return result.Status == L"planned" || result.Status == L"retired" ? 0 : 1;
+            }
+            const auto result = CollectEvidenceStore(argv[2], argv[3], mode == L"-" ? L"" : mode, observe, options.Receipts);
+            std::cout << mcpjson::WideToUtf8(EvidenceGcResultJson(result)) << std::endl;
             if (!std::cout) { return 3; }
-            return result.Status == L"planned" || result.Status == L"retired" ? 0 : 1;
-        }
-        if ((argc == 5 || argc == 6) && std::wstring(argv[1]) == L"--gc")
-        {
-            const std::wstring stage = argc == 6 ? argv[5] : L"";
-            const auto result = CollectEvidenceStore(argv[2], argv[3], std::wstring(argv[4]) == L"-" ? L"" : argv[4],
-                [&](const wchar_t* current) { Stage(stage, current); });
-            std::wcout << EvidenceGcResultJson(result) << '\n';
             return result.Status == L"planned" || result.Status == L"completed" ? 0 : 1;
         }
         if (argc >= 3 && (std::wstring(argv[1]) == L"--store" || std::wstring(argv[1]) == L"--hold-scan"))

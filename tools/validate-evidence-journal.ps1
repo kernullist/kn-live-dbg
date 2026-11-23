@@ -32,6 +32,8 @@ if ($LASTEXITCODE -ne 0) { throw "Evidence store independent validation failed: 
 if ($LASTEXITCODE -ne 0) { throw "Resumable collection scan controls failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-store-file-scan.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "Resumable physical file checks failed: $LASTEXITCODE" }
+& python (Join-Path $PSScriptRoot 'test-store-retention-receipts.py') --exe $exe --fixtures $output
+if ($LASTEXITCODE -ne 0) { throw "Receipt-checked retention controls failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-evidence-gc.py') --exe $exe --fixtures $output
 if ($LASTEXITCODE -ne 0) { throw "Evidence GC independent validation failed: $LASTEXITCODE" }
 & python (Join-Path $PSScriptRoot 'test-evidence-retirement.py') --exe $exe --fixtures $output

@@ -142,7 +142,10 @@ def main():
     gc = by_key[("evidence", "gc", "local_files")]
     assert gc["availability"] == "not_probed" and "durable_intent_before_delete" in gc["requirements"]
     assert "committed_roots_and_failure_ledgers_protected" in gc["limits"]
-    assert "uncommitted_image_and_irp_artifacts_only" in gc["limits"]
+    assert "explicit_uncommitted_or_receipt_bound_retired_originals" in gc["limits"]
+    retirement = by_key[("evidence", "retire_collection", "local_files")]
+    assert retirement["availability"] == "not_probed" and "physical_gc_separate" in retirement["limits"]
+    assert all("optional_reverified_catalog_and_file_receipts" in row["requirements"] for row in (gc, retirement))
     retention = by_key[("evidence", "retention", "native")]
     privacy = by_key[("evidence", "privacy", "local_files")]
     disclosure = by_key[("evidence", "disclosure", "local_files")]

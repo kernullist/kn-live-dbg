@@ -1292,9 +1292,9 @@ struct EvidenceStoreAccess
     static std::wstring ScanCatalog(const std::wstring& root, const EvidenceStorePageOptions& page, bool* ready,
         const std::function<void(const wchar_t*)>& observer);
     static EvidenceGcResult Collect(const std::wstring& root, const std::wstring& policyPath,
-        const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer);
+        const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer, const EvidenceStoreReceipts& receipts);
     static EvidenceRetirementResult Retire(const std::wstring& root, const std::wstring& policyPath,
-        bool apply, const std::function<void(const wchar_t*)>& observer);
+        bool apply, const std::function<void(const wchar_t*)>& observer, const EvidenceStoreReceipts& receipts);
 };
 
 bool EvidenceStoreAccess::ReadCollection(EvidenceJournal::Impl& reader, const fs::path& root, const std::wstring& id)
@@ -1806,17 +1806,6 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
             else { out.Budget.Observed = CurrentFileTime(); }
         }
         if (out.Status == L"partial" && out.Issue.empty()) { out.Issue = L"unresolved_membership_or_artifacts"; }
-        if (!scanReceipt.empty())
-        {
-            store_catalog::Names after;
-            std::wstring issue;
-            if (!store_catalog::ReadNames(NativePath(root), out.StartedTick, DeadlineMs, after, issue) || after.Digest != scanNames.Digest)
-            {
-                out.Status = L"partial"; out.CatalogComplete = out.MembershipComplete = out.ArtifactInventoryComplete = false;
-                out.Budget.Observed = 0;
-                out.Issue = issue.empty() ? L"store_scan_namespace_changed" : std::move(issue);
-            }
-        }
         if (!fileReceipt.empty())
         {
             if (observer) { observer(L"file_inventory_hashed"); }
@@ -1828,7 +1817,20 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 out.Issue = issue.empty() ? L"store_file_namespace_changed" : std::move(issue);
             }
         }
-        if (action) { action(out, root, reader); }
+        if (!scanReceipt.empty())
+        {
+            // A collection may have appeared while the physical file namespace was being checked.
+            store_catalog::Names after;
+            std::wstring issue;
+            if (!store_catalog::ReadNames(NativePath(root), out.StartedTick, DeadlineMs, after, issue) || after.Digest != scanNames.Digest)
+            {
+                out.Status = L"partial"; out.CatalogComplete = out.MembershipComplete = out.ArtifactInventoryComplete = false;
+                out.Budget.Observed = 0;
+                out.Issue = issue.empty() ? L"store_scan_namespace_changed" : std::move(issue);
+            }
+        }
+        // A supplied receipt must verify under this lease before any policy is evaluated.
+        if (action && (out.Status == L"verified" || (scanReceipt.empty() && fileReceipt.empty()))) { action(out, root, reader); }
     }
     catch (...) { out.Status = L"partial"; out.MembershipComplete = out.ArtifactInventoryComplete = false;
         out.Budget.Observed = 0; out.Issue = L"store_inspection_exception"; }
@@ -1871,6 +1873,48 @@ namespace
     }
 }
 
+namespace
+{
+    bool ReadReceiptOption(const std::vector<std::wstring>& flags, size_t& index, const std::wstring& key,
+        std::wstring& catalog, std::wstring& files)
+    {
+        const bool physical = key == L"/file-receipt";
+        auto& receipt = physical ? files : catalog;
+        if (!receipt.empty() || ++index == flags.size()) { return false; }
+        const auto& value = flags[index];
+        if (value.empty() || value.size() > (physical ? 234u : 150u) || value.front() == L'/') { return false; }
+        receipt = value;
+        return true;
+    }
+}
+
+bool ParseEvidenceRetentionOptions(const std::vector<std::wstring>& flags, bool retireCollection, EvidenceRetentionOptions& options)
+{
+    EvidenceRetentionOptions parsed;
+    bool json = false;
+    for (size_t i = 0; i < flags.size(); ++i)
+    {
+        const auto key = LowerAscii(flags[i]);
+        if (key == L"/apply" && !parsed.Apply)
+        {
+            parsed.Apply = true;
+            if (!retireCollection)
+            {
+                if (++i == flags.size() || !Id(flags[i])) { return false; }
+                parsed.OperationId = flags[i];
+            }
+        }
+        else if (key == L"/json" && !json) { json = true; }
+        else if (key == L"/scan-receipt" || key == L"/file-receipt")
+        {
+            if (!ReadReceiptOption(flags, i, key, parsed.Receipts.Catalog, parsed.Receipts.Files)) { return false; }
+        }
+        else { return false; }
+    }
+    options = std::move(parsed);
+    return true;
+}
+
 bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, EvidenceStorePageOptions* page)
 {
     if (!page) { return false; }
@@ -1885,11 +1929,7 @@ bool ParseEvidenceStorePageOptions(const std::vector<std::wstring>& options, Evi
         else if (key == L"/scan-files" && !parsed.ScanFiles) { parsed.ScanFiles = true; }
         else if (key == L"/scan-receipt" || key == L"/file-receipt")
         {
-            const bool files = key == L"/file-receipt";
-            auto& value = files ? parsed.FileReceipt : parsed.ScanReceipt;
-            if (!value.empty() || ++i == options.size()) { return false; }
-            value = options[i];
-            if (value.empty() || value.size() > (files ? 234u : 150u) || value.front() == L'/') { return false; }
+            if (!ReadReceiptOption(options, i, key, parsed.ScanReceipt, parsed.FileReceipt)) { return false; }
         }
         else if (key == L"/json" && !json) { json = true; }
         else if (key == L"/limit" && !parsed.Limit && ++i < options.size())
@@ -2113,7 +2153,7 @@ std::wstring EvidenceGcPolicyJson(const EvidenceGcPolicy& p)
 }
 
 EvidenceRetirementResult EvidenceStoreAccess::Retire(const std::wstring& root, const std::wstring& policyPath,
-    bool apply, const std::function<void(const wchar_t*)>& observer)
+    bool apply, const std::function<void(const wchar_t*)>& observer, const EvidenceStoreReceipts& receipts)
 {
     EvidenceRetirementResult result;
     result.Apply = apply;
@@ -2195,7 +2235,7 @@ EvidenceRetirementResult EvidenceStoreAccess::Retire(const std::wstring& root, c
                 result.ReceiptSha256 = std::move(digest); result.Status = L"retired";
             }
             catch (...) { result.Status = L"incomplete"; result.Issue = L"retirement_execution_exception"; }
-        }, record.Policy.RoutineBudget);
+        }, record.Policy.RoutineBudget, receipts.Catalog, receipts.Files, observer);
         if (!called) { result.Issue = snapshot.Issue.empty() ? L"retirement_inventory_unavailable" : snapshot.Issue; }
     }
     catch (...) { result.Status = L"incomplete"; result.Issue = L"retirement_inspection_exception"; }
@@ -2203,8 +2243,8 @@ EvidenceRetirementResult EvidenceStoreAccess::Retire(const std::wstring& root, c
 }
 
 EvidenceRetirementResult RetireEvidenceCollection(const std::wstring& root, const std::wstring& policyPath,
-    bool apply, const std::function<void(const wchar_t*)>& observer)
-{ return EvidenceStoreAccess::Retire(root, policyPath, apply, observer); }
+    bool apply, const std::function<void(const wchar_t*)>& observer, const EvidenceStoreReceipts& receipts)
+{ return EvidenceStoreAccess::Retire(root, policyPath, apply, observer, receipts); }
 
 std::wstring EvidenceRetirementResultJson(const EvidenceRetirementResult& r)
 {
@@ -2240,7 +2280,7 @@ bool ParseEvidenceGcPolicy(const std::wstring& json, EvidenceGcPolicy* policy)
 }
 
 EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const std::wstring& policyPath,
-    const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer)
+    const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer, const EvidenceStoreReceipts& receipts)
 {
     EvidenceGcResult result;
     result.OperationId = operationId; result.Apply = !operationId.empty();
@@ -2440,7 +2480,7 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
             }
             catch (const GcFailure& failure) { result.Status = L"incomplete"; result.Issue = failure.Issue; }
             catch (...) { result.Status = L"incomplete"; result.Issue = L"gc_execution_exception"; }
-        });
+        }, false, receipts.Catalog, receipts.Files, observer);
         if (!called) { result.Issue = inventory.Issue.empty() ? L"gc_inventory_unavailable" : inventory.Issue; }
     }
     catch (...) { result.Status = L"incomplete"; result.Issue = L"gc_inspection_exception"; }
@@ -2448,9 +2488,9 @@ EvidenceGcResult EvidenceStoreAccess::Collect(const std::wstring& root, const st
 }
 
 EvidenceGcResult CollectEvidenceStore(const std::wstring& root, const std::wstring& policyPath,
-    const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer)
+    const std::wstring& operationId, const std::function<void(const wchar_t*)>& observer, const EvidenceStoreReceipts& receipts)
 {
-    return EvidenceStoreAccess::Collect(root, policyPath, operationId, observer);
+    return EvidenceStoreAccess::Collect(root, policyPath, operationId, observer, receipts);
 }
 
 std::wstring EvidenceGcResultJson(const EvidenceGcResult& r)
