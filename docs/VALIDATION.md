@@ -4951,6 +4951,14 @@ harness` and `-Mode product` select either scope. The
 [direct collection validator](../tools/validate-image-capture-journal.ps1) also
 runs the extended [mapped-image test](../tools/test-mapped-image-journal.py).
 
+The mapped-image check reads the probe export directly from
+`owned-image-journal.dll`. A successful run keeps the DLL and its rebuild
+command, `compile.cmd`. In older run directories, `probe.obj`, `probe.lib`
+and `probe.exp` are disposable once the DLL has linked. On 2026-11-25 the
+development validator passed 614 collection checks and 77 mapped-image
+checks in each of Windows PowerShell 5.1 and PowerShell 7. A forced link
+failure left only the rebuild command after the compiler wrote the object.
+
 This P03/P06 increment is not completion of VS1 or P01-P16. Historical
 reproduction does not assert current approval, live state, authenticated clocks,
 collector identity, signatures or power-loss durability. Signed distribution

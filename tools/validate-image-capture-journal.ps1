@@ -24,12 +24,17 @@ if ($Product -and $Mode -ne 'harness') {
     $output = Join-Path $repo ('.build\image-capture-journal\run-' + [Guid]::NewGuid().ToString('N'))
     New-Item -ItemType Directory -Path $output | Out-Null
     $dll = Join-Path $output 'owned-image-journal.dll'
+    $object = Join-Path $output 'probe.obj'
     $source = Join-Path $PSScriptRoot 'owned-image-journal-fixture.cpp'
     $batch = Join-Path $output 'compile.cmd'
-    $compile = 'cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /LD "{0}" /Fo:"{1}/probe.obj" /link /NOENTRY /NODEFAULTLIB /DYNAMICBASE /BASE:0x180000000 /OUT:"{2}" /IMPLIB:"{1}/probe.lib"' -f $source, $output.Replace('\','/'), $dll
+    $compile = 'cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /LD "{0}" /Fo:"{1}" /link /NOENTRY /NODEFAULTLIB /DYNAMICBASE /BASE:0x180000000 /NOIMPLIB /NOEXP /OUT:"{2}"' -f $source, $object, $dll
     Set-Content -LiteralPath $batch -Encoding ascii -Value (@('@echo off', ('call "{0}" >nul' -f $environment.VcVarsPath), $compile, 'exit /b %errorlevel%') -join [Environment]::NewLine)
-    & $batch
-    if ($LASTEXITCODE -ne 0) { throw 'Owned MEM_IMAGE fixture compilation failed' }
+    try {
+        & $batch
+        if ($LASTEXITCODE -ne 0) { throw 'Owned MEM_IMAGE fixture compilation failed' }
+    } finally {
+        [IO.File]::Delete($object)
+    }
     & python (Join-Path $PSScriptRoot 'test-mapped-image-journal.py') --exe $program --dll $dll --fixtures $output
     if ($LASTEXITCODE -ne 0) { throw 'Owned MEM_IMAGE capture/archive/replay controls failed' }
     Write-Output "[image.capture.journal.validation] mapped_fixtures=$output"
