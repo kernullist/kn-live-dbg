@@ -593,6 +593,10 @@ Set `$requireWindowsPublisher` to `$true` to require a v2 source policy, or
 `$false` to allow v1. A signed v2 policy always enforces its Windows checks.
 Set `$catalog` to the retained catalog file for a catalog row and to `$null`
 for an embedded or v1 row. The reference and catalog each have a 64 MiB limit.
+Choose a new `$receiptPath` inside an initialized private store. The issuer
+emits one line of ASCII JSON followed by LF. PowerShell captures the line
+without its delimiter, so the example restores that byte before saving it.
+Record the resulting receipt digest in your independent case record.
 
 ```powershell
 $approvalOptions = @()
@@ -603,6 +607,10 @@ $receiptJson = & $python -B tools/provision-image-approval.py --publisher-refere
     --trusted-root-sha256 $trustedRootSha256 --verification-time $verificationTime --policy-target $policyTarget `
     --policy $sourcePolicy --manifest $manifest --reference $reference --out $selectedPolicy @approvalOptions
 if ($LASTEXITCODE -ne 0) { throw 'Image approval provisioning failed' }
+$receiptBytes = [Text.Encoding]::ASCII.GetBytes($receiptJson + [char]10)
+$file = [IO.File]::Open($receiptPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+try { $file.Write($receiptBytes, 0, $receiptBytes.Length) } finally { $file.Dispose() }
+$receiptSha256 = (Get-FileHash -LiteralPath $receiptPath -Algorithm SHA256).Hash.ToLowerInvariant()
 $receipt = $receiptJson | ConvertFrom-Json
 & $debugger --offline '!kmon' assess-image $capture $manifest $selectedPolicy $receipt.native_policy_sha256 /json
 if ($LASTEXITCODE -ne 0) { throw 'Image assessment failed' }
@@ -627,8 +635,9 @@ records the WinTrust status in hexadecimal when Windows performed the check.
 Use the top-level `provisioned` status and returned policy digest to continue
 to native assessment. Invalid arguments, an occupied destination and ordinary
 document I/O errors exit 2. The output file is created
-before its receipt is delivered. Preserve the signed source policy, reference
-envelope and any catalog to reproduce the publisher check. See the
+before its receipt is delivered. Keep the signed source policy, reference
+envelope, original receipt and any catalog for the
+[portable approval archive](#portable-publisher-approval-archives). See the
 [approval policy design](ARCHITECTURE.md#publisher-signed-image-approval-policies)
 and the [Windows publisher validation results](VALIDATION.md#windows-publisher-verification-for-retained-pe-files-on-2026-11-24).
 
@@ -677,6 +686,59 @@ Exit codes are 0 reproduced/reanalyzed, 1 unavailable, 2 invalid grammar and
 changes; success is not a clean-image or current-state claim. See
 [approved image collections](ARCHITECTURE.md#approved-image-collections) and
 [scoped collections](ARCHITECTURE.md#scoped-approved-image-collections).
+
+#### Portable publisher approval archives
+
+After `journal-image-approval` closes a collection, use `pack` to retain it
+with the evidence that authorized its native policy. Set `$collection` to
+the source store's `collections\<id>` directory. Set `$archivePath` to a
+new `.knapprovalarchive` filename directly inside an initialized private
+store. For replay, set `$privateWorkspace` to an initialized private store
+with at least the protection required by the archive. A store created with
+`!kmon init-store` requires EFS by default. Use `/acl-only` when that is
+the intended evidence protection.
+
+Use the same publisher, target and UTC instant as at issuance. Supply the
+original receipt digest from the case record and `$debuggerSha256` from
+the trusted installation. Set `$journalHeadSha256` to a separately recorded
+closure head, or `$null` to verify membership using the archived chain.
+The optional minimum root version also applies at replay.
+
+```powershell
+$archiveOptions = @('--debugger', $debugger, '--debugger-sha256', $debuggerSha256,
+    '--trusted-root-sha256', $trustedRootSha256, '--receipt-sha256', $receiptSha256,
+    '--policy-target', $policyTarget, '--verification-time', $verificationTime)
+if ($null -ne $minimumRootVersion) { $archiveOptions += @('--minimum-root-version', $minimumRootVersion) }
+if ($requireWindowsPublisher) { $archiveOptions += '--require-windows-publisher' }
+if ($journalHeadSha256) { $archiveOptions += @('--journal-head-sha256', $journalHeadSha256) }
+$catalogOption = @()
+if ($catalog) { $catalogOption += @('--catalog', $catalog) }
+$packedJson = & $python -B tools/archive-image-approval.py pack @archiveOptions --collection $collection `
+    --publisher-reference $publisherReference --policy $sourcePolicy --receipt $receiptPath --out $archivePath @catalogOption
+if ($LASTEXITCODE -ne 0) { throw 'Approval archive publication failed' }
+$archiveSha256 = ($packedJson | ConvertFrom-Json).archive_sha256
+```
+
+Record `$archiveSha256` independently at publication. On a recovery host,
+retrieve it and the other trust inputs from that record, and rebuild
+`$archiveOptions` as above. Replay only needs the archive, interpreter,
+trusted native executable and private workspace.
+
+```powershell
+$replayedJson = & $python -B tools/archive-image-approval.py replay @archiveOptions --archive $archivePath `
+    --archive-sha256 $archiveSha256 --private-workspace $privateWorkspace
+if ($LASTEXITCODE -ne 0) { throw 'Approval archive replay failed' }
+$replayedJson | ConvertFrom-Json | Select-Object status, original_assessment_reproduced,
+    original_windows_verification, current_windows_verification
+```
+
+Both operations return private JSON. Exit 0 reports `archived` or
+`reproduced`, 1 rejects the evidence or an I/O operation, and 2 indicates
+invalid arguments or an unsafe or unavailable output. For a Windows-signed
+policy, inspect the original and current Windows results individually.
+Historical reproduction can succeed when the current host cannot verify
+the signer. A failed current check supplies no present-day approval.
+See the [archive format and trust inputs](ARCHITECTURE.md#portable-publisher-approval-archives).
 
 `KnLiveDbg.exe --offline !kmon replay-image <directory|managed.kncapture> /json` reruns the recorded
 policy against either v1 or v2's retained artifact and ordered raw reads, including

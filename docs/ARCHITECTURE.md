@@ -3828,11 +3828,63 @@ the derived native policy. An independently recorded minimum root version
 lets the operator reject an older terminal revision. Both single-root and
 rotated references work with either source approval policy.
 
-Retain the original roots and release roles, source policy, independent trust
-configuration and private provisioning receipt alongside the native inputs.
-Discovering a newer revision, delegated targets and evidence of revocation
-between retained revisions remain open. See the
+The portable archive below binds the original roots and release roles, source
+policy and issuance receipt to one closed native collection. The operator
+keeps the trust configuration independently. Discovering a newer revision,
+delegated targets and evidence of revocation between retained revisions
+remain open. See the
 [publisher reference format](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release).
+
+### Portable publisher approval archives
+
+`tools/archive-image-approval.py` packages one direct or scoped approval
+after the native journal has committed its assessment and closure. The
+`.knapprovalarchive` file begins with `KNAPARC1`, a little-endian 32-bit
+EFS requirement (0 or 1), and seven little-endian 32-bit byte lengths. The
+seven records, in order, are the original native session, its two journal
+segments, the TUF envelope including any root rotations, the signed source
+policy, the exact successful provisioning receipt and the optional Windows
+catalog. Only the catalog may have length zero. The rest of the file holds
+the original journal members in ordinal path order. Both length and digest
+come from the segments. The reader admits only the native role names for
+this collection and checks every byte, including the final ledger. The
+448 MiB archive limit applies in addition to native per-role limits.
+
+For replay, the operator supplies the digests of the installed debugger,
+initial TUF root, original provisioning receipt and published archive from
+independently kept records. The operator also chooses the expected
+policy target, original UTC instant and any minimum terminal root version.
+An optional independently recorded journal head binds the collection to a
+specific prior observation. The reader reconstructs a fresh private store
+and checks both native journal membership and the original assessment at its
+recorded time. It verifies the TUF roles, derives the permitted native row
+again, compares its exact bytes and checks the fields of the original
+receipt. Source indexes and machine-specific privacy state are disposable.
+
+For a signed Windows row, the original receipt binds the verification window
+and the host's result to the independently retained receipt digest. Its
+recorded finish must precede or coincide with the native evaluation time.
+The journal identifies the selected native policy by digest. A separate
+case record identifies which issuance of that policy the operator preserved.
+Replay also asks Windows to check the archived PE and any catalog on the current
+host. A computed catalog member digest must match the original even when
+the current trust provider returns a failure. Reports expose the two
+verdicts individually. Historical chain stores, revocation cache contents,
+collector identity and the current state of the observed process are outside
+the archive's evidence. Current trust failure leaves the historical finding
+available with its original scope and comparison gaps.
+
+The archive contains private PE and read evidence. Publication uses a new
+file with a protected owner/SYSTEM ACL in an initialized private store. The
+writer holds it exclusively through validation, flush, final digest check
+and a same-directory rename that refuses to replace an existing file.
+An interrupted process can leave a private `.knapprovalarchive.pending-*`
+file before that rename and a private scratch directory during replay.
+The archive records the output store's EFS requirement. Packing and replay
+both reject a destination that would weaken the required encryption.
+Power-loss durability requires separate evidence.
+[Windows file rename semantics](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_rename_info)
+and [operator commands](COMMAND_REFERENCE.md#portable-publisher-approval-archives).
 
 ### Approved image collections
 

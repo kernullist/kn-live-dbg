@@ -144,6 +144,18 @@ class PublicContentTests(unittest.TestCase):
             self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", encoded)})
         self.assertFalse(AUDIT.inspect("unrelated.json", json.dumps(dict(ordinal=1, observed_bytes=8)).encode()))
 
+    def test_portable_approval_evidence(self):
+        for name in ("case.knapprovalarchive", ".knapprovalarchive.pending-owned"):
+            self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")
+        self.assertEqual(AUDIT.path_rule(".knapproval-replay-owned/raw.json"), "local-state-directory")
+        for data in (b"KNAPARC1", b"KNAPARC1" + bytes(100)):
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.dat", data)})
+        for row in (dict(schema="kn.image_approval_archive_result.v1"), dict(current_windows_verification=None),
+                    dict(original_windows_verification={}), dict(archive_requires_efs=True, journal_head_sha256="pin")):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("receipt\n" + json.dumps(row)).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+
     def test_saved_etl_comparison_archives_and_excerpts(self):
         self.assertEqual(AUDIT.path_rule(".knbench-etl-abc/summary.txt"), "local-state-directory")
         for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17), b"KNCORP1\0", b"KNCORP1\0" + bytes(12)):

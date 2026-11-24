@@ -13,6 +13,8 @@ import tempfile
 import unittest
 from unittest import mock
 
+from approval_archive_oracle import verify_archived_approval
+
 
 TOOLS = Path(__file__).resolve().parent
 CLI = TOOLS / "provision-image-approval.py"
@@ -24,6 +26,7 @@ AT = "20240201T000000Z"
 AT_TICKS = 133512192000000000  # 2024-02-01 UTC in Windows FILETIME.
 FUTURE = "18446744073709551615"
 native_exe, native_cases = None, []
+test_archive_efs = False
 embedded_sample, catalog_sample, signed_native_cases = None, None, []
 
 
@@ -86,6 +89,7 @@ class ApprovalFixture(unittest.TestCase):
         else:
             self.assertEqual(receipt["status"], "provisioned")
             self.assertEqual(receipt["native_policy_sha256"], sha(Path(overrides.get("out", self.out)).read_bytes()))
+            self.provision_bytes = result.stdout
         return receipt
 
 class ApprovalTests(ApprovalFixture):
@@ -302,6 +306,11 @@ class ApprovalTests(ApprovalFixture):
             self.assertTrue(report["reference_approved"])
             self.assertGreater(int(report["authorized_changed_bytes"]), 0)
             self.assertFalse(report["issuer_signature_verified"])
+            archive_case = (native_exe, capture, change, out, self.env, self.source, self.provision_bytes,
+                            self.root_pin, NAME, now.strftime("%Y%m%dT%H%M%SZ"))
+            verify_archived_approval(*archive_case, exercise_failures=(i == 0))
+            if i == 0 and test_archive_efs:
+                verify_archived_approval(*archive_case, require_efs=True)
             for other, other_change, _ in native_cases:
                 if change != other_change:
                     result = assess(other, other_change)
@@ -483,7 +492,8 @@ class WindowsApprovalTests(ApprovalFixture):
         for index, (kind, case, manifest) in enumerate(signed_native_cases):
             policy, opts = self.sample(kind)
             out = self.root / f"{kind}-{index}.knapproval"
-            receipt = self.call(0, **opts, **self.policy_for(policy, manifest=Path(manifest)), out=out)
+            selection = self.policy_for(policy, manifest=Path(manifest))
+            receipt = self.call(0, **opts, **selection, out=out)
             native = json.loads(out.read_bytes())
             self.assertEqual(native["schema"], "kn.image_approval_policy.v1")
             self.assertEqual(set(native["approvals"][0]), {"image_sha256", "manifest_sha256", "issuer"})
@@ -492,21 +502,28 @@ class WindowsApprovalTests(ApprovalFixture):
             report = json.loads(run.stdout)
             self.assertEqual((run.returncode, report["reference_approved"], report["issuer_signature_verified"]), (0, True, False))
             self.assertEqual(report["decision"], "no_observed_change")
+            verify_archived_approval(native_exe, Path(case), Path(manifest), out, self.env, self.source,
+                                     self.provision_bytes, self.root_pin, NAME, selection["verification_time"],
+                                     catalog=opts.get("catalog"))
 
 
 if __name__ == "__main__":
     options = argparse.ArgumentParser(add_help=False)
     options.add_argument("--native-exe", type=Path)
     options.add_argument("--native-case", type=Path, nargs=3, action="append", metavar=("CAPTURE", "MANIFEST", "REFERENCE"))
+    options.add_argument("--archive-efs", action="store_true", help="also exercise real NTFS EFS with the first native case")
     options.add_argument("--windows-embedded", nargs=2, metavar=("PE", "SIGNER_SHA256"))
     options.add_argument("--windows-catalog", nargs=3, metavar=("PE", "CATALOG", "SIGNER_SHA256"))
     options.add_argument("--windows-native-case", nargs=3, action="append", metavar=("KIND", "CAPTURE", "MANIFEST"))
     args, remaining = options.parse_known_args()
     if bool(args.native_exe) != bool(args.native_case or args.windows_native_case):
         options.error("provide the native binary and at least one case together")
+    if args.archive_efs and not args.native_case:
+        options.error("--archive-efs requires a native case")
     for kind, _, _ in args.windows_native_case or []:
         if kind not in ("embedded", "catalog") or not getattr(args, "windows_" + kind):
             options.error("each Windows native case needs the corresponding embedded or catalog fixture")
     native_exe, native_cases = args.native_exe, args.native_case or []
+    test_archive_efs = args.archive_efs
     embedded_sample, catalog_sample, signed_native_cases = args.windows_embedded, args.windows_catalog, args.windows_native_case or []
     unittest.main(argv=[sys.argv[0], *remaining])

@@ -15,7 +15,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -72,7 +72,7 @@ def alternatives(values) -> str:
 # Both engines match one lower-case path component. '$' alone also matches before a final newline.
 END_OF_NAME = r"(?![\s\S])"
 PRIVATE_DIRECTORY_NAME = "^" + alternatives(PRIVATE_DIRECTORIES) + END_OF_NAME
-PRIVATE_PARENT = re.compile(PRIVATE_DIRECTORY_NAME + r"|^\.knbench-etl-")
+PRIVATE_PARENT = re.compile(PRIVATE_DIRECTORY_NAME + r"|^\.knbench-etl-|^\.knapproval-replay-")
 PRIVATE_FILE_RULES = (
     ("local-state-directory", re.compile(PRIVATE_DIRECTORY_NAME)),
     ("private-operation-journal", re.compile(r"\.knmcpjournal" + END_OF_NAME + r"|\.knmcpjournal\.tmp\.")),
@@ -369,8 +369,8 @@ RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
                     "kn.image_approval_provision.v1",
-                    "kn.image_approval_policy.v2", "kn.image_approval_provision.v2")
-RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
+                    "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
+RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
                     '"truth_ref_sha256"', '"valid_key_ids"', '"signed_hashes"', '"native_policy_sha256"',
                     '"policy_target"', '"source_approval_count"', '"publisher_reference_sha256"', '"source_policy_sha256"',
@@ -379,6 +379,7 @@ RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"original_status"', '"original_files"', 
                     '"wintrust_status"', '"finished_utc"', '"root_updates"', '"root_rotation"', '"last_root_sha256"',
                     '"presented_updates"', '"verified_updates"', '"minimum_root_version"')
 RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
+    ("archive_requires_efs", "journal_head_sha256"), ("original_windows_verification",), ("current_windows_verification",),
     ("case_id", "original_status"), ("referenced_objects", "verified_objects"), ("missing_sha256",), ("original_files",),
     ("package_sha256", "results_sha256", "corpus_sha256"), ("package_sha256", "original_sha256", "original_bytes"),
     ("publisher_truth", "truth_reason"), ("trusted_root_sha256", "verification_time_utc"),
@@ -561,6 +562,9 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if bad_path:
         add(bad_path)
     # A partially written or renamed acquisition still contains private executable and process evidence.
+    if data.startswith(b"KNAPARC1"):
+        add("private-evidence-bundle")
+        return findings
     if data.startswith((b"KNETLBC1", b"KNCORP1\0")) or (data.startswith(b"PK\x03\x04") and data.startswith((b"owned-module-manifest.json", b"handoff-plan.json"), 30)):
         add("private-benchmark-package")
         return findings

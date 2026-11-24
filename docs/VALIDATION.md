@@ -7,6 +7,55 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Portable publisher approval archives on 2026-11-24
+
+Four existing closed collections were copied into disposable private stores.
+After each archive was created, an independent frame reader compared the
+session, both journal segments, every named member and all publisher records
+byte for byte with the source. The trial then removed its source store and
+working publisher files. A fresh process reproduced the complete original
+assessment from the archive, independently supplied pins and an empty private
+workspace. Each retained publisher chain ended at root version 3 after two
+rotations. The x64 Release executable was the same for issuance and replay.
+
+| Retained case | Archive bytes | Journal members including closure | Original assessment | Authorized changed bytes |
+| --- | ---: | ---: | --- | ---: |
+| CPython DLL with embedded signature | 7,018,617 | 6 | `no_observed_change` | 0 |
+| Windows DLL with retained catalog | 661,741 | 6 | `no_observed_change` | 0 |
+| Direct capture with a comparison gap | 137,931 | 6 | `incomplete_comparison` | 1 |
+| Temporal sweep across a slice boundary | 207,146 | 10 | `all_observed_changes_authorized` | 2 |
+
+Both Windows-signed cases preserved the original host result and passed a
+fresh cached signature check on this host. A simulated unavailable provider
+left the pinned original result available. A conflicting catalog member
+digest or a recorded Windows check later than the native evaluation caused
+rejection. Changing the source policy, closure dependencies, evidence bytes,
+receipt types, archive extent or operator pins also prevented reproduction.
+The four cases in the table used ACL-only stores. A separate direct case
+used NTFS EFS for source, publication and recovery. The published file and
+all 15 files present during extraction carried the Windows encrypted
+attribute. Both publication and replay rejected a downgrade to an ACL-only
+store. The provisioning suite accepts `--archive-efs` with a native case
+to repeat the encrypted round trip. Another host's trust store and physical
+power loss were outside this run.
+
+A competing writer received a Windows sharing violation while the temporary
+archive was open. When a different writer created the final name first, its
+bytes survived the publication attempt. Terminating the writer before rename
+left one private pending file and no final archive. The native privacy audit
+also checked the extracted evidence while replay was in progress.
+
+All 24 provisioning tests passed with the two Windows references, the direct
+and sweep cases, and individual direct and secondary-view slices. All 13
+publisher tests, 53 public-content tests and 3,083 native command checks
+passed. Both Windows PowerShell 5.1 and PowerShell 7.6 ran the documented
+issuance, pack and replay commands on all four cases in the table and each
+passed 280 release privacy checks. These observations concern retained
+evidence on current main. They establish neither collector authenticity nor
+the present state of the captured process.
+[Archive commands](COMMAND_REFERENCE.md#portable-publisher-approval-archives)
+and [archive format](ARCHITECTURE.md#portable-publisher-approval-archives).
+
 ## Replaying image recipes after fixture cleanup on 2026-11-24
 
 Each image publication trial runs its child in a fresh directory. After a

@@ -56,6 +56,9 @@
 *.knblob.pending-*
 *.knverify
 *.knverify.pending-*
+*.knapprovalarchive
+*.knapprovalarchive.pending-*
+.knapproval-replay-*/
 auth.json
 credentials.json
 id_rsa
