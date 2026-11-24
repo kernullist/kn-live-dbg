@@ -105,6 +105,10 @@ its digest. The [cross-collection retention budget](ARCHITECTURE.md#cross-collec
 protects a complete copy of each distinct set of original files, including
 failed acquisitions, and accounts for the named bytes of extra copies.
 
+P06 also covers interrupted publication at the 8 GiB user-minidump input
+limit. The reader holds the selected checkpoint while hashing it. Recovery
+checks that digest and the original inputs. [NTFS recovery trials](VALIDATION.md#sparse-minidump-recovery-at-8-gib)
+
 Implementation, integration, validation and deployment readiness are independent
 states. A package stays open when its required adapter, raw evidence, compatible
 environment or independent truth is missing. Preserve T01-T30 failure, negative,

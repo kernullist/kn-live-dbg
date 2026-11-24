@@ -1139,12 +1139,21 @@ partway through, supply just the original dump. Here `$pending` is the exact
 file selected for this operation and `$archive` is a new name in the same store.
 
 ```powershell
-$pendingPin = (Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash
+$fingerprint = python -B tools/archive-minidump-iat.py hash --input $pending | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $fingerprint.reason }
+$pendingPin = $fingerprint.sha256
 $readerOptions = @('--debugger', $exe, '--debugger-sha256', $readerPin, '--report-sha256', $reportPin)
 $resumed = python -B tools/archive-minidump-iat.py recover @readerOptions --pending $pending --pending-sha256 $pendingPin --out $archive --dump $dump | ConvertFrom-Json
 if ($LASTEXITCODE -ne 0) { throw $resumed.reason }
 $resumed | Select-Object status, retained_prefix_bytes, appended_bytes, archive_sha256, native_exit_code
 ```
+
+The `hash` command holds the selected local file and reports its logical byte
+count and SHA-256. It accepts a stopped checkpoint, a finished archive or a
+member up to the maximum archive extent. On a sparse file it includes every
+zero in the digest and reads the ranges Windows marks as allocated. Compare
+the result with an independently retained digest when one is available.
+An I/O failure includes the available operating-system error codes.
 
 Supply each incomplete member with `--report`, `--reference` or `--dump`.
 A complete pending file needs only the pins. If the 64-byte header is

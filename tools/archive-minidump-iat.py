@@ -19,7 +19,8 @@ from etl_reader_process import WindowsFiles, file_hash
 from owned_module_benchmark import check, encoded, sha
 from retained_corpus import CHUNK, OutputCollision
 from saved_etl_comparison import digest, local_path, outputs_safe, write_result
-from windows_private_archive import (check_archive_name, discard_private_copy, extend_sparse_file, held, native_result,
+from windows_private_archive import (SparseReader, check_archive_name, discard_private_copy, extend_sparse_file, held,
+                                     logical_hash, logical_reader, native_result,
                                      private_archive_stream, publish_archive, replay_directory, seal_archive,
                                      verified_protection, verify_pending_file)
 
@@ -60,7 +61,7 @@ def preserve_sparse(files, source, target, size, require_efs):
 
 def write_tail(target, block, sparse):
     # The caller writes strictly at EOF. Extend the logical prefix even when its final block is a hole.
-    if sparse and block and block[0] == 0 and block.count(0) == len(block):
+    if sparse and (block is SparseReader.zero or (block and block[0] == 0 and block.count(0) == len(block))):
         extend_sparse_file(target, target.tell() + len(block))
     else:
         check(target.write(block) == len(block), "incomplete original file transfer")
@@ -104,8 +105,9 @@ def reproduce(program, dump, pe, page, raw):
 
 def copy_original(source, output, length, expected, package_hash=None, *, sparse=False):
     actual = hashlib.sha256()
+    reader = logical_reader(source)
     while length:
-        block = source.read(min(length, CHUNK))
+        block = reader.read(min(length, CHUNK))
         check(block, "incomplete original file transfer")
         write_tail(output, block, sparse)
         actual.update(block)
@@ -135,7 +137,7 @@ def pack(args, files, program, protection):
         page = observation(raw, args.report_sha256)
         pins = [page["expected_reference_sha256"], page["expected_dump_sha256"]]
         for source, pin in zip(sources[1:], pins):
-            check(file_hash(source) == pin, "original member pin mismatch")
+            check(logical_hash(source) == pin, "original member pin mismatch")
             source.seek(0)
         code = reproduce(program, dump_path, pe_path, page, raw)
 
@@ -160,7 +162,7 @@ def extract_member(stack, files, path, source, size, pin, require_efs):
         sparse = preserve_sparse(files, source, output, size, require_efs)
         copy_original(source, output, size, pin, sparse=sparse)
     saved = stack.enter_context(held(files, path, share_directory_writes=True))
-    check(file_hash(saved) == pin, "replay file identity changed")
+    check(logical_hash(saved) == pin, "replay file identity changed")
     return saved
 
 
@@ -177,7 +179,8 @@ def replay(args, files, program, workspace, protection):
         # The extracted payloads must independently match their original pins on the second pass.
         archive_hash = hashlib.sha256(header)
         archive_hash.update(raw)
-        for block in iter(lambda: source.read(CHUNK), b""):
+        reader = logical_reader(source)
+        for block in iter(lambda: reader.read(CHUNK), b""):
             archive_hash.update(block)
         check(archive_hash.hexdigest() == args.archive_sha256, "archive pin mismatch")
         check(protection["efs_required"] or not (require_efs or encrypted(files, source)),
@@ -198,18 +201,20 @@ def verify_prefix_and_suffix(pending, retained, members):
     # Compute the final digest from the original members, independently of the pin on the pending file.
     archive_hash, position, suffix = hashlib.sha256(), 0, []
     pending.seek(0)
+    stored = logical_reader(pending)
     for stream, size, pin in members:
         stream.seek(0)
+        reader = logical_reader(stream)
         have = min(size, max(retained - position, 0))
         if have < size:
             suffix.append((stream, have, size - have))
         member_hash = hashlib.sha256()
         while size:
-            block = stream.read(min(CHUNK, size))
+            block = reader.read(min(CHUNK, size))
             check(block, "incomplete original file transfer")
             compare = min(len(block), max(retained - position, 0))
             if compare:
-                check(pending.read(compare) == block[:compare], "pending bytes differ from the original")
+                check(stored.read(compare) == block[:compare], "pending bytes differ from the original")
             member_hash.update(block)
             archive_hash.update(block)
             position += len(block)
@@ -222,8 +227,9 @@ def append_suffix(pending, retained, suffix, sparse):
     pending.seek(retained)
     for source, offset, size in suffix:
         source.seek(offset)
+        reader = logical_reader(source)
         while size:
-            block = source.read(min(size, CHUNK))
+            block = reader.read(min(size, CHUNK))
             check(block, "incomplete pending archive write")
             write_tail(pending, block, sparse)
             size -= len(block)
@@ -239,11 +245,12 @@ def verify_copy_prefix(stream, pending, start, size):
     check(copied <= size, "unexpected recovery copy extent")
     pending.seek(start)
     stream.seek(0)
+    source, copy = logical_reader(pending), logical_reader(stream)
     remaining = copied
     while remaining:
         count = min(CHUNK, remaining)
-        block = pending.read(count)
-        check(len(block) == count and stream.read(count) == block, "recovery copy differs from the retained member")
+        block = source.read(count)
+        check(len(block) == count and copy.read(count) == block, "recovery copy differs from the retained member")
         remaining -= count
     return copied
 
@@ -262,16 +269,17 @@ def recover_member(stack, files, protection, path, pending, start, size, pin, us
         stack.callback(cleanup, os.fstat(copy.fileno()))
         if use_copy:
             sparse = preserve_sparse(files, pending, copy, size, protection["efs_required"])
+            source = logical_reader(pending)
             remaining = size - copied
             while remaining:
-                block = pending.read(min(CHUNK, remaining))
+                block = source.read(min(CHUNK, remaining))
                 check(block, "incomplete private recovery copy")
                 write_tail(copy, block, sparse)
                 remaining -= len(block)
             copy.flush()
     if use_copy:
         saved = stack.enter_context(held(files, path, share_directory_writes=True))
-        check(file_hash(saved) == pin, "original member pin mismatch")
+        check(logical_hash(saved) == pin, "original member pin mismatch")
         return saved
 
 
@@ -288,7 +296,7 @@ def recover(args, files, program, workspace, protection):
     with private_archive_stream(files, path, protection) as pending, ExitStack() as stack:
         retained = os.fstat(pending.fileno()).st_size
         check(retained <= HEADER.size + REPORT_MAX + PE_MAX + DUMP_MAX, "invalid pending archive size")
-        check(file_hash(pending) == args.pending_sha256, "pending archive pin mismatch")
+        check(logical_hash(pending) == args.pending_sha256, "pending archive pin mismatch")
         paths = [local_path(v) if v is not None else None for v in (args.report, args.reference, args.dump)]
         check(all(p not in copy_paths for p in paths), "a recovery copy cannot be supplied as an original")
         originals = [stack.enter_context(held(files, p, share_directory_writes=True)) if p else None for p in paths]
@@ -377,6 +385,8 @@ def main(argv):
     writer = commands.add_parser("pack", allow_abbrev=False)
     reader = commands.add_parser("replay", allow_abbrev=False)
     recovery = commands.add_parser("recover", allow_abbrev=False, help="finish an interrupted private publication")
+    fingerprint = commands.add_parser("hash", allow_abbrev=False, help="hash the logical bytes of a local archive or member")
+    fingerprint.add_argument("--input", required=True, help="one local file within the maximum archive size")
     for op in (writer, reader, recovery):
         op.add_argument("--debugger", required=True, help="installed offline KnLiveDbg executable")
         op.add_argument("--debugger-sha256", required=True, help="independent digest of that executable")
@@ -396,6 +406,12 @@ def main(argv):
     report = dict(schema="kn.minidump_iat_archive.v1", operation=args.command, status="rejected")
     try:
         check(os.name == "nt", "minidump archive verification requires Windows")
+        if args.command == "hash":
+            with held(WindowsFiles(), local_path(args.input), share_directory_writes=True) as source:
+                size = os.fstat(source.fileno()).st_size
+                check(size <= HEADER.size + REPORT_MAX + PE_MAX + DUMP_MAX, "input exceeds the maximum archive extent")
+                report.update(status="hashed", input_bytes=str(size), sha256=logical_hash(source))
+                return write_result(encoded(report)) if safe_sinks(argv) else 2
         args.debugger_sha256 = digest(args.debugger_sha256.lower())
         args.report_sha256 = digest(args.report_sha256.lower())
         if args.command == "replay":
@@ -432,14 +448,15 @@ def main(argv):
     except (KeyError, AttributeError, TypeError, IndexError, RecursionError, struct.error, UnicodeError):
         report["reason"] = "invalid minidump archive or report structure"
     except OSError as exc:
-        report["reason"] = "archive I/O or native reader unavailable"
-        if args.command == "recover":
+        hashing = args.command == "hash"
+        report["reason"] = "could not read the selected input" if hashing else "archive I/O or native reader unavailable"
+        if hashing or args.command == "recover":
             if exc.errno is not None:
                 report["errno"] = exc.errno
             if getattr(exc, "winerror", None) is not None:
                 report["win32_error"] = exc.winerror
             if exc.errno == errno.ENOSPC or getattr(exc, "winerror", None) in (39, 112):
-                report["reason"] = "insufficient space for archive recovery"
+                report["reason"] = "insufficient space to hash the input" if hashing else "insufficient space for archive recovery"
     except subprocess.TimeoutExpired:
         report["reason"] = "native reader timed out" if args.command == "recover" else "archive I/O or native reader unavailable"
     except ValueError as exc:

@@ -2,6 +2,8 @@
 from contextlib import ExitStack, contextmanager
 import ctypes as c
 from ctypes import wintypes as w
+import hashlib
+import io
 import os
 import re
 import shutil
@@ -12,8 +14,91 @@ import uuid
 
 from etl_reader_process import file_hash
 from owned_module_benchmark import check
-from retained_corpus import OutputCollision
+from retained_corpus import CHUNK, OutputCollision
 from saved_etl_comparison import outputs_safe
+
+
+class SparseReader:
+    """Read logical bytes from one held local file during a single, read-only pass."""
+
+    zero = bytes(CHUNK)
+    window_bytes = 64 << 20
+
+    def __init__(self, stream, size):
+        import msvcrt
+        self.stream, self.size = stream, size
+        self.handle = msvcrt.get_osfhandle(stream.fileno())
+        self.query = c.WinDLL("kernel32", use_last_error=True).DeviceIoControl
+        self.query.argtypes = (w.HANDLE, w.DWORD, w.LPVOID, w.DWORD, w.LPVOID, w.DWORD, c.POINTER(w.DWORD), w.LPVOID)
+        self.query.restype = w.BOOL
+        self.start = self.end = 0
+        self.ranges = None
+
+    def allocated(self, start, end):
+        pair = c.c_int64 * 2  # FILE_ALLOCATED_RANGE_BUFFER
+        request, reply, used = pair(start, end - start), (pair * 128)(), w.DWORD()
+        if not self.query(self.handle, 0x940CF, c.byref(request), c.sizeof(request), reply, c.sizeof(reply),
+                          c.byref(used), None):  # FSCTL_QUERY_ALLOCATED_RANGES, including ERROR_MORE_DATA
+            return None
+        if used.value > c.sizeof(reply) or used.value % c.sizeof(pair):
+            return None
+        ranges, previous = [], 0
+        for offset, length in reply[:used.value // c.sizeof(pair)]:
+            stop = offset + length
+            if offset < previous or length <= 0 or stop > (1 << 63) - 1 or stop <= start or offset >= end:
+                return None
+            ranges.append((max(start, offset), min(stop, end)))
+            previous = stop
+        return ranges
+
+    def read(self, count):
+        start = self.stream.tell()
+        end = min(self.size, start + count)
+        if not 0 < count <= CHUNK or start >= end:
+            return self.stream.read(count)
+        if start < self.start or end > self.end:
+            self.start, self.end = start, min(self.size, start + self.window_bytes)
+            self.ranges = self.allocated(start, self.end)
+        if self.ranges is None:
+            return self.stream.read(count)
+        block = None
+        for first, last in self.ranges:
+            left, right = max(first, start), min(last, end)
+            if left >= right:
+                continue
+            if left == start and right == end:
+                return self.stream.read(end - start)
+            if block is None:
+                block = bytearray(end - start)
+            self.stream.seek(left)
+            data = self.stream.read(right - left)
+            check(len(data) == right - left, "incomplete allocated file range")
+            block[left - start:right - start] = data
+        self.stream.seek(end)
+        return self.zero[:end - start] if block is None else bytes(block)
+
+
+def logical_reader(stream):
+    try:
+        info = os.fstat(stream.fileno())
+    except io.UnsupportedOperation:  # In-memory archive header and report.
+        return stream
+    if info.st_size < CHUNK or not info.st_file_attributes & stat.FILE_ATTRIBUTE_SPARSE_FILE:
+        return stream
+    return SparseReader(stream, info.st_size)
+
+
+def logical_hash(stream):
+    reader = logical_reader(stream)
+    if reader is stream:
+        return file_hash(stream)
+    stream.seek(0)
+    digest = hashlib.sha256()
+    while stream.tell() < reader.size:
+        block = reader.read(CHUNK)
+        check(block, "incomplete file hash")
+        digest.update(block)
+    return digest.hexdigest()
 
 
 @contextmanager
@@ -190,7 +275,7 @@ def seal_archive(stream, destination, expected, *, before_rename=None):
     import msvcrt
     stream.flush()
     os.fsync(stream.fileno())
-    check(file_hash(stream) == expected, "sealed bytes differ from the verified archive")
+    check(logical_hash(stream) == expected, "sealed bytes differ from the verified archive")
     if before_rename is not None:
         before_rename()
     name = str(destination).encode("utf-16-le")

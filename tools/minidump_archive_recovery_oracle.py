@@ -101,6 +101,112 @@ def pin(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
+def check_sparse_inputs(workspace):
+    from retained_corpus import CHUNK
+    from unittest.mock import Mock, patch
+
+    cli = [sys.executable, "-B", CLI, "hash", "--input"]
+    with tempfile.TemporaryDirectory(dir=workspace, prefix="sparse-reads-") as folder:
+        folder = Path(folder)
+        system = Path(os.environ["SystemRoot"]) / "System32"
+        if folder.stat().st_file_attributes & stat.FILE_ATTRIBUTE_COMPRESSED:
+            subprocess.run([system / "compact.exe", "/u", folder], check=True, capture_output=True)
+        path = folder / "logical.bin"
+        data = bytearray(9 * CHUNK + 13)
+        markers = ((7, b"header"), (3 * CHUNK - 5, b"cross-boundary"), (len(data) - 4, b"tail"))
+        missing = subprocess.run([*cli, path], capture_output=True, timeout=20)
+        failure = json.loads(missing.stdout)
+        assert missing.returncode == 1 and failure["reason"] == "could not read the selected input" and failure["win32_error"] == 2
+        path.touch()
+        assert json.loads(subprocess.check_output([*cli, path]))["sha256"] == hashlib.sha256(b"").hexdigest()
+        command = runpy.run_path(str(CLI))["main"]
+        output = Mock(return_value=0)
+        with patch.dict(command.__globals__, logical_hash=Mock(side_effect=OSError(errno.ENOSPC, "volume full")), write_result=output):
+            assert command(["hash", "--input", str(path)]) == 1
+        failure = json.loads(output.call_args.args[0])
+        assert failure["errno"] == errno.ENOSPC and failure["reason"] == "insufficient space to hash the input"
+        subprocess.run([system / "fsutil.exe", "sparse", "setflag", path],
+                       check=True, capture_output=True)
+        with path.open("r+b") as stream:
+            publisher.extend_sparse_file(stream, len(data))
+            assert publisher.logical_hash(stream) == hashlib.sha256(data).hexdigest()
+            for offset, marker in markers:
+                data[offset:offset + len(marker)] = marker
+                stream.seek(offset)
+                stream.write(marker)
+        expected = hashlib.sha256(data).hexdigest()
+        assert pin(path) == expected
+
+        class CountedInput:
+            def __init__(self, stream):
+                self.stream = stream
+                self.material = 0
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def read(self, count):
+                actual = self.stream.read(count)
+                self.material += len(actual)
+                return actual
+
+        with path.open("rb", buffering=0) as stream:
+            counted = CountedInput(stream)
+            assert publisher.logical_hash(counted) == expected and 0 < counted.material < CHUNK
+            reader = publisher.logical_reader(counted)
+            for pos, length in ((3 * CHUNK - 3, 17), (CHUNK, 31), (len(data) - 4, 8), (1, 21)):
+                stream.seek(pos)
+                assert reader.read(length) == data[pos:pos + length]
+
+            def malformed(*args):
+                reply, used = args[4], ctypes.cast(args[6], ctypes.POINTER(wintypes.DWORD))
+                reply[0][0], reply[0][1], used[0] = 4, -1, 16
+                return True
+
+            def partial(*args):
+                reply, used = args[4], ctypes.cast(args[6], ctypes.POINTER(wintypes.DWORD))
+                reply[0][0], reply[0][1], used[0] = 0, 65536, 16
+                ctypes.set_last_error(234)  # ERROR_MORE_DATA can accompany valid rows.
+                return False
+
+            for query in (lambda *args: False, malformed, partial):
+                stream.seek(0)
+                fresh = publisher.logical_reader(counted)
+                before = counted.material
+                with patch.object(fresh, "query", query):
+                    assert fresh.read(CHUNK) == data[:CHUNK] and fresh.read(CHUNK) == data[CHUNK:2 * CHUNK]
+                assert counted.material - before == 2 * CHUNK
+        result = subprocess.run([*cli, path], capture_output=True, check=True)
+        assert json.loads(result.stdout) == dict(schema="kn.minidump_iat_archive.v1", operation="hash",
+                                                 status="hashed", input_bytes=str(len(data)), sha256=expected)
+        alias = path.with_name("sink")
+        os.link(path, alias)
+        for channel, args in (("stdout", [*cli, path]), ("stderr", [*cli[:-1], "--input=" + str(path), "--unknown"])):
+            with alias.open("ab") as sink:
+                assert subprocess.run(args, **{channel: sink}, timeout=20).returncode == 2
+        assert pin(path) == expected
+        alias.unlink()
+        with path.open("r+b") as writer:
+            rejected = subprocess.run([*cli, path], capture_output=True, timeout=20)
+            failure = json.loads(rejected.stdout)
+            assert rejected.returncode == 1 and failure["status"] == "rejected" and failure["win32_error"] == 32
+            writer.seek(CHUNK)
+            writer.write(b"x")
+        data[CHUNK] = ord("x")
+        assert json.loads(subprocess.check_output([*cli, path]))["sha256"] == hashlib.sha256(data).hexdigest()
+        with path.open("r+b") as stream:
+            publisher.extend_sparse_file(stream, 160 * (256 << 10))
+            for index in range(160):
+                stream.seek(index * (256 << 10) + 17)
+                stream.write(bytes([index + 1]))
+        assert json.loads(subprocess.check_output([*cli, path]))["sha256"] == pin(path)
+        with path.open("r+b") as stream:
+            publisher.extend_sparse_file(stream, (8 << 30) + (64 << 20) + (1 << 20) + FRAME.size + 1)
+        rejected = subprocess.run([*cli, path], capture_output=True, timeout=20)
+        assert rejected.returncode == 1 and json.loads(rejected.stdout)["reason"] == "input exceeds the maximum archive extent"
+    print("Verified sparse reads, ordinary SHA-256, material fallback, fresh allocation, hash input bounds and output aliases.", flush=True)
+
+
 def check_recovery(exe, originals, inputs, workspace, encrypted=None):
     exe = exe.resolve()
     reader = pin(exe)
@@ -405,6 +511,29 @@ def check_sparse_recovery(exe, originals, outer, *, size, retained):
         return p.stdout
 
     final_byte = b"Z" if size > 2 << 30 else b"\0"
+    # Construct the independent SHA-256 from the source fixture, known holes and distinct islands.
+    # An ordinary buffered hash of both multigigabyte files exhausted the validation volume.
+    zero = bytes(1 << 20)
+    islands = [(boundary - 9, f"across-{boundary}-boundary".encode()) for boundary in (2 << 30, 4 << 30) if boundary < size]
+    islands.append((size - 1, final_byte))
+    segments = [(0, (originals / "regular.dmp").read_bytes()), *islands]
+
+    def expected_hash(preamble, dump_bytes):
+        value = hashlib.sha256(preamble)
+        pos = 0
+        for offset, data in [*segments, (dump_bytes, b"")]:
+            gap = min(offset, dump_bytes) - pos
+            while gap > 0:
+                n = min(gap, len(zero))
+                value.update(zero[:n])
+                gap -= n
+            if offset >= dump_bytes:
+                break
+            included = data[:dump_bytes - offset]
+            value.update(included)
+            pos = offset + len(included)
+        return value.hexdigest()
+
     with tempfile.TemporaryDirectory(dir=outer, prefix="sparse-recovery-") as tmp:
         base = Path(tmp).resolve()
         system = Path(os.environ["SystemRoot"]) / "System32"
@@ -424,21 +553,25 @@ def check_sparse_recovery(exe, originals, outer, *, size, retained):
             publisher.extend_sparse_file(stream, size)
         run([system / "fsutil.exe", "sparse", "setrange", dump, source_size, size - source_size])
         with dump.open("r+b") as stream:
-            stream.seek(size - 1)
-            stream.write(final_byte)
+            for offset, data in islands:
+                stream.seek(offset)
+                stream.write(data)
             stream.flush()
             os.fsync(stream.fileno())
         allocation_limit = min(150 << 20, size)
         assert physical(dump) < allocation_limit
-        raw = run([*native, "dump-image-iat", dump, pin(dump), pe, pin(pe), "FixtureTick", "/declaration", "/json"])
+        cli = [sys.executable, "-B", CLI]
+        dump_pin = expected_hash(b"", size)
+        digest = json.loads(run([*cli, "hash", "--input", dump]))
+        assert digest["status"] == "hashed" and digest["sha256"] == dump_pin and int(digest["input_bytes"]) == size
+        raw = run([*native, "dump-image-iat", dump, dump_pin, pe, pin(pe), "FixtureTick", "/declaration", "/json"])
         assert json.loads(raw)["slot_value_observed"]
         report.write_bytes(raw)
         reader = pin(exe)
         header = FRAME.pack(b"KNMDIAT1", 0, len(raw), pe.stat().st_size, size, bytes.fromhex(reader))
-        expected = hashlib.sha256(header + raw + pe.read_bytes())
-        with dump.open("rb") as stream:
-            for block in iter(lambda: stream.read(1 << 20), b""):
-                expected.update(block)
+        preamble = header + raw + pe.read_bytes()
+        expected = expected_hash(preamble, size)
+        expected_prefix = expected_hash(preamble, retained - len(preamble))
         extent = len(header) + len(raw) + pe.stat().st_size + size
         common = ["--debugger", exe, "--debugger-sha256", reader, "--report-sha256", sha(raw)]
         pack = ["pack", *common, "--report", report, "--reference", pe, "--dump", dump, "--out", out]
@@ -450,18 +583,38 @@ def check_sparse_recovery(exe, originals, outer, *, size, retained):
         print(f"Interrupted at {retained} bytes for a {size}-byte dump.", flush=True)
         report.unlink()
         pe.unlink()
-        cli = [sys.executable, "-B", CLI]
-        recovered = json.loads(run([*cli, "recover", *common, "--pending", pending, "--pending-sha256", pin(pending),
-                                    "--out", out, "--dump", dump]))
-        assert recovered["archive_sha256"] == expected.hexdigest() and int(recovered["retained_prefix_bytes"]) == retained
+        pending_pin = json.loads(run([*cli, "hash", "--input", pending]))
+        assert pending_pin["sha256"] == expected_prefix and int(pending_pin["input_bytes"]) == retained
+        recovery = [*cli, "recover", *common, "--pending", pending, "--out", out, "--dump", dump, "--pending-sha256"]
+        if size == 8 << 30 and retained > (4 << 30) + 1:
+            offset = retained - 1
+            dump_offset = offset - len(preamble)
+            assert not any(pos <= dump_offset < pos + len(data) for pos, data in segments)
+            with pending.open("r+b", buffering=0) as altered:
+                altered.seek(offset)
+                altered.write(b"!")
+            assert json.loads(run([*recovery, expected_prefix], 1))["reason"] == "pending archive pin mismatch"
+            new_pin = json.loads(run([*cli, "hash", "--input", pending]))["sha256"]
+            assert new_pin != expected_prefix
+            assert json.loads(run([*recovery, new_pin], 1))["reason"] == "pending bytes differ from the original"
+            assert not out.exists() and os.path.samestat(previous, pending.stat()) and pending.stat().st_size == retained
+            with pending.open("r+b", buffering=0) as altered:
+                altered.seek(offset)
+                assert altered.read(1) == b"!"
+                altered.seek(offset)
+                altered.write(b"\0")
+            print("Rejected a changed byte above 4 GiB with both the original and the updated checkpoint digest.", flush=True)
+        recovered = json.loads(run([*recovery, expected_prefix]))
+        assert recovered["archive_sha256"] == expected and int(recovered["retained_prefix_bytes"]) == retained
         assert int(recovered["appended_bytes"]) == extent - retained and os.path.samestat(previous, out.stat())
         assert out.stat().st_size == extent
         assert physical(out) < allocation_limit, (physical(out), allocation_limit)
         assert not pending.exists()
         assert out.stat().st_file_attributes & stat.FILE_ATTRIBUTE_SPARSE_FILE
         with out.open("rb") as stream:
-            stream.seek(-1, 2)
-            assert stream.read() == final_byte
+            for offset, data in islands:
+                stream.seek(len(preamble) + offset)
+                assert stream.read(len(data)) == data
         with dump.open("r+b") as stream:
             publisher.extend_sparse_file(stream, (8 << 30) + 1)
         assert dump.stat().st_size == (8 << 30) + 1
@@ -472,10 +625,11 @@ def check_sparse_recovery(exe, originals, outer, *, size, retained):
         report.unlink()
         pe.unlink()
         dump.unlink()
-        replay = json.loads(run([*cli, "replay", *common, "--archive", out, "--archive-sha256", expected.hexdigest(),
+        replay = json.loads(run([*cli, "replay", *common, "--archive", out, "--archive-sha256", expected,
                                  "--private-workspace", store]))
         assert replay["observation"] == json.loads(raw) and {p.name for p in store.iterdir()} == {"store.knprivacy", out.name}
-        print(f"Verified {extent} archive bytes, {extent - retained} appended, final byte and original report.", flush=True)
+        print(f"Verified {extent} archive bytes, {extent - retained} appended, {len(islands)} boundary markers and original report. "
+              f"Archive allocation was {physical(out)} bytes.", flush=True)
         print("Rejected the 8 GiB + 1 input.", flush=True)
 
 

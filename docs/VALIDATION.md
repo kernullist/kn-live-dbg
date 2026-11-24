@@ -74,12 +74,45 @@ before publication.
 A larger run flushed 4,294,968,073 bytes before interruption. With about
 7.9 GiB available at the start, this host reported insufficient disk space
 when reading the sparse checkpoint for its digest. End-to-end recovery at
-that offset and for an entire 8 GiB input remains unverified. From an x64
-Native Tools prompt, use `--require-efs` to exercise encryption and
-`--large-recovery` for the optional NTFS size trials. Allow room for both
-the original and the archive on the volume used by `TEMP`. Physical
-power-loss recovery requires separate evidence.
+that size was subsequently exercised in the trials below.
 [Recovery command](COMMAND_REFERENCE.md#recover-an-interrupted-minidump-archive)
+
+### Sparse minidump recovery at 8 GiB
+
+On 2026-11-25 an ordinary buffered SHA-256 read failed with insufficient
+space on an 8,581,546,465-byte checkpoint even though the NTFS volume
+started with 16,049,340,416 bytes free. With the allocated-range reader,
+the publisher resumed at that offset and appended 8,395,809 bytes to the
+same file. The finished 8,589,942,274-byte archive occupied 32,768,000
+bytes on NTFS. After all three separate inputs were removed, replay
+reproduced the original native report.
+
+A second run stopped at 4,294,968,073 archive bytes. Changing the last
+retained byte invalidated the checkpoint digest. Supplying a digest of
+the altered file still failed the comparison with the original dump.
+After restoring the byte, recovery appended 4,294,974,201 bytes and the
+archive reproduced the report after source removal.
+
+The control included the original minidump bytes, distinct markers across
+the 2 and 4 GiB offsets and a nonzero final byte. An independent SHA-256
+calculation used those known bytes and the intervening zeros to check both
+the checkpoint and the complete archive. The native reader separately
+hashed the dump through ordinary file reads. A 40 MiB file with 160
+allocated ranges exceeded the reader's 128-row query capacity. The
+fallback matched a conventional SHA-256 of the entire file.
+
+With the existing owned fixtures, 155 archive checks and 246 interrupted
+recovery checks passed. The two earlier ACL and EFS archives reproduced
+their original reports, and all four publisher approval archives retained
+their exact bytes. Windows PowerShell 5.1 and PowerShell 7 ran the recovery
+example with a valid checkpoint and with the checkpoint already removed.
+
+Run `tools/test-minidump-iat-archive.py` from an x64 Native Tools prompt
+with `--exe`, `--require-efs` and `--large-recovery` to repeat the archive
+and NTFS size trials. The maximum-size runs used sparse inputs on ACL-only
+stores. The EFS tests used smaller files. The native verifier retains its
+30-second budget per hash pass. The interruption was a publisher process
+exit on a running host. Physical power loss remains untested.
 
 ## Portable user-minidump observations
 

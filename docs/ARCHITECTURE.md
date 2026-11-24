@@ -763,6 +763,15 @@ in temporary copies. The archive digest includes every logical byte through
 the end of the file. EFS stores keep their encrypted representation.
 [Windows sparse file operations](https://learn.microsoft.com/en-us/windows/win32/fileio/sparse-file-operations)
 
+For a held local sparse file, hashing, member transfers and prefix checks
+query the allocated ranges on the same handle. Each query covers up to
+64 MiB and accepts up to 128 ranges. The reader clips them to the requested bytes, reads
+their contents, and supplies zeros for gaps reported by the file system.
+A failed, incomplete or malformed range query falls back to ordinary reads
+for that window. Each pass obtains a fresh map, including the hash after the
+last flush and before rename. The native minidump reader also rechecks its
+original SHA-256 using ordinary reads. [Windows allocated-range semantics](https://learn.microsoft.com/en-us/windows/win32/api/winioctl/ni-winioctl-fsctl_query_allocated_ranges)
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a

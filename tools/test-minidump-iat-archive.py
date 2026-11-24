@@ -16,7 +16,7 @@ import sys
 import tempfile
 
 from etl_reader_process import WindowsFiles
-from minidump_archive_recovery_oracle import check_recovery, check_sparse_recovery
+from minidump_archive_recovery_oracle import check_recovery, check_sparse_inputs, check_sparse_recovery
 
 CLI = Path(__file__).with_name("archive-minidump-iat.py")
 FRAME = struct.Struct("<8sIIQQ32s")
@@ -257,6 +257,7 @@ def exercise(args, outer):
     check(pin(archive) == package_pin, "original archive preserved across altered controls")
     print(f"Passed {count} minidump archive checks and reproduced {len(saved)} original native reports after source removal.")
     check_recovery(exe, originals, inputs, work, secure if args.require_efs else None)
+    check_sparse_inputs(work)
     if args.large_recovery:
         for size, offset in ((64 << 20, 36 << 20), ((2 << 30) + (8 << 20), 2 << 30), (8 << 30, 4 << 30)):
             check_sparse_recovery(exe, originals, outer, size=size, retained=offset + 777)
