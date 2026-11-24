@@ -5,6 +5,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import shutil
@@ -79,6 +80,98 @@ def child(image, mode):
     finally:
         if not kernel.VirtualFree(base, 0, 0x8000):
             raise ctypes.WinError(ctypes.get_last_error())
+
+
+def check_capture_streams(exe, command, root, check):
+    from _winapi import CreateJunction
+
+    with tempfile.TemporaryDirectory(dir=root, prefix="delivery-") as working:
+        work = Path(working)
+        reference = work / "--allow-residency"
+        shutil.copyfile(command[3], reference)
+        case = work / "case"
+        shutil.copytree(command[7], case)
+        nested = case / "nested"
+        nested.mkdir()
+        subfile = nested / "original.bin"
+        subfile.write_bytes(b"owned prior evidence")
+        original = case / "recipe.knverify"
+        blob, = case.glob("*.knblob")
+        occupied = [*command]
+        occupied[3], occupied[7] = reference.name, case
+        missing = occupied.copy()
+        missing[1:3] = [4294967295, 1]
+
+        def call(args, output, stream):
+            handles = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            with output.open("ab", buffering=0) as out:
+                handles[stream] = out
+                return subprocess.run([str(exe), *map(str, args)], cwd=work, timeout=30, **handles)
+
+        def stamp(path):
+            return hashlib.sha256(path.read_bytes()).digest(), path.stat().st_mtime_ns
+
+        for source in (reference, original, blob, subfile):
+            alias = work / "outside.log"
+            os.link(source, alias)
+            try:
+                before = stamp(source)
+                for args, stream, expected in ((missing, "stdout", 2), ([*occupied, "extra"], "stderr", 2),
+                                               (["--mode", "offline", *occupied], "stdout", 5),
+                                               ([*occupied, "--mode=observe"], "stdout", 2)):
+                    outcome = call(args, alias, stream)
+                    check(outcome.returncode == expected and not outcome.stdout and not outcome.stderr,
+                          "unsafe redirected diagnostic returns its exit code without delivering bytes")
+                    check(stamp(source) == before, "original content and write time survive output through another name")
+            finally:
+                alias.unlink()
+
+        fresh = occupied.copy()
+        fresh[7] = work / "new-case"
+        before = stamp(reference)
+        check(call(fresh, reference, "stdout").returncode == 2 and not fresh[7].exists() and stamp(reference) == before,
+              "direct reference alias rejected before the live acquisition")
+        before = stamp(subfile)
+        check(call(occupied, subfile, "stdout").returncode == 2 and stamp(subfile) == before,
+              "single-name output inside an occupied case is protected")
+        junction = work / "outside-directory"
+        CreateJunction(str(nested), str(junction))
+        try:
+            check(call(occupied, junction / subfile.name, "stdout").returncode == 2 and stamp(subfile) == before,
+                  "a report opened through a junction into the occupied case cannot change the evidence")
+        finally:
+            junction.rmdir()
+        file_dest = missing.copy()
+        file_dest[7] = subfile
+        check(call(file_dest, subfile, "stdout").returncode == 2 and stamp(subfile) == before,
+              "a regular file at the requested case name is protected")
+        shifted = [command[0], original, "invalid"]
+        before = stamp(original)
+        check(call(shifted, original, "stderr").returncode == 2 and stamp(original) == before,
+              "misplaced filename in malformed input still protects the original")
+        check(call([*occupied, "extra", "operand"], original, "stderr").returncode == 2 and stamp(original) == before,
+              "excess operands cannot cause a disk usage message to overwrite a prior case")
+
+        report = work / "case-report.jsonl"
+        report.write_bytes(b"prior report\n")
+        other_name = work / "second-report-name"
+        os.link(report, other_name)
+        os.link(report, work / "third-report-name")
+        successful = call(fresh, other_name, "stdout")
+        lines = report.read_bytes().splitlines()
+        check(successful.returncode == 0 and lines[0] == b"prior report" and json.loads(lines[1])["original_claim_recorded"],
+              "distinct multi-link report appends the real capture result")
+        check((fresh[7] / "recipe.knverify").is_file(), "successful disk delivery published the original case")
+        rejected = call(missing, report, "stdout")
+        check(rejected.returncode == 1 and json.loads(report.read_bytes().splitlines()[-1])["status"] == "failed",
+              "separate disk report retains the acquisition failure for an occupied case")
+        usage = call([*occupied, "extra"], report, "stderr")
+        check(usage.returncode == 2 and report.read_bytes().splitlines()[-1].startswith(b"usage:"),
+              "malformed arguments can still deliver usage to a distinct disk file")
+        before = stamp(original)
+        unused = call(missing, original, "stderr")
+        check(unused.returncode == 1 and json.loads(unused.stdout)["status"] == "failed" and stamp(original) == before,
+              "a valid invocation protects the writing stream and preserves an unused stderr alias")
 
 
 def main():
@@ -189,6 +282,7 @@ def main():
                       "an existing case is never replaced")
                 undelivered = None
                 if mode == "clean":
+                    check_capture_streams(exe, command, root, check)
                     undelivered = root / "stdout-failed"
                     output_command = command.copy()
                     output_command[7] = undelivered

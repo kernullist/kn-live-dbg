@@ -2,6 +2,7 @@
 
 #include "SchemaArtifact.h"
 #include <cwctype>
+#include <memory>
 
 namespace symbol_artifacts
 {
@@ -50,8 +51,11 @@ namespace symbol_artifacts
 
     struct Directories
     {
-        std::vector<HANDLE> Values;
-        ~Directories() { for (const auto h : Values) { CloseHandle(h); } }
+        Directories() = default;
+        Directories(const Directories&) = delete;
+        Directories& operator=(const Directories&) = delete;
+        Directories(Directories&&) noexcept = default;
+        Directories& operator=(Directories&&) noexcept = default;
         // The caller supplies an approved directory name, including a volume-GUID
         // name obtained from a leased handle when the consumer must reopen by path.
         bool HoldExisting(const std::wstring& directory, DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE, DWORD* apiError = nullptr)
@@ -66,8 +70,8 @@ namespace symbol_artifacts
                 if (apiError) { *apiError = GetLastError(); }
                 return false;
             }
-            try { Values.push_back(h); }
-            catch (...) { CloseHandle(h); throw; }
+            std::unique_ptr<void, CloseDirectory> owned(h);
+            Values.push_back(std::move(owned));
             FILE_ATTRIBUTE_TAG_INFO info{};
             return GetFileInformationByHandleEx(h, FileAttributeTagInfo, &info, sizeof(info)) &&
                 (info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) && !(info.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
@@ -89,6 +93,9 @@ namespace symbol_artifacts
             }
             return true;
         }
+    private:
+        struct CloseDirectory { void operator()(void* h) const noexcept { CloseHandle(h); } };
+        std::vector<std::unique_ptr<void, CloseDirectory>> Values;
     };
 
     struct TemporaryFile

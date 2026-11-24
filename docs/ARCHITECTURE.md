@@ -3473,6 +3473,14 @@ projection before replay. Pending, abandoned, missing, overrun, cross-source or
 fallback receipts cannot become an executable recipe under this single-source
 format. A recorded failed or denied read remains a failed or denied parser input.
 
+When the live capture report goes to a disk handle, the collector compares
+Windows file IDs and pins the named input paths. If a case directory already
+exists, every name of a hard-linked output on the same volume must resolve
+outside it. The check runs before acquisition and again before delivery to
+account for paths created during capture. Malformed commands check the stream
+used for usage text. Restricted mode suppresses the disk diagnostic before it
+opens any named file. [Windows hard-link enumeration](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findnextfilenamew)
+
 The live CLI requests `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` and returns before driver,
 service, symbol or monitor initialization. It uses the Win32 user-address ceiling
 with an explicitly assumed legacy LA48 shape; it does not infer CR4.LA57. The

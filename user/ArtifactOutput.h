@@ -8,6 +8,8 @@
 class DistinctArtifactInput
 {
 public:
+    HANDLE PinnedHandle() const { return Input.get(); }
+
     bool Hold(HANDLE sink, const std::wstring& name, bool allowMissingParent = false)
     {
         if (name.empty()) { return true; }

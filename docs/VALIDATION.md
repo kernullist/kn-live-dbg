@@ -7,6 +7,32 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Live image capture output and original evidence on 2026-11-24
+
+At `3f71da0`, a failed capture appended 372 bytes to a disposable copy of
+Windows `version.dll` when stdout was a hard link to the copy. A usage error
+on stderr appended 158 bytes and a restricted launch on stdout appended 175.
+With the x64 Release fix, all three wrote zero bytes. The SHA-256 and last
+write time stayed the same. The exit codes were 2, 2 and 5 respectively.
+The test opened each output for append before starting the executable.
+
+The live image suite passed 224 checks with three owned child processes.
+These covered the reference PE, the saved recipe, its blob and a nested file
+in an existing case, including output opened through an outside hard link or
+a directory junction. A separate report with three hard links received the
+capture result, and a published case replayed after delivery to a read-only
+handle failed. All three children exited.
+
+The type layout suite passed 116 checks. Windows continued to deny delete
+access to a held directory after the list of handles grew and released it
+when the final owner went out of scope. The command suite passed 3,088 checks
+and the restricted-launch suite checked 90 results. Two existing signed trials
+replayed their original reports and reproduced 0 and 48 differing bytes.
+To repeat the live checks, use `tools/validate-image-recipe.ps1` to generate
+`owned-image.exe`. Pass its directory to `tools/test-live-image-recipe.py`
+with `--fixtures` and the Release CLI with `--exe`.
+[Direct image capture and replay](ARCHITECTURE.md#exact-image-reference-replay)
+
 ## Cross-collector native image comparison on 2026-11-24
 
 Two standard-user x64 Release trials each recorded two independent collectors

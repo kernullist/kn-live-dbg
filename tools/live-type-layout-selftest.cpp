@@ -75,12 +75,29 @@ namespace
             Check(!pin.Pin(root / L"junction", false), "reparse cache ancestor denied");
         }
         const auto empty = root / L"empty-cache";
+        const auto deleteAccess = [](const std::filesystem::path& path) -> DWORD {
+            const auto file = CreateFileW(path.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+            if (file == INVALID_HANDLE_VALUE) { return GetLastError(); }
+            CloseHandle(file);
+            return ERROR_SUCCESS;
+        };
         {
-            symbol_artifacts::Directories pin;
-            Check(pin.Pin(empty, true), "empty cache directory created and pinned");
+            std::vector<symbol_artifacts::Directories> pins(1);
+            Check(pins.front().Pin(empty, true), "empty cache directory created and pinned");
             Check(!MoveFileExW(empty.c_str(), (root / L"moved-empty-cache").c_str(), 0),
                 "directory itself denies rename before any child file exists");
+            pins.reserve(pins.capacity() + 1);
+            Check(deleteAccess(empty) == ERROR_SHARING_VIOLATION, "growing the lease list retains the directory pin");
+            symbol_artifacts::Directories owner;
+            const auto previous = root / L"previous-lease";
+            Check(owner.Pin(previous, true), "second directory pinned");
+            owner = std::move(pins.front());
+            pins.clear();
+            Check(deleteAccess(previous) == ERROR_SUCCESS && deleteAccess(empty) == ERROR_SHARING_VIOLATION,
+                "move assignment releases the old lease and retains the transferred lease");
         }
+        Check(deleteAccess(empty) == ERROR_SUCCESS, "directory delete access restored after the last lease");
         const auto temporary = directory / L"temporary.pdb";
         {
             symbol_artifacts::TemporaryFile file;

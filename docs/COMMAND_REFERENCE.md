@@ -487,13 +487,25 @@ captures the same direct comparison from a live process into a v3 case. PID,
 creation FILETIME and length are decimal; base and RVA are hexadecimal. The
 supplied generation must match the opened handle, and the caller needs process
 `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` access. `--allow-residency` is required because reads can affect page
-residency. The command always emits `kn.image_capture.v3` JSON and opens no driver
-or symbols. It records the original ordered read receipts, consent and Win32
-status/copy counts. It supports one AMD64 direct-image range of 1..4,096 bytes,
+residency. The `kn.image_capture.v3` JSON report records the original read
+receipts in order, the caller's consent, the Win32 status and the number of
+bytes copied. It supports one AMD64 direct-image range of 1..4,096 bytes,
 with a legacy LA48 assumption and the OS user ceiling recorded explicitly.
 It has no native fallback or background-monitor capture. Successful publication
-may still report an unverified or modified range. Exit 3 means stdout delivery
-failed; a case already published before that failure remains on disk.
+may still report an unverified or modified range. The command runs before
+driver or symbol initialization.
+
+Use a separate file or a pipe for the report. With an inherited disk handle,
+the command checks the writing stream against the reference and the requested
+case, including hard links to files inside an existing case. An unsafe or
+unverifiable destination returns exit 2 without writing to that stream.
+Malformed arguments receive the same check before usage goes to disk. If the
+command exceeds its nine-operand limit, usage goes only to a pipe or console.
+A restricted launch returns its policy exit code and suppresses the disk
+diagnostic. Exit 3 indicates delivery failed on an admitted output. A case
+published before a delivery failure remains available for replay. These checks
+cover writes made by the executable. A shell that truncates the destination
+before launch, or writes pipeline output itself, controls that file separately.
 
 V3 also retains `VirtualQueryEx` calls before and after each read and a final
 query of each distinct read range. `result.mapping` separates consistent

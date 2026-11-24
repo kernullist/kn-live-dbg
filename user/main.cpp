@@ -54120,7 +54120,8 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
             {
                 if (_wcsicmp(argv[i], L"--etl-profile") == 0 || _wcsicmp(argv[i], L"--etl-switches") == 0 ||
                     _wcsicmp(argv[i], L"--etl-disk-io") == 0 || _wcsicmp(argv[i], L"--etl-hard-faults") == 0 ||
-                    _wcsicmp(argv[i], L"--etl-rotation-set") == 0 || _wcsicmp(argv[i], L"--etl-image-lifetime") == 0) { return code; }
+                    _wcsicmp(argv[i], L"--etl-rotation-set") == 0 || _wcsicmp(argv[i], L"--etl-image-lifetime") == 0 ||
+                    _wcsicmp(argv[i], L"--verify-process-image") == 0) { return code; }
                 if (i + 1 < argc && (_wcsicmp(argv[i], capability_probes::SavedEtl.Selector) == 0 ||
                     _wcsicmp(argv[i], capability_probes::SavedDump.Selector) == 0 ||
                     (_wcsicmp(argv[i], L"dump-read") == 0 && _wcsicmp(argv[i - 1], L"!kmon") == 0))) { return code; }
