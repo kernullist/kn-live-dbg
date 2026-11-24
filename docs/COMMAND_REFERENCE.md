@@ -1044,7 +1044,9 @@ sections. A `waits_for_thread_termination` edge cites the blocked thread,
 the WCT thread-wait object and a distinct target thread with its own
 creation time. Both handle checks bracket the query. The capture pin
 identifies the original nodes and handle witnesses. Lock identities are
-local to that traversal. A `potential_wait_cycle` requires a Windows cycle flag and a
+local to that traversal. A `waits_for_message_receiver` edge identifies
+the sender and receiver generations in a synchronous window-message wait.
+Its `reply_status` remains `unobserved`. A `potential_wait_cycle` requires a Windows cycle flag and a
 closed chain of at least two distinct threads whose handles bracket the
 query. The report stops interpreting the chain at a foreign or unqualified
 thread. A single returned thread can also mean Windows could not observe
@@ -1096,8 +1098,9 @@ preserves the setup error and both traversal results.
 
 A corroborated round requires both views to close the same directed cycle
 through both chosen roots, with matching thread generations and dependency
-types. A target thread and a mutex owner have distinct roles in a mixed cycle. `repeated_groups` lists runs of consecutive corroborated rounds
-with the same cycle. Each interval between rounds must have a recorded wait
+types. In a mixed cycle, each arc identifies its target as a lock owner,
+message receiver or thread whose termination is awaited. `repeated_groups`
+lists consecutive corroborated rounds with the same cycle. Each interval between rounds must have a recorded wait
 timeout and a measured gap of at least the requested pause. Separate partial
 chains cannot close a cycle. `repeated_potential_wait_cycle` describes
 repeated observations of that configuration during the series. Earlier
@@ -1135,6 +1138,10 @@ The diagnosis compares the recorded explanations for the primary thread.
   includes `primary_waited_for_thread_termination`. Its facts identify the
   target thread in the original traversal. Establishing how the waiter
   woke requires its wait result and independent target-exit evidence.
+- `primary_waited_for_message_receiver` cites the original sender, message
+  object, receiver and handle checks. To establish how the wait ended, compare
+  the sender's return with the receiver's entry and reply. A receiver can keep
+  processing after calling `ReplyMessage`. [Windows message-wait evidence](ARCHITECTURE.md#windows-synchronous-message-waits)
 
 Each entry in `supporting_facts` and `counterevidence` is a zero-based
 index into `facts`. Each fact cites JSON pointers into the original file
@@ -1148,8 +1155,8 @@ malicious intent cannot be inferred from these observations alone.
 ### Check a proposed wait claim
 
 Use the saved WCT file and SHA-256 from the capture examples above. The first
-command returns a private `kn.wait_investigation.v1` report. The plan names
-six hypotheses and evaluates the recorded views within `--max-views` (0–16,
+command returns a private `kn.wait_investigation.v1` report. The default
+`kn.wait_claim_policy.v2` evaluates seven hypotheses within `--max-views` (0–16,
 default 16). Use `coverage` for the separate issued and unissued query counts.
 
 ```powershell
@@ -1169,16 +1176,20 @@ if ($null -ne $claim) {
 ```
 
 The example submits a claim only when replay found decisive witnesses. Supply
-a UTF-8 proposal of up to 32 KiB on standard input. It can contain up to six
-distinct claims, each with 1–32 distinct evidence IDs. The checker verifies each
-proposed `supported` or `refuted` verdict against the original file. It reports
+a UTF-8 proposal of up to 32 KiB on standard input. Its policy selects up to
+seven distinct claims in v2 or six in v1, each with 1–32 distinct evidence IDs.
+The checker verifies each proposed `supported` or `refuted` verdict against the original file. It reports
 the reason for each rejection, including a missing witness or a citation from
-another observation. A different file digest, target generation, policy, extra
-field or unknown claim makes the proposal invalid. No proposal field selects a
+another observation. An unexpected file digest or target generation, unsupported
+policy, extra field or unknown claim makes the proposal invalid. No proposal field selects a
 command, file or provider.
 
+Use `--investigate --policy kn.wait_claim_policy.v1` to reproduce an earlier
+investigation with its original cycle rules. `--check-claims` reads the policy
+from the saved proposal. An explicit `--policy` on that command must match it.
+
 Exit 0 means the plan was evaluated and every submitted claim passed. An
-investigation without proposals can finish with all six hypotheses inconclusive.
+investigation without proposals can finish with every hypothesis inconclusive.
 Exit 1 means the view budget was insufficient or a claim failed verification.
 Exit 2 indicates invalid input or an input/output file collision. Exit 3 indicates
 a report write failure. Keep captures, proposals and reports private.

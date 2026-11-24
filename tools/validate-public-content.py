@@ -205,14 +205,15 @@ IO_TIMING_FIELDS = tuple(frozenset(fields) for fields in (
     ("port_handle", "start", "ok"), ("port_open_line", "phase_line"), ("disputed_dequeue_lines", "packet_outcome"),
     ("joined_packets", "corroborated_results"),
 ))
-WAIT_PLAN_SCHEMAS = ("kn.wait_investigation.v1", "kn.wait_claim_proposal.v1")
+WAIT_PLAN_SCHEMAS = ("kn.wait_investigation.v1", "kn.wait_claim_proposal.v1", "kn.wait_message_fixture.v1")
 WAIT_PLAN_MARKERS = (*WAIT_PLAN_SCHEMAS, '"evidence_ids"', '"required_evidence_groups"', '"evaluated_views"', '"round"', '"process_created"',
-                     '"supporting_facts"', '"next_observation"')
+                     '"supporting_facts"', '"next_observation"', '"receiver_created"', '"handler_entry_tick"')
 WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
     ("id", "kind", "round", "evidence"), ("claim", "verdict", "evidence_ids"),
     ("claim", "verdict", "required_evidence_groups"), ("claim", "verdict", "supporting_facts"),
     ("claim", "proposed_verdict", "evidence_ids"), ("candidate", "unobserved", "next_observation"),
     ("evaluated_views", "required_views", "capture_bytes"), ("pid", "process_created", "tid", "thread_created"),
+    ("receiver_tid", "receiver_created"), ("send_return_tick", "handler_entry_tick", "handler_leave_tick"),
 ))
 DUMP_EVIDENCE_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
 ETL_COMPARISON_MARKERS = (*ETL_COMPARISON_SCHEMAS, '"retained_sha256"', '"before_sha256"', '"supported_descriptors"',

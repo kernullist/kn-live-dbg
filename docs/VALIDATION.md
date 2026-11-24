@@ -7,6 +7,44 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Synchronous window-message waits on 2026-11-24
+
+The x64 Release collector with SHA-256 prefix `46924bf4a363` captured two
+threads in an owned process with a message-only window. Five workloads
+produced 11 WCT receipts. Each workload supplied one sender traversal and a
+two-round series from both roots. A sixth single traversal sampled the sender
+after its send timed out. All reports were replayed after the fixture exited.
+
+| Workload | Independent Win32 observation | WCT result |
+| --- | --- | --- |
+| Synchronous send | The window procedure entered before capture. The sender received its result after release. | A message wait linked the sender and receiver generations. |
+| Posted message | The post had returned when the handler was sampled. `InSendMessageEx` returned zero. | The sender had no reported message wait. |
+| Early reply | The handler called `ReplyMessage` and stayed active. The sender received the early reply value. | The sender had no reported message wait. |
+| Send while holding a mutex | The receiver's zero-time wait on the sender's mutex timed out. Both threads finished after release. | Both root traversals reported the same directed message/mutex cycle. |
+| Send timeout | The send returned `ERROR_TIMEOUT` while the handler remained active. | The message edge was present before the timeout and absent in the later traversal. |
+
+The fixture recorded handler entry, handler exit and sender return ticks.
+These supplied an independent time window for every WCT query. The five
+message regression tests ran with optimized and runtime-checked x64 fixture
+builds. The 21 existing WCT tests passed. Explicit v1 replay produced
+byte-identical investigation output for 29 retained single or paired receipts
+compared with `3596913`. Twelve v1 proposals also produced identical
+verification output. Detached message records and receipts were checked by
+the publication scanner. The tests cover these process-local workloads on
+one Windows host. WCT alone supplies neither a message identifier nor a
+sender return value. [Windows WCT](https://learn.microsoft.com/en-us/windows/win32/debug/wait-chain-traversal)
+
+To repeat the test from an x64 Visual Studio developer PowerShell with a built
+collector, run these commands from the source checkout.
+
+```powershell
+$out = Join-Path '.build' ('wait-message-' + [guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $out | Out-Null
+cl.exe /nologo /std:c++17 /EHsc /W4 /WX /O2 "/Fo:$out\fixture.obj" "/Fe:$out\fixture.exe" tools\wait-message-fixture.cpp /link user32.lib
+if ($LASTEXITCODE -ne 0) { throw 'Window-message fixture build failed' }
+python -I -B tools/test-wait-messages.py --exe .\x64\Release\KnLiveDbg.exe --fixture "$out\fixture.exe"
+```
+
 ## Release privacy fixture cleanup on 2026-11-24
 
 At `70443b6`, a successful run of the packaging regression left 152 files

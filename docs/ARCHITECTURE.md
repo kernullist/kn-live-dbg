@@ -1433,10 +1433,28 @@ eventual exit and the wait call's final result require other evidence.
 A finite wait can expire after Windows reports a cycle.
 [Capture and replay a wait chain](COMMAND_REFERENCE.md#capture-a-windows-wait-chain)
 
+### Windows synchronous message waits
+
+The WCT replayer recognizes a blocked sender, an owned `WctSendMessageType`
+object and a distinct receiver in the same process. It requires a successful
+traversal and live handle checks around the query for both thread generations.
+The edge cites those checks and the three node positions. A mixed cycle can
+include a message receiver in one direction and a mutex owner in the other.
+Both root traversals must agree on each dependency's type and direction for
+corroboration. [Windows wait chain traversal](https://learn.microsoft.com/en-us/windows/win32/debug/wait-chain-traversal)
+
+This observation identifies the receiving thread during traversal. The window,
+message identifier, handler execution and outcome require separate evidence.
+For example, a receiver can call `ReplyMessage` and continue processing after
+the sender has returned. A timeout can also end the sender's wait.
+[InSendMessageEx](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-insendmessageex) and [SendMessageTimeoutW](https://learn.microsoft.com/en-us/windows/win32/api/winuser/nf-winuser-sendmessagetimeoutw)
+
 ### Evidence-checked wait investigations
 
-The offline WCT replayer evaluates six code-owned claims about the requested
-primary process and thread generations. It checks the SHA-256 of the original
+The offline WCT replayer evaluates seven claims about the requested primary
+process and thread generations under `kn.wait_claim_policy.v2`. The v1 policy
+retains its six claims and original cycle interpretation for archived proposals.
+The replayer checks the SHA-256 of the original
 file and counts its recorded root views before evaluating the graph. One
 single-root receipt costs one view. Each recorded paired round costs two,
 including a root whose query was never issued. The coverage ledger retains the

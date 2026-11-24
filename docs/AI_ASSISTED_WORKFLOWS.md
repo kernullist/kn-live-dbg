@@ -78,13 +78,17 @@ cannot turn an unread region into verified evidence.
 ## Check claims about a recorded wait
 
 The offline WCT investigation accepts claims from an analyst or a model. Give
-the checker the original capture and its SHA-256. `--investigate` returns the
-six claim names, the requested target identity and the evidence groups
-for each decisive verdict. `--check-claims` reads a typed proposal on standard
-input, replays the capture and returns a result for every submitted claim.
+the checker the original capture and its SHA-256. `--investigate` lists seven
+claims under the default v2 policy, the requested target identity and the
+evidence groups for each decisive verdict. An archived v1 proposal selects the
+original six claims and cycle rules when `--check-claims` reads it from
+standard input. The checker replays the capture and returns a result for each
+submitted claim.
 
-The policy distinguishes a reported cycle, an owned wait and a thread
-termination dependency. Refuting persistence of the first cycle requires evidence
+The v2 policy distinguishes a reported cycle, an owned lock wait, a thread
+termination wait and a synchronous message wait. The last claim identifies
+the receiving thread. Its reply and the sender's return require independent
+observations. Refuting persistence of the first cycle requires evidence
 of the cycle and of a corresponding exit. Unknown command fields, foreign
 evidence IDs and unsupported conclusions fail verification. The checker runs
 locally without calling the configured model or the interactive command

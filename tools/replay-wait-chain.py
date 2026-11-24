@@ -12,9 +12,9 @@ import sys
 DWORD = (1 << 32) - 1
 U64 = (1 << 64) - 1
 LIMIT = 16  # WCT_MAX_NODE_COUNT
-THREAD, THREAD_WAIT, BLOCKED, OWNED = 8, 6, 3, 6
+THREAD, THREAD_WAIT, SEND_MESSAGE, BLOCKED, OWNED = 8, 6, 2, 3, 6
 LOCKS = {1: "critical_section", 3: "mutex"}
-DEPENDENCIES = {**LOCKS, THREAD_WAIT: "thread_termination"}
+DEPENDENCIES = {**LOCKS, THREAD_WAIT: "thread_termination", SEND_MESSAGE: "synchronous_message"}
 PARTIAL = {234, 565}  # ERROR_MORE_DATA, ERROR_TOO_MANY_THREADS
 WAIT_TIMEOUT, WAIT_FAILED = 258, DWORD
 
@@ -149,7 +149,7 @@ def validate(c):
     return {p["requested"]: p for p in threads}
 
 
-def assess(c, digest):
+def assess(c, digest, *, message_waits=True):
     pins = validate(c)
     r, final = c["requested"], c["query"]
     nodes = [] if final is None else final["nodes"]
@@ -212,15 +212,18 @@ def assess(c, digest):
         if not waiter or nodes[i]["status"] != BLOCKED or object_node["status"] != OWNED:
             continue
         target = thread(nodes[i + 2]) if i + 2 < len(nodes) else None
-        if object_node["type"] == THREAD_WAIT:
+        if object_node["type"] == THREAD_WAIT or (message_waits and object_node["type"] == SEND_MESSAGE):
             if target and target != waiter:
-                report["edges"].append(dict(relation="waits_for_thread_termination", node_indices=[i, i + 1, i + 2],
-                                            thread_id=waiter[0], thread_created=waiter[1],
-                                            target_tid=target[0], target_created=target[1], wait_selection="unknown",
-                                            observation="/query",
-                                            evidence=[f"/query/nodes/{n}" for n in range(i, i + 3)] +
-                                                     ["/process", f"/threads/{pin_positions[waiter[0]]}",
-                                                      f"/threads/{pin_positions[target[0]]}"]))
+                if object_node["type"] == THREAD_WAIT:
+                    relation = "waits_for_thread_termination"
+                    endpoint = dict(target_tid=target[0], target_created=target[1], wait_selection="unknown")
+                else:
+                    relation = "waits_for_message_receiver"
+                    endpoint = dict(receiver_tid=target[0], receiver_created=target[1], reply_status="unobserved")
+                report["edges"].append(dict(relation=relation, node_indices=[i, i + 1, i + 2],
+                                            thread_id=waiter[0], thread_created=waiter[1], **endpoint,
+                                            observation="/query", evidence=[f"/query/nodes/{n}" for n in range(i, i + 3)] +
+                                            ["/process", f"/threads/{pin_positions[waiter[0]]}", f"/threads/{pin_positions[target[0]]}"]))
                 complete.add(i)
         elif object_node["type"] in LOCKS:
             semantics = LOCKS[object_node["type"]]
@@ -243,9 +246,13 @@ def assess(c, digest):
                 report["potential_cycle"] = dict(node_indices=list(range(first, last + 1)),
                                                  evidence="/query", distinct_threads=len(members))
                 report["conclusion"] = "potential_wait_cycle"
-                report["reason"] = ("wct_cycle_with_pinned_thread_termination_wait" if
-                                    any(nodes[i + 1]["type"] == THREAD_WAIT for i in segment) else
-                                    "wct_cycle_with_pinned_exclusive_lock_chain")
+                types = {nodes[i + 1]["type"] for i in segment}
+                if SEND_MESSAGE in types:
+                    report["reason"] = "wct_cycle_with_pinned_message_wait"
+                elif THREAD_WAIT in types:
+                    report["reason"] = "wct_cycle_with_pinned_thread_termination_wait"
+                else:
+                    report["reason"] = "wct_cycle_with_pinned_exclusive_lock_chain"
                 report["next_observation"] = "repeat_for_the_same_generations_or_collect_a_frozen_wait_snapshot"
                 return report
     if final["cycle"]:
@@ -292,16 +299,18 @@ def cycle_relations(ring):
         row = dict(waiter_tid=waiter, waiter_created=created)
         if semantics == "thread_termination":
             row.update(wait_semantics=semantics, target_tid=target, target_created=target_created)
+        elif semantics == "synchronous_message":
+            row.update(wait_semantics=semantics, receiver_tid=target, receiver_created=target_created)
         else:
             row.update(lock_semantics=semantics, owner_tid=target, owner_created=target_created)
         relations.append(row)
     return relations
 
 
-def series_view(view, digest, base):
+def series_view(view, digest, base, *, message_waits):
     fields(view, "timing receipt")
     c, timing = view["receipt"], view["timing"]
-    a = assess(c, digest)
+    a = assess(c, digest, message_waits=message_waits)
     check((timing is not None) == (c["query"] is not None), "timing without its traversal")
     if timing is not None:
         fields(timing, "reader_tid begin end")
@@ -401,7 +410,7 @@ class SeriesLifetimes:
             self.terminated.add(key)
 
 
-def series(c, digest):
+def series(c, digest, *, message_waits=True):
     fields(c, "schema planned_rounds pause_ms collector qpc_hz rounds")
     total, delay = uint(c["planned_rounds"], 8), uint(c["pause_ms"], 5000)
     check(total >= 2 and delay and type(c["rounds"]) is list and 1 <= len(c["rounds"]) <= total, "invalid series plan")
@@ -426,7 +435,7 @@ def series(c, digest):
         views, rings = [], []
         receipts = []
         for vi, v in enumerate(r["views"]):
-            view, ring = series_view(v, digest, f"/rounds/{ri}/views/{vi}/receipt")
+            view, ring = series_view(v, digest, f"/rounds/{ri}/views/{vi}/receipt", message_waits=message_waits)
             views.append(view)
             rings.append(ring)
             receipts.append(v["receipt"])
@@ -588,7 +597,7 @@ def diagnose(capture, assessment):
     primary = rounds[0][0][0]["requested"]
     primary_key = (primary["tid"], primary["thread_created"])
     facts, open_waits, closed_views, gaps = [], [], [], []
-    termination_waits = []
+    termination_waits, message_waits = [], []
     reference_support, different_cycles = [], []
     reference = None
     first_round = None
@@ -602,13 +611,17 @@ def diagnose(capture, assessment):
         for c, a, base in views:
             q = c["query"]
             issued += q is not None
-            primary_targets = [e for e in a["edges"] if e["relation"] == "waits_for_thread_termination"
+            primary_targets = [e for e in a["edges"]
+                               if e["relation"] in ("waits_for_thread_termination", "waits_for_message_receiver")
                                and (e["thread_id"], e["thread_created"]) == primary_key]
             for dependency in primary_targets:
-                termination_waits.append(fact("thread_termination_wait_observed", index,
-                                              [base + "/query", *dependency["evidence"]],
-                                              target_tid=dependency["target_tid"],
-                                              target_created=dependency["target_created"]))
+                evidence = [base + "/query", *dependency["evidence"]]
+                if dependency["relation"] == "waits_for_message_receiver":
+                    message_waits.append(fact("synchronous_message_wait_observed", index, evidence,
+                                              receiver_tid=dependency["receiver_tid"], receiver_created=dependency["receiver_created"]))
+                else:
+                    termination_waits.append(fact("thread_termination_wait_observed", index, evidence,
+                                                  target_tid=dependency["target_tid"], target_created=dependency["target_created"]))
             cycle = a["potential_cycle"]
             ring = cycle_signature(c, cycle)
             if ring and any((arc[0], arc[1]) == primary_key for arc in ring):
@@ -685,17 +698,27 @@ def diagnose(capture, assessment):
                          next_observation="record_owner_progress_and_wait_completion_or_timeout")],
                 deadlock_established=False, cause_of_hang_established=False, intent_assessed=False,
                 whole_host_assessed=False, collector_authenticated=False)
-    if reference and any(arc[2] == "thread_termination" for arc in reference):
+    if reference:
+        semantics = {arc[2] for arc in reference}
         unknown = report["candidates"][0]["unobserved"]
-        if all(arc[2] == "thread_termination" for arc in reference):
+        if not semantics.intersection(LOCKS.values()):
             unknown.remove("lock_lifetimes")
-        unknown.append("thread_wait_completion")
+        if "thread_termination" in semantics:
+            unknown.append("thread_wait_completion")
+        if "synchronous_message" in semantics:
+            unknown.append("message_reply_or_timeout")
     if termination_waits:
         report["candidates"].append(dict(candidate="primary_waited_for_thread_termination",
                                          status="dependency_observed", supporting_facts=termination_waits,
                                          counterevidence=[], unobserved=["wait_completion", "alternative_wait_objects", "timeout_or_cancellation",
                                                                         "target_exit_as_cause_of_wakeup"],
                                          next_observation="record_the_wait_result_and_target_thread_exit"))
+    if message_waits:
+        report["candidates"].append(dict(candidate="primary_waited_for_message_receiver",
+                                         status="dependency_observed", supporting_facts=message_waits,
+                                         counterevidence=[], unobserved=["window_and_message_identity", "handler_execution",
+                                                                       "reply_or_timeout", "sender_return"],
+                                         next_observation="compare_receiver_entry_and_reply_with_the_sender_return"))
     return report
 
 
@@ -709,6 +732,7 @@ THREAD_WAIT_FACT = "thread_termination_wait_observed"
 EXITS = ("process_termination_observed", "cycle_member_termination_observed")
 OBSERVED_CYCLES = (CYCLE, OTHER_CYCLE)
 INVESTIGATION_POLICY = "kn.wait_claim_policy.v1"
+MESSAGE_POLICY = "kn.wait_claim_policy.v2"
 SINGLE_CAPTURE_LIMIT = 64 * 1024
 CAPTURE_LIMIT = 512 * 1024
 PROPOSAL_LIMIT = 32 * 1024
@@ -724,7 +748,10 @@ WAIT_CLAIMS = (
     ("reference_cycle_persisted_to_end_of_capture", (CYCLE, REPEATED), (OTHER_CYCLE, *EXITS), (), ((CYCLE,), EXITS)),
     ("primary_contention_without_a_reported_cycle_throughout_capture", (OPEN_WAIT,), OBSERVED_CYCLES, (), (OBSERVED_CYCLES,)),
 )
-CLAIM_NAMES = tuple(row[0] for row in WAIT_CLAIMS)
+MESSAGE_FACT = "synchronous_message_wait_observed"
+CLAIM_POLICIES = {INVESTIGATION_POLICY: WAIT_CLAIMS, MESSAGE_POLICY: WAIT_CLAIMS + (
+    ("primary_waited_for_message_receiver", (MESSAGE_FACT,), (), ((MESSAGE_FACT,),), ()),
+)}
 
 
 def original_value(capture, pointer):
@@ -754,12 +781,12 @@ def bound_facts(capture, diagnosis):
     return facts
 
 
-def wait_hypotheses(facts):
+def wait_hypotheses(facts, claims):
     def matches(kinds):
         return [f["id"] for f in facts if f["kind"] in kinds]
 
     hypotheses = []
-    for name, supporting, counter, positive, negative in WAIT_CLAIMS:
+    for name, supporting, counter, positive, negative in claims:
         verdict, required = "inconclusive", []
         for outcome, groups in (("supported", positive), ("refuted", negative)):
             witnesses = [matches(group) for group in groups]
@@ -771,19 +798,19 @@ def wait_hypotheses(facts):
     return hypotheses
 
 
-def proposal_rows(proposal, digest):
+def proposal_rows(proposal, digest, policy, claim_names):
     fields(proposal, "schema policy receipt_sha256 target claims", "proposal")
-    check(proposal["schema"] == "kn.wait_claim_proposal.v1" and proposal["policy"] == INVESTIGATION_POLICY,
+    check(proposal["schema"] == "kn.wait_claim_proposal.v1" and proposal["policy"] == policy,
           "unsupported wait proposal schema or policy")
     check(proposal["receipt_sha256"] == digest, "proposal is outside the pinned capture")
     requested_generation(proposal["target"], "proposal target")
     rows = proposal["claims"]
-    check(type(rows) is list and 1 <= len(rows) <= len(WAIT_CLAIMS), "invalid proposed claim count")
+    check(type(rows) is list and 1 <= len(rows) <= len(claim_names), "invalid proposed claim count")
     seen = set()
     for row in rows:
         fields(row, "claim verdict evidence_ids", "claim")
         name, ids = row["claim"], row["evidence_ids"]
-        check(name in CLAIM_NAMES and name not in seen and row["verdict"] in ("supported", "refuted"), "invalid proposed claim")
+        check(name in claim_names and name not in seen and row["verdict"] in ("supported", "refuted"), "invalid proposed claim")
         seen.add(name)
         check(type(ids) is list and 1 <= len(ids) <= MAX_CITATIONS and
               all(type(i) is str and re.fullmatch(r"[0-9a-f]{64}", i) for i in ids) and len(set(ids)) == len(ids),
@@ -822,9 +849,14 @@ def recorded_view_count(capture):
     return 2 * len(rounds)
 
 
-def investigate(capture, digest, size, view_budget, proposal, proposal_sha256):
+def investigate(capture, digest, size, view_budget, proposal, proposal_sha256, policy=None):
     required = recorded_view_count(capture)
-    rows = proposal_rows(proposal, digest) if proposal is not None else []
+    if policy is None:
+        policy = proposal.get("policy") if proposal is not None else MESSAGE_POLICY
+    check(type(policy) is str and policy in CLAIM_POLICIES, "unsupported wait investigation policy")
+    claims = CLAIM_POLICIES[policy]
+    claim_names = [row[0] for row in claims]
+    rows = proposal_rows(proposal, digest, policy, claim_names) if proposal is not None else []
     target_pointer = "/rounds/0/views/0/receipt/requested" if capture["schema"] == "kn.wait_series.v1" else "/requested"
     target = original_value(capture, target_pointer)
     requested_generation(target)
@@ -832,20 +864,20 @@ def investigate(capture, digest, size, view_budget, proposal, proposal_sha256):
         check(proposal["target"] == target, "proposal targets another process or thread generation")
     limit = SINGLE_CAPTURE_LIMIT if capture["schema"] == "kn.wait_chain.v1" else CAPTURE_LIMIT
     plan = dict(goal="check_competing_wait_explanations_for_the_primary_thread", allowed_source=capture["schema"],
-                operation="replay_retained_wct", hypotheses=list(CLAIM_NAMES),
+                operation="replay_retained_wct", hypotheses=claim_names,
                 stop_conditions=["view_budget_exceeded", "pinned_source_exhausted", "proposal_not_verified"], max_capture_bytes=limit,
-                max_views=view_budget, max_claims=len(WAIT_CLAIMS), max_evidence_ids_per_claim=MAX_CITATIONS,
+                max_views=view_budget, max_claims=len(claims), max_evidence_ids_per_claim=MAX_CITATIONS,
                 max_proposal_bytes=PROPOSAL_LIMIT, capture_bytes=size, required_views=required, evaluated_views=0)
-    report = dict(schema="kn.wait_investigation.v1", policy=INVESTIGATION_POLICY, receipt_sha256=digest,
+    report = dict(schema="kn.wait_investigation.v1", policy=policy, receipt_sha256=digest,
                   plan=plan, target=None, target_evidence=None, proposal_sha256=proposal_sha256, facts=[], hypotheses=[], coverage=None, unclassified_views=[],
                   missing_observations=[], proposal_checks=[], status="deferred", stop_reason="view_budget_exceeded",
                   collector_authenticated=False, deadlock_established=False, cause_of_hang_established=False)
     if required > view_budget:
         return report
-    diagnosis = diagnose(capture, assessment_for(capture, digest))
+    diagnosis = diagnose(capture, assessment_for(capture, digest, message_waits=policy == MESSAGE_POLICY))
     check(target == diagnosis["primary"], "unresolved primary identity")
     facts = bound_facts(capture, diagnosis)
-    hypotheses = wait_hypotheses(facts)
+    hypotheses = wait_hypotheses(facts, claims)
     checks = check_proposed(rows, hypotheses)
     rejected = any(row["result"] != "verified" for row in checks)
     report.update(target=target, target_evidence=target_pointer, facts=facts, hypotheses=hypotheses, coverage=diagnosis["coverage"],
@@ -873,8 +905,9 @@ def read_capture(stream, digest):
     return capture, len(raw)
 
 
-def assessment_for(capture, digest):
-    return series(capture, digest) if type(capture) is dict and capture.get("schema") == "kn.wait_series.v1" else assess(capture, digest)
+def assessment_for(capture, digest, *, message_waits=True):
+    evaluate = series if type(capture) is dict and capture.get("schema") == "kn.wait_series.v1" else assess
+    return evaluate(capture, digest, message_waits=message_waits)
 
 
 def replay_stream(stream, digest, explain):
@@ -951,7 +984,7 @@ def run_investigation(args):
             proposal = json.loads(data.decode("utf-8-sig"), object_pairs_hook=unique_object)
             check(type(proposal) is dict, "expected a typed claim proposal")
             proposal_sha = hashlib.sha256(data).hexdigest()
-        report = investigate(capture, args.sha256, size, budget, proposal, proposal_sha)
+        report = investigate(capture, args.sha256, size, budget, proposal, proposal_sha, args.policy)
         payload = memoryview((json.dumps(report, separators=(",", ":"), allow_nan=False) + "\n").encode("ascii"))
         try:
             while payload:
@@ -973,11 +1006,12 @@ def main():
     modes.add_argument("--investigate", action="store_true", help="evaluate bounded wait claims and emit their original evidence IDs")
     modes.add_argument("--check-claims", action="store_true", help="verify a typed claim proposal from standard input")
     parser.add_argument("--max-views", type=int, help="maximum recorded root views to evaluate, from 0 to 16")
+    parser.add_argument("--policy", choices=tuple(CLAIM_POLICIES), help="wait investigation policy to apply or require")
     args = parser.parse_args()
     try:
         if args.investigate or args.check_claims:
             return run_investigation(args)
-        check(args.max_views is None, "view budget requires an investigation")
+        check(args.max_views is None and args.policy is None, "view budget and policy require an investigation")
         with args.capture.open("rb") as stream:
             if aliases_sink(regular_identity(stream)):
                 return 2

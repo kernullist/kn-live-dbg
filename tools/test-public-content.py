@@ -636,6 +636,14 @@ class PublicContentTests(unittest.TestCase):
                 self.assertTrue(AUDIT.inspect("renamed.log", ("banner\n" + json.dumps([obj])[:-1]).encode(encoding)))
         self.assertFalse(AUDIT.inspect("manual.md", b"Use kn.wait_investigation.v1 to check evidence_ids."))
 
+    def test_window_message_wait_exports(self):
+        for row in (dict(schema="kn.wait_message_fixture.v1"), dict(receiver_tid=17, receiver_created="20"),
+                    dict(send_return_tick=200, handler_entry_tick=100, handler_leave_tick=200)):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                data = ("log\n" + json.dumps(dict(entries=[row]))[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"The receiver_created field identifies a recorded thread generation."))
+
     def test_saved_dump_probe_exports(self):
         scope = dict(schema="kn.capabilities.v1", target_probed=False, scope="saved_dump_probe")
         metadata = dict(status="header_digest_mismatch", schema="kn.dump_capability_probe.v1")
