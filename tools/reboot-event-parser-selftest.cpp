@@ -93,6 +93,98 @@ namespace
         Check(history.Hypothesis().find(L"forward_and_backward_steps_observed") != std::wstring::npos, "both directions retained");
     }
 
+    void CheckBootWindow()
+    {
+        const std::wstring xml = L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+            L"<Provider Name='Microsoft-Windows-Kernel-General' Guid='{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d}'/>"
+            L"<EventID>12</EventID><Version>0</Version><TimeCreated SystemTime='2024-02-29T12:00:01Z'/>"
+            L"<EventRecordID>5</EventRecordID><Channel>System</Channel></System><EventData>";
+        const std::wstring field = L"<Data Name='StartTime'>2024-02-29T12:00:00.0000001Z</Data>";
+        RebootBootStart start;
+        start.recordId = 5; start.version = 0;
+        auto parse = [&](const std::wstring& fields) {
+            const auto input = xml + fields + L"</EventData></Event>";
+            return DecodeRebootBootStart(reinterpret_cast<const BYTE*>(input.data()),
+                static_cast<UINT>(input.size() * sizeof(wchar_t)), start);
+        };
+        Check(!parse(field) && start.xmlTime == 133536816000000001ull, "named OS start, distinct from event write time");
+        Check(!start.Qualified(), "XML alone cannot qualify a start");
+        Check(std::wstring(parse(field + field)) == L"ambiguous_event_fields" && !start.xmlTime, "duplicate start");
+        Check(std::wstring(parse(L"<Data Name='StopTime'>2024-02-29T12:00:00Z</Data>")) == L"start_time_invalid", "wrong field");
+        Check(std::wstring(parse(L"<Data Name='StartTime'>2024-02-29T12:00:00.123456789Z</Data>")) == L"start_time_invalid",
+            "unrepresentable start");
+        start.version = 1;
+        Check(std::wstring(parse(field)) == L"unsupported_event_template", "unknown typed start version");
+        start.version = 0; start.recordId = 6;
+        Check(std::wstring(parse(field)) == L"record_id_mismatch", "cross-record start");
+
+        RebootClockHistory history{1, 10};
+        history.status = L"partial_saved_window";
+        auto& b = history.boots.emplace();
+        for (uint64_t id = 2; id <= history.last; ++id) { b.ObserveRecord(id, id != 3); }
+        Check(b.contiguousFrom == 4 && b.lastRead == 10, "classified suffix after gap and foreign row");
+        b.previousStart = RebootBootStart{5, 0, 100, 100, {}, L"observed"};
+        b.receivingStart = RebootBootStart{8, 0, 200, 200, {}, L"observed"};
+        RebootEventComparison event;
+        event.recordId = 10; event.dumpQualified = true; event.xmlFileTime = event.typedFileTime = 205;
+        RebootTimeline timeline;
+        timeline.estimatedBoot = RebootTimeline::Bounds{99, 100};
+        auto compare = [&] { return CompareRebootBootWindow(history, timeline, event); };
+        auto has = [&](const wchar_t* text) { return compare().report.find(text) != std::wstring::npos; };
+        auto position = [&](int64_t first, int64_t last, const wchar_t* expected, std::optional<bool> inside) {
+            timeline.dumpSecond = RebootTimeline::Bounds{first, last};
+            const auto result = compare();
+            Check(result.report.find(expected) != std::wstring::npos && result.insidePrevious == inside, "closed dump interval, half-open boot");
+        };
+        position(90, 99, L"before_previous_start", false);
+        position(99, 100, L"overlaps_previous_start", {});
+        position(100, 199, L"within_previous_boot_window", true);
+        position(199, 200, L"overlaps_receiving_start", {});
+        position(200, 201, L"at_or_after_receiving_start", false);
+        position(99, 200, L"overlaps_both_starts", {});
+        Check(compare().previousStartInEstimate == true, "start on uptime estimate boundary");
+        timeline.estimatedBoot = RebootTimeline::Bounds{101, 105};
+        Check(compare().previousStartInEstimate == false, "previous start outside estimate");
+        timeline.estimatedBoot.reset();
+        Check(!compare().previousStartInEstimate.has_value(), "missing uptime estimate");
+        auto unknown = [&](const wchar_t* why) {
+            const auto result = compare();
+            Check(!result.insidePrevious.has_value() && !result.previousStartInEstimate.has_value() &&
+                result.report.find(why) != std::wstring::npos, "unresolved boot evidence retains reason");
+        };
+        timeline.dumpSecond = RebootTimeline::Bounds{115, 125};
+        history.changes.push_back(RebootClockChange{4, 0, 10, 11, 10, 11, {}, L"observed"});
+        Check(compare().insidePrevious == true, "earlier boot clock step excluded");
+        auto& step = history.changes.back();
+        step.recordId = 6;
+        unknown(L"boot_clock_step_observed");
+        step.recordId = 9; step.typedNewTime = 10;
+        unknown(L"boot_clock_change_unresolved");
+        step.newTime = 10;
+        Check(compare().insidePrevious == true, "same clock value is not a step");
+        b.lastShutdown = 7;
+        Check(compare().insidePrevious == true, "shutdown initiation before receiving boot retained");
+        b.lastShutdown = 9; unknown(L"ambiguous_receiving_boot"); b.lastShutdown = 0;
+        b.earlierRestart = 9; unknown(L"ambiguous_receiving_boot"); b.earlierRestart = 0;
+        b.previousStart->error = ERROR_INVALID_DATA; unknown(L"boot_start_unqualified"); b.previousStart->error.reset();
+        b.previousStart->typedTime = 101; unknown(L"boot_start_unqualified");
+        b.previousStart->typedTime = b.previousStart->xmlTime = 200; unknown(L"boot_marker_order_conflict");
+        b.previousStart->typedTime = b.previousStart->xmlTime = 100;
+        event.xmlFileTime = 206; unknown(L"restart_time_unqualified");
+        event.xmlFileTime = event.typedFileTime = 199; unknown(L"boot_marker_order_conflict");
+        event.xmlFileTime = event.typedFileTime = 205;
+        b.ObserveRecord(6, false); b.ObserveRecord(8, true); b.ObserveRecord(10, true);
+        Check(b.contiguousFrom == 10, "missing record resets suffix");
+        unknown(L"boot_record_coverage_incomplete");
+        b.contiguousFrom = 5; b.lastRead = 9; unknown(L"boot_record_coverage_incomplete");
+        history.status = L"history_deadline_reached"; unknown(L"history_unavailable");
+        history.status = L"saved_window_observed"; b.previousStart.reset(); unknown(L"two_start_records_unavailable");
+        Check(has(L"\"previous_start\":null"), "missing start not manufactured");
+        RebootBootWindow limit;
+        limit.ObserveRecord(UINT64_MAX - 1, true); limit.ObserveRecord(UINT64_MAX, true);
+        Check(limit.contiguousFrom == UINT64_MAX - 1 && limit.lastRead == UINT64_MAX, "full-width contiguous record IDs");
+    }
+
     void CheckClock()
     {
         constexpr int64_t t = 133536816000000000LL, ticks = 10000000;
@@ -167,6 +259,7 @@ int main()
         Parse(L"<!DOCTYPE Event [<!ENTITY x '123'>]>" + document, L"malformed_event_xml");
         CheckClock();
         CheckChanges();
+        CheckBootWindow();
         std::cout << checked << " reboot event parser checks passed\n";
         return 0;
     }

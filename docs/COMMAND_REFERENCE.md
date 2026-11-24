@@ -2685,6 +2685,29 @@ record lookup result.
 The original dump comparison is available in `reboot_timeline`.
 [Clock evidence and limits](ARCHITECTURE.md#saved-reboot-clock-changes)
 
+### Compare a dump with the previous boot window
+
+Reuse the pinned dump, System log, Event 41 and first record ID from the
+preceding example. Include at least the two most recent OS start records
+before Event 41. Windows writes the restart event during the following boot.
+[Microsoft's Event 41 guidance](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart)
+
+```powershell
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $dumpPin --reboot-log $log.FullName --log-sha256 $logPin --record-id $record.RecordId --compare-time --clock-history-from $first --boot-window
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+if ($null -eq $report.boot_window) { throw $report.status }
+$report.boot_window | Select-Object status, boot_suffix_complete, dump_position, previous_start_in_estimated_boot
+$report.assessment.hypotheses | Where-Object candidate -eq 'same_recorded_stop_at_restart'
+```
+
+In `kn.crash_diagnosis.v6`, `within_previous_boot_window` places the whole
+recorded dump second between the two starts. `at_or_after_receiving_start`
+can occur even when the dump precedes Event 41 and all five stop fields
+match. A second spanning a boundary leaves placement open. Inspect
+`previous_start`, `receiving_start` and the two clock-change counts when
+the comparison is unresolved. [Boot window evidence](ARCHITECTURE.md#saved-boot-windows)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

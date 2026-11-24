@@ -94,10 +94,13 @@ a reference failure after a successful open.
 In P13, comparing saved crash and reboot times can expose an event that
 precedes a dump even when the stop fields agree. An operator can inspect
 recorded clock steps preceding Event 41 in the same EVTX, including gaps
-in a filtered export. Linking the dump to that host, boot and clock still
-requires incident-specific evidence.
-[Command example](COMMAND_REFERENCE.md#read-clock-changes-preceding-a-reboot-event) and
-[validation results](VALIDATION.md#saved-reboot-clock-history).
+in a filtered export. The boot-window comparison checks whether the dump
+falls between the last two recorded OS starts and whether its uptime
+supports the older start. Linking the dump to that host, boot and clock
+still requires incident-specific evidence.
+[Clock history](COMMAND_REFERENCE.md#read-clock-changes-preceding-a-reboot-event),
+[boot window comparison](COMMAND_REFERENCE.md#compare-a-dump-with-the-previous-boot-window)
+and [validation results](VALIDATION.md#saved-boot-window-comparison).
 
 The [source collection](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
 retains the original acquisition report and its image dependencies in one

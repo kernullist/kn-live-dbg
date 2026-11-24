@@ -24,8 +24,10 @@ struct SavedCrashClock
 struct RebootTimeline
 {
     enum class Order { Unknown, BeforeEvent, SameSecond, AfterEvent };
+    struct Bounds { int64_t first, last; };
     Order order = Order::Unknown;
     std::wstring report;
+    std::optional<Bounds> dumpSecond, estimatedBoot;
 };
 
 struct RebootClockChange
@@ -36,6 +38,23 @@ struct RebootClockChange
     std::optional<DWORD> error;
     const wchar_t* status = L"clock_fields_unavailable";
     std::optional<int64_t> Delta() const;
+};
+
+struct RebootBootStart
+{
+    uint64_t recordId = 0;
+    std::optional<unsigned> version;
+    std::optional<uint64_t> xmlTime, typedTime;
+    std::optional<DWORD> error;
+    const wchar_t* status = L"start_time_unavailable";
+    bool Qualified() const;
+};
+
+struct RebootBootWindow
+{
+    std::optional<RebootBootStart> previousStart, receivingStart;
+    uint64_t contiguousFrom = 0, lastRead = 0, lastShutdown = 0, earlierRestart = 0;
+    void ObserveRecord(uint64_t id, bool inScope);
 };
 
 struct RebootClockHistory
@@ -51,8 +70,15 @@ struct RebootClockHistory
     std::optional<DWORD> error;
     std::vector<RebootClockChange> changes;
     bool complete = false;
+    std::optional<RebootBootWindow> boots;
     std::wstring Json() const;
     std::wstring Hypothesis() const;
+};
+
+struct RebootBootAssessment
+{
+    std::optional<bool> insidePrevious, previousStartInEstimate;
+    std::wstring report;
 };
 
 struct RebootEventComparison
@@ -61,6 +87,7 @@ struct RebootEventComparison
     std::wstring logDigest, metadata = L"null";
     uint64_t logBytes = 0, recordId = 0;
     std::optional<DWORD> win32Error;
+    std::optional<unsigned> eventVersion;
     std::optional<ULONG> eventCode;
     std::optional<SavedCrashStop> eventStop;
     std::optional<bool> sameCode, sameStop;
@@ -68,12 +95,15 @@ struct RebootEventComparison
     std::optional<DWORD> timeError;
     bool dumpQualified = false;
     std::wstring Json() const;
-    std::wstring Hypothesis(const RebootTimeline* timing = nullptr) const;
+    std::wstring Hypothesis(const RebootTimeline* timing = nullptr, const RebootBootAssessment* boots = nullptr) const;
 };
 
 // The saved System event parser accepts one Windows-rendered XML document.
 void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& comparison);
 const wchar_t* DecodeRebootClockChange(const BYTE* xml, UINT byteCount, RebootClockChange& change);
+const wchar_t* DecodeRebootBootStart(const BYTE* xml, UINT byteCount, RebootBootStart& start);
 RebootEventComparison CompareSavedRebootEvent(const std::wstring& path, const std::wstring& pin,
     uint64_t recordId, const SavedCrashStop* qualifiedDumpStop, bool readTime = false, RebootClockHistory* history = nullptr);
 RebootTimeline CompareRebootTime(const SavedCrashClock& dump, const RebootEventComparison& event);
+RebootBootAssessment CompareRebootBootWindow(const RebootClockHistory& history, const RebootTimeline& timeline,
+    const RebootEventComparison& event);

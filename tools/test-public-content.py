@@ -4,6 +4,7 @@ from contextlib import closing
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -405,7 +406,7 @@ class PublicContentTests(unittest.TestCase):
         for signature in (b"ElfFile\0", b"ElfChnk\0"):
             self.assertIn("private-windows-event-log", {f["rule"] for f in AUDIT.inspect("renamed.bin", signature + bytes(128))})
         for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1", "kn.crash_diagnosis.v4", "kn.reboot_timeline.v1",
-                       "kn.crash_diagnosis.v5", "kn.reboot_clock_history.v1"):
+                       "kn.crash_diagnosis.v5", "kn.reboot_clock_history.v1", "kn.crash_diagnosis.v6", "kn.reboot_boot_window.v1"):
             for text in (json.dumps({"status": "example", "schema": schema}),
                          "log\n" + json.dumps({"schema": schema, "status": "example"}, indent=2)[:-3],
                          "log\n" + json.dumps({"requested_record_id": "1", "log_sha256": "example", "same_stop_tuple": None})):
@@ -415,10 +416,16 @@ class PublicContentTests(unittest.TestCase):
         for key in ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
                     "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime",
                     "clock_old_filetime", "clock_new_filetime", "clock_typed_old_filetime", "clock_typed_new_filetime",
-                    "clock_delta_100ns"):
+                    "clock_delta_100ns", "boot_start_record_id", "boot_start_xml_filetime", "boot_start_typed_filetime", "contiguous_from_record_id",
+                    "last_read_record_id", "last_shutdown_marker_id", "earlier_restart_record_id", "previous_start_in_estimated_boot"):
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 cut = ("log\n" + json.dumps({"result": {key: "example"}}, indent=2)[:-4]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", cut)})
+        for where in ("previous_start", "receiving_start"):
+            row = dict(boot_start_record_id="7", version=0, status="observed")
+            prefix = json.dumps({where: row}, indent=2).split('"status"')[0]
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("cut.txt", prefix.encode(encoding))})
 
     def test_whea_export_and_event_comparison(self):
         name = "Microsoft-Windows-WHEA-Logger"
@@ -917,8 +924,10 @@ class PublicContentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 1)
             self.assertNotIn("synthetic", result.stdout)
             self.assertEqual(json.loads(result.stdout)["files"], 1)
+            # A temporary directory inside a checkout would otherwise discover its parent repository.
+            isolated = dict(os.environ, GIT_CEILING_DIRECTORIES=str(root.resolve().parent))
             missing = subprocess.run([sys.executable, str(Path(AUDIT.__file__)),
-                                      "--root", str(root)], capture_output=True, text=True)
+                                      "--root", str(root)], env=isolated, capture_output=True, text=True)
             self.assertEqual(missing.returncode, 2)
             empty = root / "empty"
             empty.mkdir()

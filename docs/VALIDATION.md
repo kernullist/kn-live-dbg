@@ -7,6 +7,39 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved boot window comparison
+
+On 2026-11-25 the development x64 Release executable compared controlled
+AMD64 triage dumps with two distinct Kernel-Power Event 41 records from
+saved Windows System logs. The last two Kernel-General starts and the
+restart record spanned 585 record IDs for one restart and 614 for the other.
+Get-WinEvent independently read each start's named XML field and native
+property. The receiving OS had already started 11.36 and 11.91 seconds
+before the corresponding Event 41 write.
+
+For each restart a controlled dump with all five matching stop fields
+and a timestamp three seconds after the receiving start still preceded
+Event 41. The boot-window report retained the stop match and cited the
+contrary start records. A dump three seconds before the receiving start
+with uptime measured from the older start supported both observations.
+Changing just its uptime kept the wall-time support and added contrary
+boot-time evidence. A separate SDK debugger session read the wall clock
+and uptime of each retained control to the displayed millisecond.
+
+Two overlapping exports of the first restart contained 44 and 48 in-scope
+start records. Both gave the same 585-ID suffix, including when earlier
+computer labels differed. Removing one interior ID from an export retained
+both starts and suspended placement. Omitting only the ID immediately
+before the older start preserved placement. Single-start, mismatched-pin,
+live-dump and redirected-output controls also passed. In 45 v1 through v5
+invocations, exit status, stdout and stderr matched the previous executable
+byte for byte. The native parser passed 241 checks. On this host, the MSVC
+AddressSanitizer stopped during interception at startup. With continuation
+enabled, the instrumented parser ran the same 241 checks with partial
+interception. Attribution of the original incident requires its own dump
+and independent host and boot provenance.
+[Run the boot window comparison](COMMAND_REFERENCE.md#compare-a-dump-with-the-previous-boot-window)
+
 ## Saved reboot clock history
 
 On 2026-11-25 the development x64 Release reader examined two saved

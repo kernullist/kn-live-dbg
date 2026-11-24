@@ -233,7 +233,7 @@ namespace
 
     struct Options
     {
-        bool whea = false, wheaEvent = false, compareTime = false;
+        bool whea = false, wheaEvent = false, compareTime = false, bootWindow = false;
         size_t rebootArg = 0;
         uint64_t recordId = 0, firstClockRecord = 0;
     };
@@ -277,8 +277,12 @@ namespace
         if (args[i++] != L"--compare-time") { return false; }
         options.compareTime = true;
         if (i == args.size()) { return true; }
-        return args.size() - i == 2 && args[i] == L"--clock-history-from" && RecordId(args[i + 1], options.firstClockRecord) &&
-            RebootClockHistory::ValidWindow(options.firstClockRecord, options.recordId);
+        if (args.size() - i < 2 || args[i] != L"--clock-history-from" || !RecordId(args[i + 1], options.firstClockRecord) ||
+            !RebootClockHistory::ValidWindow(options.firstClockRecord, options.recordId)) { return false; }
+        i += 2;
+        if (i == args.size()) { return true; }
+        options.bootWindow = args.size() - i == 1 && args[i] == L"--boot-window";
+        return options.bootWindow;
     }
 }
 
@@ -290,7 +294,7 @@ std::wstring SavedCrashStop::Json() const
 
 static int Diagnose(const std::vector<std::wstring>& args, const Options& options)
 {
-    const unsigned version = options.firstClockRecord ? 5 : options.compareTime ? 4 : options.rebootArg ? 3 : options.whea ? 2 : 1;
+    const unsigned version = options.bootWindow ? 6 : options.firstClockRecord ? 5 : options.compareTime ? 4 : options.rebootArg ? 3 : options.whea ? 2 : 1;
     const auto expected = LowerDigest(args[2]);
     std::filesystem::path path;
     symbol_artifacts::Directories parents;
@@ -325,13 +329,16 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     std::optional<RebootEventComparison> reboot;
     std::optional<RebootTimeline> timeline;
     std::optional<RebootClockHistory> history;
+    std::optional<RebootBootAssessment> boots;
     if (options.rebootArg)
     {
         const auto i = options.rebootArg;
         if (options.firstClockRecord) { history = RebootClockHistory{options.firstClockRecord, options.recordId}; }
+        if (options.bootWindow) { history->boots.emplace(); }
         reboot = CompareSavedRebootEvent(args[i + 1], LowerDigest(args[i + 3]), options.recordId,
             match && stopEvidence && stop.code ? &stop : nullptr, options.compareTime, history ? &*history : nullptr);
         if (options.compareTime) { timeline = CompareRebootTime(clock, *reboot); }
+        if (options.bootWindow) { boots = CompareRebootBootWindow(*history, *timeline, *reboot); }
     }
     if (!source.Unchanged()) { return Failure(version, L"source_changed_or_unreadable"); }
     const auto status = !e.stop ? L"header_only" : !match ? L"conflicting_stop_data" : L"matched_stop_data";
@@ -351,6 +358,7 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     if (reboot) { report += L",\"reboot_event\":" + reboot->Json(); }
     if (timeline) { report += L",\"reboot_timeline\":" + timeline->report; }
     if (history) { report += L",\"clock_history\":" + history->Json(); }
+    if (boots) { report += L",\"boot_window\":" + boots->report; }
     report += L",\"assessment\":{\"header_context_matches_selected\":" +
         std::wstring(e.sameContext ? Bool(*e.sameContext) : L"null") +
         L",\"header_context_matches_stack_top\":" + (e.topMatches ? Bool(*e.topMatches) : L"null") +
@@ -366,7 +374,7 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
             L"inspect_the_corresponding_whea_error_record") + L"},";
     if (options.whea) { report += record.Hypothesis() + L","; }
     if (options.wheaEvent) { report += event.Hypothesis() + L","; }
-    if (reboot) { report += reboot->Hypothesis(timeline ? &*timeline : nullptr) + L","; }
+    if (reboot) { report += reboot->Hypothesis(timeline ? &*timeline : nullptr, boots ? &*boots : nullptr) + L","; }
     if (history) { report += history->Hypothesis() + L","; }
     report += L"{\"candidate\":\"component_present_at_stop\",\"state\":" +
         Quote(located ? L"mapped_frame_observed" : L"unresolved") +
@@ -390,7 +398,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
             return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
                 std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> "
                     L"[--whea [--event-xml <file> --event-sha256 <digest>]] "
-                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal> [--compare-time [--clock-history-from <first-record-id>]]]\n";
+                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal> [--compare-time [--clock-history-from <first-record-id> [--boot-window]]]]\n";
                 return 2;
             });
         };

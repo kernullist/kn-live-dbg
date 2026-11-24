@@ -22,11 +22,13 @@ PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa",
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
 REBOOT_TIME_SCHEMAS = ("kn.crash_diagnosis.v4", "kn.reboot_timeline.v1", "kn.crash_diagnosis.v5",
-                       "kn.reboot_clock_history.v1")
+                       "kn.reboot_clock_history.v1", "kn.crash_diagnosis.v6", "kn.reboot_boot_window.v1")
 REBOOT_CLOCK_FIELDS = ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
                        "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime",
                        "clock_old_filetime", "clock_new_filetime", "clock_typed_old_filetime", "clock_typed_new_filetime",
-                       "clock_delta_100ns")
+                       "clock_delta_100ns", "boot_start_record_id", "boot_start_xml_filetime", "boot_start_typed_filetime",
+                       "contiguous_from_record_id", "last_read_record_id", "last_shutdown_marker_id", "earlier_restart_record_id",
+                       "previous_start_in_estimated_boot")
 CRASH_SCHEMAS = (*REBOOT_TIME_SCHEMAS, "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
                  "kn.whea_event_comparison.v1", "kn.reboot_event_comparison.v1")
 EVENT_EXPORT_PROVIDER = re.compile(

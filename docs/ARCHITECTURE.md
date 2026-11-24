@@ -4689,6 +4689,36 @@ steps, the origin of the dump and correspondence across boots need separate
 evidence. [Windows clock reset events](https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/client-clock-reverts-to-previous-time)
 and [named event properties](https://learn.microsoft.com/en-us/windows/win32/wes/rendering-events).
 
+### Saved boot windows
+
+The boot-window reader uses the same pinned EVTX and bounded record scan as
+the clock history. It retains the two latest Kernel-General Event 12 candidates
+before the selected Kernel-Power Event 41. For each start it checks the
+provider name, GUID, record ID and version-zero template, then compares
+the named XML `StartTime` with the native FILETIME property. The payload
+records the OS start time. Event 41 records the prior unexpected shutdown
+during the following startup. [Windows startup and shutdown events](https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-unexpected-reboots-system-event-logs)
+and [Event 41 timing](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart).
+
+Placement requires an unbroken sequence of classified System records with
+the endpoint's computer label, from the older start through Event 41.
+Earlier gaps can coexist with a complete suffix. A second restart report
+or a shutdown marker after the newer start makes the receiving boot
+ambiguous. A shutdown marker during the older boot records initiation.
+Completion of that shutdown needs further evidence. Clock changes are
+counted separately on either side of the newer start. A nonzero or
+unresolved step in either interval, or incompatible marker times,
+suspends placement and preserves the observed fields.
+
+The candidate interval includes the older start and excludes the newer one.
+The debugger's whole-second precision can put a dump across either boundary.
+The report also tests whether the older start falls inside the boot-time
+estimate derived from the dump clock and uptime. The incident hypothesis
+retains supporting and contrary observations together. Missing startup
+events, sleep and clock behavior outside the captured records remain possible.
+Linking the files to the same host and boot requires independent acquisition
+provenance.
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

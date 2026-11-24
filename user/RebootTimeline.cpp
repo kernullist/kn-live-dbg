@@ -48,10 +48,12 @@ RebootTimeline CompareRebootTime(const SavedCrashClock& dump, const RebootEventC
     {
         const auto start = UnixEpoch + static_cast<int64_t>(*dump.debuggerUnixSeconds) * TicksPerSecond;
         const auto end = start + TicksPerSecond - 1;
+        result.dumpSecond = RebootTimeline::Bounds{start, end};
         if (uptime.value_or(false))
         {
             const auto duration = static_cast<int64_t>(*dump.debuggerUptimeSeconds) * TicksPerSecond;
-            boot = Bounds(start - (duration + TicksPerSecond - 1), end - duration);
+            result.estimatedBoot = RebootTimeline::Bounds{start - (duration + TicksPerSecond - 1), end - duration};
+            boot = Bounds(result.estimatedBoot->first, result.estimatedBoot->last);
         }
         if (!agrees) { status = L"event_time_unavailable"; }
         else if (!*agrees) { status = L"event_time_conflict"; }
@@ -121,4 +123,101 @@ std::wstring RebootClockHistory::Hypothesis() const
         (complete && !forward && !backward ? evidence : L"[]") +
         L",\"missing\":[" + (complete ? std::wstring() : L"\"/clock_history/status\",") +
         L"\"/clock_history/dump_clock_correspondence_verified\"],\"next\":\"verify_boot_and_clock_provenance_for_the_dump\"}";
+}
+
+bool RebootBootStart::Qualified() const
+{
+    return std::wstring_view(status) == L"observed" && !error && version == 0u && xmlTime && *xmlTime && *xmlTime <= INT64_MAX &&
+        xmlTime == typedTime;
+}
+
+void RebootBootWindow::ObserveRecord(uint64_t id, bool inScope)
+{
+    if (!inScope) { contiguousFrom = 0; }
+    else if (!contiguousFrom || id - 1 != lastRead) { contiguousFrom = id; }
+    lastRead = id;
+}
+
+namespace
+{
+    std::wstring StartJson(const std::optional<RebootBootStart>& start)
+    {
+        if (!start) { return L"null"; }
+        return L"{\"boot_start_record_id\":" + Quote(std::to_wstring(start->recordId)) + L",\"version\":" +
+            (start->version ? std::to_wstring(*start->version) : L"null") + L",\"status\":" + Quote(start->status) +
+            L",\"boot_start_xml_filetime\":" + DecimalString(start->xmlTime) +
+            L",\"boot_start_typed_filetime\":" + DecimalString(start->typedTime) +
+            L",\"win32_error\":" + (start->error ? std::to_wstring(*start->error) : L"null") + L"}";
+    }
+
+    struct BootClockChanges
+    {
+        unsigned steps = 0, unresolved = 0;
+        std::wstring Json() const
+        {
+            return L"{\"nonzero_steps\":" + std::to_wstring(steps) + L",\"unresolved_changes\":" + std::to_wstring(unresolved) + L"}";
+        }
+    };
+}
+
+RebootBootAssessment CompareRebootBootWindow(const RebootClockHistory& history, const RebootTimeline& timeline,
+    const RebootEventComparison& event)
+{
+    RebootBootAssessment result;
+    const RebootBootWindow empty;
+    const auto& b = history.boots ? *history.boots : empty;
+    const auto& previous = b.previousStart;
+    const auto& receiving = b.receivingStart;
+    BootClockChanges priorClock, receivingClock;
+    for (const auto& change : history.changes)
+    {
+        if (!receiving || change.recordId > history.last) { continue; }
+        const bool afterStart = change.recordId >= receiving->recordId;
+        if (!afterStart && (!previous || change.recordId < previous->recordId)) { continue; }
+        auto& segment = afterStart ? receivingClock : priorClock;
+        const auto delta = change.Delta();
+        if (!delta) { ++segment.unresolved; }
+        else if (*delta) { ++segment.steps; }
+    }
+    const std::wstring_view scan(history.status);
+    const bool drained = scan == L"saved_window_observed" || scan == L"partial_saved_window";
+    const bool covered = drained && previous && receiving && event.recordId == history.last && previous->recordId < receiving->recordId &&
+        receiving->recordId < history.last && b.lastRead == history.last && b.contiguousFrom && b.contiguousFrom <= previous->recordId;
+    const wchar_t* status = L"boot_window_observed";
+    if (!history.boots || !drained) { status = L"history_unavailable"; }
+    else if (!previous || !receiving) { status = L"two_start_records_unavailable"; }
+    else if (!covered) { status = L"boot_record_coverage_incomplete"; }
+    else if (!previous->Qualified() || !receiving->Qualified()) { status = L"boot_start_unqualified"; }
+    else if (b.earlierRestart > receiving->recordId || b.lastShutdown > receiving->recordId) { status = L"ambiguous_receiving_boot"; }
+    else if (priorClock.unresolved || receivingClock.unresolved) { status = L"boot_clock_change_unresolved"; }
+    else if (priorClock.steps || receivingClock.steps) { status = L"boot_clock_step_observed"; }
+    else if (!event.typedFileTime || !*event.typedFileTime || *event.typedFileTime > INT64_MAX ||
+        event.xmlFileTime != event.typedFileTime) { status = L"restart_time_unqualified"; }
+    else if (*previous->typedTime >= *receiving->typedTime || *receiving->typedTime > *event.typedFileTime)
+    { status = L"boot_marker_order_conflict"; }
+
+    const wchar_t* position = L"unresolved";
+    if (std::wstring_view(status) == L"boot_window_observed" && event.dumpQualified && timeline.dumpSecond)
+    {
+        const auto lower = static_cast<int64_t>(*previous->typedTime), upper = static_cast<int64_t>(*receiving->typedTime);
+        const auto& second = *timeline.dumpSecond;
+        if (second.last < lower) { position = L"before_previous_start"; result.insidePrevious = false; }
+        else if (second.first >= upper) { position = L"at_or_after_receiving_start"; result.insidePrevious = false; }
+        else if (second.first >= lower && second.last < upper) { position = L"within_previous_boot_window"; result.insidePrevious = true; }
+        else if (second.first < lower && second.last >= upper) { position = L"overlaps_both_starts"; }
+        else { position = second.first < lower ? L"overlaps_previous_start" : L"overlaps_receiving_start"; }
+        if (timeline.estimatedBoot)
+        { result.previousStartInEstimate = timeline.estimatedBoot->first <= lower && lower <= timeline.estimatedBoot->last; }
+    }
+    const auto id = [](uint64_t value) { return value ? Quote(std::to_wstring(value)) : L"null"; };
+    result.report = L"{\"schema\":\"kn.reboot_boot_window.v1\",\"status\":" + Quote(status) +
+        L",\"previous_start\":" + StartJson(previous) + L",\"receiving_start\":" + StartJson(receiving) +
+        L",\"contiguous_from_record_id\":" + id(b.contiguousFrom) + L",\"last_read_record_id\":" + id(b.lastRead) +
+        L",\"boot_suffix_complete\":" + (covered ? L"true" : L"false") +
+        L",\"last_shutdown_marker_id\":" + id(b.lastShutdown) + L",\"earlier_restart_record_id\":" + id(b.earlierRestart) +
+        L",\"previous_clock_changes\":" + (previous && receiving ? priorClock.Json() : L"null") +
+        L",\"receiving_clock_changes\":" + (receiving ? receivingClock.Json() : L"null") +
+        L",\"dump_position\":" + Quote(position) + L",\"previous_start_in_estimated_boot\":" + Agreement(result.previousStartInEstimate) +
+        L",\"same_host_boot_verified\":false}";
+    return result;
 }

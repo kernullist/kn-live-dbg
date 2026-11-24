@@ -74,7 +74,7 @@ namespace
 
     enum class Group { Other, System, Data };
     enum Field { None, Provider, Time, Id, Version, RecordId, Channel, Length, Raw,
-        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, OldTime, NewTime, Count };
+        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, OldTime, NewTime, StartTime, Count };
 
     bool Attribute(IXmlReader& reader, const wchar_t* name, std::wstring& out)
     {
@@ -96,7 +96,7 @@ namespace
 
     struct Event
     {
-        enum class Kind { Whea, Reboot, Clock };
+        enum class Kind { Whea, Reboot, Clock, BootStart };
         Kind kind = Kind::Whea;
         Group group = Group::Other;
         Field field = None;
@@ -169,6 +169,10 @@ namespace
                     {
                         if (key == L"OldTime") { field = OldTime; }
                         else if (key == L"NewTime") { field = NewTime; }
+                    }
+                    else if (kind == Kind::BootStart)
+                    {
+                        if (key == L"StartTime") { field = StartTime; }
                     }
                     else if (key == L"RawData") { field = Raw; }
                     else if (key == L"Length") { field = Length; }
@@ -327,6 +331,7 @@ void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& r
     result.metadata = event.metadata;
     if (id->recordId != result.recordId) { result.status = L"record_id_mismatch"; return; }
     if (id->id != 41 || id->version > 10) { result.status = L"unsupported_event_template"; return; }
+    result.eventVersion = static_cast<unsigned>(id->version);
     result.xmlFileTime = id->fileTime;
     if (!id->version) { result.status = L"event_stop_code_unavailable"; return; }
     SavedCrashStop stop;
@@ -365,6 +370,21 @@ const wchar_t* DecodeRebootClockChange(const BYTE* xml, UINT byteCount, RebootCl
     UtcTimestamp(event.text[NewTime], change.newTime);
     if (!change.oldTime || !change.newTime || !*change.oldTime || !*change.newTime ||
         *change.oldTime > INT64_MAX || *change.newTime > INT64_MAX) { return L"clock_fields_invalid"; }
+    return nullptr;
+}
+
+const wchar_t* DecodeRebootBootStart(const BYTE* xml, UINT byteCount, RebootBootStart& start)
+{
+    start.xmlTime.reset();
+    Event event;
+    event.kind = Event::Kind::BootStart;
+    if (!Parse(xml, byteCount, event)) { return event.status; }
+    const auto id = event.Metadata(L"Microsoft-Windows-Kernel-General", GeneralProvider);
+    if (!id) { return event.status; }
+    if (id->recordId != start.recordId) { return L"record_id_mismatch"; }
+    if (id->id != 12 || id->version != 0 || start.version != id->version) { return L"unsupported_event_template"; }
+    UtcTimestamp(event.text[StartTime], start.xmlTime);
+    if (!start.xmlTime || !*start.xmlTime || *start.xmlTime > INT64_MAX) { return L"start_time_invalid"; }
     return nullptr;
 }
 
