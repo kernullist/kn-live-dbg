@@ -7,6 +7,32 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Replaying image recipes after fixture cleanup on 2026-11-24
+
+Each image publication trial runs its child in a fresh directory. After a
+successful publication or a scheduled interruption, the validator removes
+the working `input.exe` before replaying a committed case. An interrupted
+child may have written only part of the input. A child that reports success
+must have published a recipe. An unexpected child failure preserves any
+working input for inspection.
+[Image recipe validator](../tools/validate-image-recipe.ps1)
+
+In earlier runs, 91 temporary inputs matched the same retained 8 MiB image
+byte for byte. The public offline command `!kmon replay-image` reproduced all
+54 committed cases before and after removal of those copies. Its JSON output
+matched byte for byte for every case. The other 102 trial directories had no
+committed recipe in either observation.
+
+On Windows PowerShell 5.1 and PowerShell 7.6, each set of 12 new interruption
+trials left no working input. The public command replayed completed cases
+from both recipe formats. Separate checks on both shells covered early exit,
+partial writes, process failure, missing or malformed recipes and redirected
+directories. The default AddressSanitizer runtime stopped during interceptor
+initialization on this host. With
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` and `ASAN_OPTIONS=halt_on_error=1`,
+the instrumented harness completed the suite and all 12 interruption trials.
+The unsupported interceptor limits sanitizer coverage.
+
 ## Retained publisher root history on 2026-11-24
 
 The Sigstore 3.0.0 Python wheel supplied the initial production root, version

@@ -13,7 +13,7 @@ else
     'Release'
 }
 $output = Join-Path $repo ('.build\image-recipe\' + $variant + '\run-' + [Guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Force -Path $output | Out-Null
+New-Item -ItemType Directory -Path $output | Out-Null
 $flags = '/O2 /MD'
 if ($Sanitize)
 {
@@ -88,8 +88,24 @@ foreach ($format in @('v1', 'v2'))
             {
                 throw 'Image publication failed before interruption'
             }
+            $directory = [IO.DirectoryInfo]::new($target)
+            while ($directory.FullName -ne $repo)
+            {
+                if (($directory.Attributes -band [IO.FileAttributes]::ReparsePoint) -or $null -eq $directory.Parent)
+                {
+                    throw 'Image publication fixture is outside its expected directory tree'
+                }
+                $directory = $directory.Parent
+            }
             $case = Join-Path $target 'case'
-            if (Test-Path -LiteralPath (Join-Path $case 'recipe.knverify'))
+            $hasRecipe = Test-Path -LiteralPath (Join-Path $case 'recipe.knverify')
+            if (-not $terminated -and -not $hasRecipe)
+            {
+                throw 'Completed image publication produced no recipe'
+            }
+            # Only the child writes input.exe in this fresh trial. Replay must use the retained case.
+            [IO.File]::Delete((Join-Path $target 'input.exe'))
+            if ($hasRecipe)
             {
                 & $program --replay $case
                 if ($LASTEXITCODE -ne 0)
