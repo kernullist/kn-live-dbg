@@ -22,6 +22,38 @@ namespace
         if (ok) { ++Passed; }
         else { ++Failed; std::cerr << "[journal.selftest] FAIL " << name << '\n'; }
     }
+    void SourcePriorityTests()
+    {
+        const std::wstring page = LR"({"ownership":"owned_verified","reference_qualified":true,"requested_bytes":"64","compared_bytes":"64","skipped_bytes":"0","failed_bytes":"0","attempted":true,"inventory_available":true,"traversal_complete":true,"ranges_truncated":false})";
+        const auto changed = [&](const wchar_t* field, const wchar_t* value)
+        {
+            auto copy = page;
+            copy.replace(copy.find(field), std::char_traits<wchar_t>::length(field), value);
+            return ReadImageSourcePriority(L"recorded", copy);
+        };
+        using P = CollectionPriority;
+        Check(changed(L"owned_verified", L"new_ownership") == P::Unknown, "unknown source ownership is protected");
+        Check(changed(L"\"64\"", L"\"18446744073709551616\"") == P::Unknown, "source count overflow is protected");
+        Check(changed(L"\"skipped_bytes\":\"0\"", L"\"skipped_bytes\":\"1\"") == P::Unknown, "contradictory source counts are protected");
+        Check(changed(L"\"attempted\":true", L"\"attempted\":\"true\"") == P::Unknown, "invalid source flag is protected");
+        Check(changed(L"\"ranges_truncated\":false", L"\"ranges_truncated\":true") == P::Gap, "truncated source loses full-range priority");
+        Check(changed(L"\"compared_bytes\":\"64\"", L"\"compared_bytes\":\"32\"") == P::Gap, "partial range is a source gap");
+        EvidenceStoreInventory store;
+        for (auto id : {L"12", L"2"})
+        {
+            auto& row = store.Collections.emplace_back();
+            row.Id = id;
+            row.Recovery.Status = L"verified_prefix";
+            row.Recovery.Closed = true;
+            row.Retention.Source.ReportSha256 = std::wstring(64, L'a');
+        }
+        AccountCollectionRetention(store);
+        for (const auto& row : store.Collections)
+        {
+            Check(row.Retention.Priority == P::Unknown && row.Retention.Source.RetainedCollectionId == L"2" &&
+                row.Retention.Source.ActiveCopies == 2, "unknown source copies stay outside routine selection");
+        }
+    }
     bool Write(const fs::path& path, const std::vector<uint8_t>& bytes)
     {
         fs::create_directories(path.parent_path());
@@ -568,6 +600,7 @@ int wmain(int argc, wchar_t** argv)
         }
         if (argc != 2) { return 2; }
         Tests(argv[1]);
+        SourcePriorityTests();
         TypedTests(fs::path(argv[1]) / L"typed-controls");
         std::cout << "[journal.selftest] passed=" << Passed << " failed=" << Failed << '\n';
         return Failed ? 1 : 0;

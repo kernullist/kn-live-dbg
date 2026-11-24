@@ -3,6 +3,8 @@
 #include "EvidenceStore.h"
 #include <algorithm>
 #include <map>
+#include <tuple>
+#include <vector>
 
 using namespace bounded_observation_json;
 namespace
@@ -42,6 +44,44 @@ namespace
     }
     std::wstring Usage(const CollectionRetentionUsage& usage)
     { return L"\"paths\":" + N(usage.Paths) + L",\"named_bytes\":" + N(usage.Bytes); }
+
+    bool NumericIdBefore(const std::wstring& left, const std::wstring& right)
+    { return left.size() < right.size() || (left.size() == right.size() && left < right); }
+
+    void ClassifySourceCopies(EvidenceStoreInventory& store)
+    {
+        using Files = std::tuple<std::wstring, std::wstring, std::wstring>;
+        std::map<Files, std::vector<EvidenceStoreCollection*>> groups;
+        for (auto& c : store.Collections)
+        {
+            const auto& files = c.Retention.Source;
+            if (!files.ReportSha256.empty())
+                { groups[{files.ReportSha256, files.ClaimFileSha256, files.ReferenceSha256}].push_back(&c); }
+        }
+        for (const auto& group : groups)
+        {
+            const auto& copies = group.second;
+            const auto* keeper = *std::min_element(copies.begin(), copies.end(), [](const auto* a, const auto* b)
+                { return NumericIdBefore(a->Id, b->Id); });
+            for (auto* copy : copies)
+            {
+                auto& root = copy->Retention;
+                root.Source.RetainedCollectionId = keeper->Id;
+                root.Source.ActiveCopies = copies.size();
+                if (copy != keeper && root.Priority != Priority::Unknown) { root.Priority = Priority::Routine; }
+            }
+        }
+    }
+
+    std::wstring SourceCopyJson(const ImageSourceRetention& s)
+    {
+        if (s.RetainedCollectionId.empty()) { return {}; }
+        const auto digest = [](const std::wstring& pin) { return pin.empty() ? L"null" : mcpjson::Quote(pin); };
+        return L",\"source_copies\":{\"report_sha256\":" + mcpjson::Quote(s.ReportSha256) +
+            L",\"claim_file_sha256\":" + digest(s.ClaimFileSha256) + L",\"reference_sha256\":" + digest(s.ReferenceSha256) +
+            L",\"retained_collection_id\":" + mcpjson::Quote(s.RetainedCollectionId) +
+            L",\"active_copies\":" + N(s.ActiveCopies) + L"}";
+    }
 }
 
 CollectionPriority ReadImageTicketPriority(const std::wstring& json)
@@ -55,6 +95,32 @@ CollectionPriority ReadImageTicketPriority(const std::wstring& json)
     const auto kind = Lane(ticket.String(L"class"), false);
     if (kind == Priority::Routine && (keys || unkeyed == L"true")) { return Priority::Unknown; }
     return kind;
+}
+
+CollectionPriority ReadImageSourcePriority(const std::wstring& status, const std::wstring& result)
+{
+    if (status == L"failed" || status == L"interrupted") { return Priority::Gap; }
+    IndexedObject page;
+    uint64_t requested = 0, compared = 0, skipped = 0, failed = 0;
+    if (status != L"recorded" || !page.Parse(result) ||
+        !Counter(page, L"requested_bytes", true, requested) || !requested || requested > 4096 ||
+        !Counter(page, L"compared_bytes", true, compared) || compared > requested ||
+        !Counter(page, L"skipped_bytes", true, skipped) || skipped > requested - compared ||
+        !Counter(page, L"failed_bytes", true, failed) || failed > requested - compared - skipped) { return Priority::Unknown; }
+    bool full = compared == requested;
+    constexpr std::pair<const wchar_t*, const wchar_t*> required[] = {
+        {L"reference_qualified", L"true"}, {L"attempted", L"true"}, {L"inventory_available", L"true"},
+        {L"traversal_complete", L"true"}, {L"ranges_truncated", L"false"}};
+    for (const auto& [key, expected] : required)
+    {
+        std::wstring flag;
+        if (!page.Raw(key, &flag) || (flag != L"true" && flag != L"false")) { return Priority::Unknown; }
+        if (flag != expected) { full = false; }
+    }
+    const auto ownership = page.String(L"ownership");
+    if (ownership == L"owned_unverified") { return Priority::Gap; }
+    if (ownership != L"owned_verified" && ownership != L"owned_modified") { return Priority::Unknown; }
+    return full ? Priority::First : Priority::Gap;
 }
 
 CollectionPriority ReadLedgerPriority(const std::wstring& json, const std::wstring& id, bool irp,
@@ -144,6 +210,7 @@ CollectionPriority CombineCollectionPriority(CollectionPriority a, CollectionPri
 
 void AccountCollectionRetention(EvidenceStoreInventory& store)
 {
+    ClassifySourceCopies(store);
     std::map<std::wstring, CollectionRetentionRoot*> roots;
     for (auto& c : store.Collections)
         { if (c.Recovery.Status == L"verified_prefix" && c.Recovery.Closed) { roots.emplace(c.Id, &c.Retention); } }
@@ -188,7 +255,7 @@ const EvidenceStoreCollection* SelectRoutineRetirement(const EvidenceStoreInvent
             !r.ExclusiveRoutineBytes || r.ExclusiveRoutineBytes > cap || !r.ClosureWritten || store.Budget.Observed < r.ClosureWritten ||
             (store.Budget.Observed - r.ClosureWritten) / 10000000 < age) { continue; }
         if (!best || r.ClosureWritten < best->Retention.ClosureWritten || (r.ClosureWritten == best->Retention.ClosureWritten &&
-            (c.Id.size() < best->Id.size() || (c.Id.size() == best->Id.size() && c.Id < best->Id)))) { best = &c; }
+            NumericIdBefore(c.Id, best->Id))) { best = &c; }
     }
     return best;
 }
@@ -210,7 +277,7 @@ std::wstring CollectionRetentionBudgetJson(const EvidenceStoreInventory& store)
         const auto& r = c.Retention;
         roots += L"{\"collection_id\":" + mcpjson::Quote(c.Id) + L",\"class\":" + mcpjson::Quote(Names[Index(r.Priority)]) +
             L",\"closure_last_write_filetime\":" + N(r.ClosureWritten) + L",\"routine_paths\":" + N(r.RoutinePaths) +
-            L",\"exclusive_routine_bytes\":" + N(r.ExclusiveRoutineBytes) + L"}";
+            L",\"exclusive_routine_bytes\":" + N(r.ExclusiveRoutineBytes) + SourceCopyJson(r.Source) + L"}";
     }
     return L"{\"schema\":\"kn.evidence_collection_retention.v1\",\"status\":\"verified\",\"observed_filetime\":" + N(store.Budget.Observed) +
         L",\"classes\":" + lanes + L"],\"failure_ledgers\":{" + Usage(store.Budget.Ledgers) + L"},\"roots\":" + roots + L"]}";

@@ -50,7 +50,7 @@ namespace
         return hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) ? hash.Finish() : L"";
     }
 
-    bool SourceInputs(const std::wstring& page, const EvidenceJournalMember& root, ImageArchiveCatalog& catalog)
+    bool SourceInputs(const std::wstring& page, const EvidenceJournalMember& root, ImageArchiveCatalog& catalog, bool inspectRetention)
     {
         const auto id = ImageSourceReportCollection(root.Path, root.Sha256);
         if (id.empty()) { return false; }
@@ -58,6 +58,7 @@ namespace
         if (root.Schema != L"kn.image_capture.v3" || ParseProcessImageCaptureReport(page, report)) { return false; }
         catalog.CaptureStatus = report.CaptureStatus;
         catalog.SourceStatus = report.SourceStatus;
+        if (inspectRetention) { catalog.SourcePriority = ReadImageSourcePriority(report.CaptureStatus, report.Result); }
         if (!report.Published()) { return true; }
         catalog.SourceClaimBinding = SourceClaimBinding(report.CaptureStatus, report.SourceId, report.TargetId, report.OperationId,
             report.Policy, report.Consistency, report.Result);
@@ -146,10 +147,10 @@ ImageArchiveKind ImageArchiveKindForPath(const std::wstring& path)
 }
 
 bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember& root,
-    const std::wstring& json, ImageArchiveCatalog& catalog, bool includeReadTicket)
+    const std::wstring& json, ImageArchiveCatalog& catalog, bool inspectRetention)
 {
     IndexedObject record, claim;
-    if (kind == ImageArchiveKind::SourceReport) { return SourceInputs(json, root, catalog); }
+    if (kind == ImageArchiveKind::SourceReport) { return SourceInputs(json, root, catalog, inspectRetention); }
     if (!record.Parse(json) || record.String(L"schema") != root.Schema) { return false; }
     const bool wrapped = root.Schema == ImageClaimPublicationSchema || root.Schema == ImageScopeClaimPublicationSchema;
     std::wstring inner;
@@ -182,7 +183,7 @@ bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember&
         if (!SealedPayload(record, reads ? L"payload_sha256" : L"recipe_sha256", raw, catalog.PayloadSha256) || !payload.Parse(raw)) { return false; }
         if (reads)
         {
-            if (includeReadTicket && schema == L"kn.image_reads.v3") { payload.Raw(L"retention", &catalog.RetentionTicket); }
+            if (inspectRetention && schema == L"kn.image_reads.v3") { payload.Raw(L"retention", &catalog.RetentionTicket); }
             return !wrapped && ReadReference(payload, schema, catalog);
         }
         if (kind == ImageArchiveKind::Capture && root.Path.rfind(L"image-captures/case-", 0) == 0)

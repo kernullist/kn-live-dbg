@@ -80,7 +80,9 @@ The [source collection](COMMAND_REFERENCE.md#archive-a-process-image-acquisition
 retains the original acquisition report and its image dependencies in one
 private journal. It also closes attempts that produced no image. The
 original report can be removed after verifying the archive and retaining
-its digest.
+its digest. The [cross-collection retention budget](ARCHITECTURE.md#cross-collection-routine-budget)
+protects a complete copy of each distinct set of original files, including
+failed acquisitions, and accounts for the named bytes of extra copies.
 
 Implementation, integration, validation and deployment readiness are independent
 states. A package stays open when its required adapter, raw evidence, compatible

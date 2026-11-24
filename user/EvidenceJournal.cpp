@@ -6,6 +6,7 @@
 #include "AnalystSnapshot.h"
 #include "BoundedObservationJson.h"
 #include "ContentHash.h"
+#include "ImageClaimPublication.h"
 #include "ImageScopeClaimPublication.h"
 #include "PendingIrpEvidence.h"
 #include "ImageCaptureCollection.h"
@@ -787,6 +788,7 @@ struct EvidenceJournal::Impl
             if (t.Kind != L"image_source" || catalog.Inputs.size() + 1 != t.Members.size() ||
                 added.SourceClaimBinding != catalog.SourceClaimBinding) { return Fail(L"capture_report_dependencies_mismatch"); }
             added.SourceLedger = ImageSourceSessionJson(Result.CollectionId, t.Members, catalog.CaptureStatus, catalog.SourceStatus);
+            if (InspectPriority) { ImagePriority = catalog.SourcePriority; }
         }
         if (t.Kind == L"image_source" && kind == ImageArchiveKind::Capture) { added.SourceClaimBinding = std::move(catalog.SourceClaimBinding); }
         if (kind == ImageArchiveKind::Reads || kind == ImageArchiveKind::Slice || (t.Kind == L"image_source" && kind == ImageArchiveKind::Capture))
@@ -1514,6 +1516,16 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                 auto& info = out.Collections.back().Retention;
                 info.Priority = CombineCollectionPriority(d.ImagePriority, d.IrpPriority);
                 if (d.SweepHasGap) { info.Priority = CombineCollectionPriority(info.Priority, CollectionPriority::Gap); }
+                if (d.SourceArchive)
+                {
+                    const auto& source = d.Records.front().Transaction;
+                    info.Source.ReportSha256 = source.Id;
+                    for (const auto& member : source.Members)
+                    {
+                        if (member.Schema == ImageClaimPublicationSchema) { info.Source.ClaimFileSha256 = member.Sha256; }
+                        else if (member.Schema == L"raw.bytes") { info.Source.ReferenceSha256 = member.Sha256; }
+                    }
+                }
                 const auto segment = d.Files.find(L"@segment-" + std::to_wstring(d.Result.CommittedSegments));
                 FILETIME time{};
                 if (segment != d.Files.end() && GetFileTime(segment->second.get(), nullptr, nullptr, &time))

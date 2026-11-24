@@ -7,6 +7,35 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Retention of native acquisition copies on 2026-11-25
+
+At `0126c2d`, the retention inventory put all seven closed source collections
+in one unclassified category. On the same files, the updated x64 Release CLI
+protected four failed acquisitions and two distinct completed comparisons.
+The seventh collection contained the same report, claim file and PE as
+collection 5. It accounted for 40,218 exclusive routine bytes. The PE
+stayed protected across all active owners. The ordinary catalog and
+artifact digests matched the preceding binary. A separate archived
+Ctrl+C acquisition received observation-gap protection.
+
+In a disposable store, a budget plan selected a duplicate. Explicitly
+retiring its protected peer invalidated the plan, and the surviving copy
+took over protection. A fresh plan after another copy arrived allowed
+retirement of the duplicate. Separate GC operations removed its report
+and claim file. The remaining original reproduced the claim and the
+retired ledger still recorded the attempt. Two acquisitions of the same
+range with different reports remained protected. A control also kept
+distinct outer claim files with the same inner recipe. An open source
+transaction withheld the global budget until its closure succeeded.
+
+The archive suite passed 541 checks and its native acquisition fixture
+passed 127. The live suite passed 266 checks, including complete, changed,
+unreadable and interrupted ranges. The existing 17-collection image/IRP
+budget suite passed 112 CLI checks with its pre-v2 reader. The budget
+measures active named bytes on a stopped local store. Physical disk
+allocation and recovery after power loss were outside these trials.
+[Cross-collection routine budget](ARCHITECTURE.md#cross-collection-routine-budget)
+
 ## Archived process image acquisitions on 2026-11-25
 
 At `f6c2121`, `journal-image` retained the image case and reference PE.

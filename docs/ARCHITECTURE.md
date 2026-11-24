@@ -658,6 +658,18 @@ protect gap collections. Missing, older or inconsistent priority records can
 leave a collection unclassified. Direct captures and approval journals use
 their own closure formats and stay outside routine selection.
 
+For a native acquisition archived with `journal-image-source`, the store
+groups active, closed copies by the exact SHA-256 values of the report,
+claim file and reference PE. A failed acquisition has only the report.
+The lowest numeric collection ID retains a copy of each set of originals.
+A report recording a qualified comparison over the full requested range
+receives first-observation protection.
+A failed or interrupted acquisition, or a recorded comparison with gaps,
+receives observation-gap protection. Unrecognized results stay unclassified.
+An additional byte-identical copy with a recognized outcome is routine.
+Two collections that share a PE or an inner recipe can still have different
+original files. Each closure ledger preserves its own supplied-attempt count.
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a

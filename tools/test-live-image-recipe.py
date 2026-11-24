@@ -292,13 +292,15 @@ def main():
         assert value, message
         checks += 1
 
-    def run(arguments, code=0):
-        result = subprocess.run([str(exe), *map(str, arguments)], capture_output=True,
-                                text=True, encoding="utf-8", timeout=30)
+    def run(arguments, code=0, save_stdout=None):
+        result = subprocess.run([str(exe), *map(str, arguments)], capture_output=True, timeout=30)
         check(result.returncode == code, f"exit {result.returncode}, expected {code}: {result.stderr}")
         if code == 2:
-            check(not result.stdout and "usage:" in result.stderr, "invalid grammar produces no evidence")
+            check(not result.stdout and b"usage:" in result.stderr, "invalid grammar produces no evidence")
             return None
+        if save_stdout is not None:
+            with save_stdout.open("xb") as stream:
+                stream.write(result.stdout)
         return json.loads(result.stdout)
 
     def replay(directory, current=False, code=0):
@@ -320,7 +322,9 @@ def main():
 
     with tempfile.TemporaryDirectory(prefix="live-image-", dir=fixtures) as temporary:
         root = Path(temporary)
-        for mode in ("clean", "modified", "hole"):
+        source_store = root / "outcomes"
+        run(["--offline", "!kmon", "init-store", source_store, "/acl-only", "/json"])
+        for collection_id, mode in enumerate(("clean", "modified", "hole"), 1):
             reference = root / f"원본-{mode}.exe"
             shutil.copyfile(fixtures / "owned-image.exe", reference)
             target = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--child", str(reference), mode],
@@ -344,7 +348,8 @@ def main():
                 run(command[:-1], 2)
                 run([*command, "--allow-residency"], 2)
                 check(not directory.exists(), "bad consent grammar does not open an output directory")
-                result = run(command)
+                source_page = root / (mode + "-capture.json")
+                result = run(command, save_stdout=source_page)
                 manifest = directory / "recipe.knverify"
                 original = manifest.read_bytes()
                 publication = json.loads(original)
@@ -409,6 +414,14 @@ def main():
                 exact = replay(directory)
                 check(exact["status"] == "replayed" and exact["result"] == exact["recorded_result"] == result["result"],
                       "post-exit replay survives original reference replacement and removal")
+                source_pin = hashlib.sha256(source_page.read_bytes()).hexdigest()
+                saved = run(["--offline", "!kmon", "journal-image-source", source_page, source_pin,
+                             source_store, collection_id, directory, "/json"])
+                check(saved["closed"] and saved["capture_status"] == "recorded", "archive the actual comparison outcome")
+                budget = run(["--offline", "!kmon", "store", source_store, "/retention", "/json"])["collection_retention"]
+                row = next(r for r in budget["roots"] if r["collection_id"] == str(collection_id))
+                check(row["class"] == ("observation_gap" if mode == "hole" else "first_observation") and
+                      row["source_copies"]["report_sha256"] == source_pin, "coverage of the live read decides its retention class")
                 if undelivered is not None:
                     check(replay(undelivered)["status"] == "replayed", "case survives failed stdout delivery and target exit")
                 for case, recorded, digest, capture_file, capture_pin in interrupted:
@@ -439,6 +452,11 @@ def main():
                         capture_file.unlink()
                         retained = run(["--offline", "!kmon", "replay-image-source", store / acquisition["report_path"], capture_pin, "/json"])
                         check(retained == source, "the archive reproduces the interrupt after the original stdout is removed")
+                        budget = run(["--offline", "!kmon", "store", store, "/retention", "/json"])["collection_retention"]
+                        rows = {r["collection_id"]: r for r in budget["roots"]}
+                        check(rows["2"]["class"] == "observation_gap" and rows["2"]["source_copies"]["active_copies"] == "1" and
+                              rows["1"]["class"] == "unclassified" and "source_copies" not in rows["1"],
+                              "interrupted acquisition and legacy image-only collection retain their own priorities")
                 current = replay(directory, current=True)
                 check(current["status"] == "reanalyzed" and current["result"] == exact["result"], "current policy uses only retained inputs")
                 check(not exact["execution_observed"] and not exact["collector_authenticated"], "read evidence does not prove execution or collector trust")

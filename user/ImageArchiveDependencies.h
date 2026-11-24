@@ -1,6 +1,7 @@
 #pragma once
 
 #include "EvidenceJournal.h"
+#include "CollectionRetentionBudget.h"
 #include <map>
 
 enum class ImageArchiveKind { None, Capture, Reads, Slice, Sweep, SourceReport };
@@ -41,6 +42,7 @@ struct ImageArchiveCatalog
     bool SweepHasGap = false;
     std::wstring PayloadSha256, RetentionTicket;
     std::wstring CaptureStatus, SourceStatus, SourceClaimBinding;
+    CollectionPriority SourcePriority = CollectionPriority::Unknown;
     std::map<std::wstring, ImageArchiveInput> Inputs;
 };
 
@@ -48,6 +50,6 @@ struct ImageArchiveCatalog
 // supplies the logical paths for its content-addressed input files.
 ImageArchiveKind ImageArchiveKindForPath(const std::wstring& path);
 bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember& root,
-    const std::wstring& json, ImageArchiveCatalog& catalog, bool includeReadTicket = false);
+    const std::wstring& json, ImageArchiveCatalog& catalog, bool inspectRetention = false);
 bool MatchesImageArchiveInput(const ImageArchiveInput& input, const EvidenceJournalMember& member,
     const std::wstring& payloadSha256);

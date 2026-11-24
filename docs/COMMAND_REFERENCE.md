@@ -340,10 +340,15 @@ current originals under its own exclusive lease and evaluates the policy only
 after the supplied receipts verify. A catalog supports up to 16,384 entries
 and the full inspection has an aggregate 8 GiB read budget.
 
-To budget routine originals across closed KMON image and IRP collections,
-save a successful `store <artifact-root> /retention` report as UTF-8 in a
-private directory. Each root reports its class and exclusive routine bytes.
-The class totals cover the whole store even when artifact detail is paged.
+To budget routine originals across closed KMON image, IRP and native image
+acquisition collections, save a successful `store <artifact-root> /retention`
+report as UTF-8 in a private directory. Each root reports its class and
+exclusive routine bytes.
+For a native acquisition, `source_copies` on its root lists the original
+file digests, the retained collection ID and the number of active copies.
+Its exclusive routine bytes count the extra named files that retirement
+would release. The class totals cover the whole store even when artifact
+detail is paged.
 For a 128 MiB target, run
 `python tools/new-evidence-gc-policy.py --inventory inventory.json --retire-excess-routine 134217728 --reason "routine archive budget" --output routine.json`.
 Use `--minimum-age-seconds` for the minimum closure age and `--byte-limit`
@@ -1047,6 +1052,8 @@ outcome as recorded. Keep the external pin when transferring the archive.
 The journal command independently verifies the file membership and closure.
 If delivery of the command result fails, an exact retry uses the same
 collection ID and files. A committed ID rejects a different report.
+Use `store <artifact-root> /retention /json` to find active copies of the
+same acquisition and the collection that protects their original files.
 
 ## Trace an I/O request through completion
 

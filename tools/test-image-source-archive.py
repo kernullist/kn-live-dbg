@@ -9,6 +9,8 @@ import subprocess
 import sys
 import tempfile
 
+from image_source_retention_oracle import check_source_copies
+
 
 def sha(data):
     return hashlib.sha256(data).hexdigest()
@@ -306,6 +308,7 @@ def main():
         retired = cli("journal", copy_store / "collections/2")
         check(retired["status"] == "retired" and not retired["original_set_verified"] and
               "committed_source_report_path" not in retired and not retired["committed_direct_capture_paths"], "retired journal preserves historical membership")
+        check_source_copies(store, directory, cli, check)
     print(f"[image.source.archive] passed={checks} acquisitions=6 source_removed=true")
 
 

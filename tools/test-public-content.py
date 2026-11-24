@@ -73,7 +73,8 @@ class PublicContentTests(unittest.TestCase):
         samples = (dict(schema="kn.process_image_source.v1"), dict(schema="kn.image_source_replay.v1"),
                    dict(schema="kn.image_source_session.v1"), dict(schema="kn.image_source_collection.v1"),
                    dict(archived_attempts="1", archived_claims="0"), dict(report_committed=True, capture_status="failed"),
-                   dict(committed_source_report_path="private"),
+                   dict(committed_source_report_path="private"), dict(retained_collection_id="2", active_copies="3"),
+                   dict(report_sha256="a" * 64, claim_file_sha256="b" * 64),
                    dict(requested_pid="1", requested_creation_filetime="3"),
                    dict(acquisition_id="2", parent_acquisition_id="1", requested_filetime="3"),
                    dict(pid="1", creation_filetime="3", win32_status="0"), dict(capture_status="failed", original_claim_matched=False))

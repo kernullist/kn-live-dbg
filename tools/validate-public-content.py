@@ -385,7 +385,7 @@ RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v
                     "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
-                    '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
+                    '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
                     '"truth_ref_sha256"', '"valid_key_ids"', '"signed_hashes"', '"native_policy_sha256"',
                     '"policy_target"', '"source_approval_count"', '"publisher_reference_sha256"', '"source_policy_sha256"',
@@ -395,6 +395,7 @@ RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_wind
                     '"presented_updates"', '"verified_updates"', '"minimum_root_version"')
 RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("archived_attempts", "archived_claims"), ("report_committed", "capture_status"), ("committed_source_report_path",),
+    ("retained_collection_id", "active_copies"), ("report_sha256", "claim_file_sha256"),
     ("requested_pid", "requested_creation_filetime"), ("acquisition_id", "parent_acquisition_id", "requested_filetime"),
     ("pid", "creation_filetime", "win32_status"), ("capture_status", "original_claim_matched"),
     ("archive_requires_efs", "journal_head_sha256"), ("original_windows_verification",), ("current_windows_verification",),
