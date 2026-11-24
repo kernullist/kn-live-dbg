@@ -7,6 +7,40 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Native loader windows for image captures on 2026-11-24
+
+On current main, a standard-user child loaded the same copy of Windows
+`version.dll` twice at the same base, with an explicit unload between the two
+captures. Separate collectors each recorded seven original reads and one
+marker in a private sequential ETL. After the child exited and the temporary
+DLL was removed, Windows `tracerpt` independently reproduced the marker
+ordinal, collector PID, digest, raw timestamp, frequency and all 14 read
+endpoints in each recording. The direct case and its managed archive returned
+byte-identical reports.
+
+Both recordings returned `process_generation_unavailable` and reproduced the
+original byte claim. A separate saved ETL with 168,298 records returned
+`capture_marker_missing`. Wrong pins failed and a writable stdout hard link
+to the ETL, claim or retained PE received zero bytes. The existing live recipe
+suite passed 181 checks and the mapping and archive suite passed 526.
+With the collector provider disabled, the optional capture returned Win32 21
+before creating a case. Windows PowerShell 5.1 and PowerShell 7.6 each ran
+the documented offline command against both captures.
+The runner removes its temporary compiler inputs, copied DLL and decoded XML.
+Both retained recordings replayed after removal of the isolated build objects.
+
+The system-wide trial used the current Windows account. Windows rejected
+session creation with `0x80070005` before the workload started. The private
+recordings validate capture and post-exit timing replay. The load/unload join
+and transition dispositions were exercised with 14 in-memory controls per
+capture, including a private log containing apparent system boundaries and
+cross-thread timestamps one tick apart. A positive join from the Windows
+kernel provider remains unverified.
+Run `tools/validate-image-loader-window.ps1` with matching x64 Release
+objects for the private trial. Its `-SystemTrace` option runs the two-load
+trial on a host with session-control access.
+[Command and expected evidence](TRACE_IMPORT.md#native-loader-intervals-for-image-captures)
+
 ## Portable publisher approval archives on 2026-11-24
 
 Four existing closed collections were copied into disposable private stores.

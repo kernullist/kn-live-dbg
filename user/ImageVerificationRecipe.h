@@ -5,6 +5,8 @@
 #include "RecordingObservationSource.h"
 #include "ProcessMappingObservation.h"
 
+namespace image_loader { struct Window; }
+
 constexpr size_t ImageRecipeMaxBytes = 2 * 1024 * 1024;
 constexpr size_t ImageRecipeMaxReads = 64;
 constexpr uint64_t ImageRecipeReadBudget = 128 * 1024;
@@ -47,6 +49,7 @@ struct ImageRecipeCaptureOptions
     bool AllowResidencyChanges = false;
     IProcessMappingObserver* MappingObserver = nullptr;
     ObservationOperationBudget Budget{ImageRecipeReadBudget, ImageRecipeMaxReads, ImageRecipeMaxReads, 65536, 5000};
+    image_loader::Window* LoaderWindow = nullptr;
 };
 
 struct ImageRecipeReplay

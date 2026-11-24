@@ -262,6 +262,7 @@
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
     <ClCompile Include="RebootEvent.cpp" />
     <ClCompile Include="EtlProfile.cpp" />
+    <ClCompile Include="EtlImageLifetime.cpp" />
     <ClCompile Include="WheaRecord.cpp" />
     <ClCompile Include="WheaEvent.cpp" />
     <ClCompile Include="IoLifecycleCapture.cpp" />
@@ -487,6 +488,7 @@
     <ClInclude Include="RebootEvent.h" />
     <ClInclude Include="ArtifactOutput.h" />
     <ClInclude Include="EtlProfile.h" />
+    <ClInclude Include="ImageLoaderWindow.h" />
     <ClInclude Include="CapabilityProbeContracts.h" />
     <ClInclude Include="SavedEtlCapability.h" />
     <ClInclude Include="SavedEtlInput.h" />

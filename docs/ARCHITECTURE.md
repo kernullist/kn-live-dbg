@@ -3524,6 +3524,34 @@ and native kernel mapping-lifetime providers remain separate work.
 See Microsoft's [VirtualQueryEx contract](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualqueryex)
 and [defined memory-information fields](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-memory_basic_information).
 
+### Native loader intervals for image captures
+
+A v3 direct capture with `--trace-loader` samples the Windows performance
+counter before verification and after the final mapping query. Each original
+read has a second pair of counters inside its before/after mapping queries.
+After publishing the original claim, the collector submits one ETW event
+containing the canonical recipe SHA-256, counter frequency and ordered
+intervals. Receiving that event in the saved trace establishes which timing
+data accompanied the capture. The recipe and original byte assessment retain
+their existing formats. [Windows performance counter](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)
+
+The offline reader reproduces the original claim and verifies the independent
+ETL and recipe pins. It compares raw QPC ticks with the recipe's millisecond
+timeline, then checks process start and end records for the collector and target
+using PID and creation FILETIME. A recorded interval also requires an enclosing
+image load and unload with matching base, size, preferred base, checksum, image
+timestamp, pointer width and name. Every original read must fall inside that
+image and the v3 mapping assessment must qualify it as native `MEM_IMAGE`.
+A transition inside the capture has its own disposition. A transition strictly
+inside an individual read also identifies that read's ordinal. Cross-thread
+timestamps within one QPC tick of a boundary have ambiguous order.
+
+Missing boundaries, lost events, conflicting process generations, ambiguous
+ordering and unsupported event layouts leave the interval unqualified. The
+comparison describes events visible to one logger. Continuous VAD identity,
+collector authentication and instruction execution require separate evidence.
+[Trace inputs and command](TRACE_IMPORT.md#native-loader-intervals-for-image-captures)
+
 ### Direct recipe replay
 
 Default `replay-image` uses the recorded policy only when this binary implements

@@ -125,7 +125,7 @@ def main():
         for mode in ("clean", "modified", "hole"):
             reference = root / f"원본-{mode}.exe"
             shutil.copyfile(fixtures / "owned-image.exe", reference)
-            target = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "--child", str(reference), mode],
+            target = subprocess.Popen([sys.executable, "-B", str(Path(__file__).resolve()), "--child", str(reference), mode],
                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                       text=True, encoding="utf-8", creationflags=subprocess.CREATE_NO_WINDOW)
             try:

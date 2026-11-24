@@ -1,5 +1,48 @@
 # Execution trace inputs
 
+## Native loader intervals for image captures
+
+Start a sequential, QPC-clocked file session before launching the target and
+collector. Enable `Microsoft-Windows-Kernel-Process`
+(`{22fb2cd6-0e7b-422b-a0c7-2fad1fd0e716}`, process and image keywords
+`0x50`) and the KnLiveDbg read-window provider
+(`{02a921c3-281c-47c3-a734-9b233a737d8d}`, keyword `0x1`). Level 5
+covers both. Keep the session running through the target's unload and both
+process exits. The account controlling a system trace needs Windows ETW
+session permissions. Store traces and reports under a private root because
+they can contain process identities, image names and addresses.
+[Windows trace session access](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-starttracew)
+
+Run the following with the target's creation FILETIME, image base and RVA.
+`$case` names a fresh capture directory. The capture supplies the inner
+recipe pin. Obtain the ETL pin after the recording has closed.
+
+```powershell
+$capture = & $exe --verify-process-image $targetPid $creationTime $reference $base $rva 64 $case --allow-residency --trace-loader | ConvertFrom-Json
+# After the target and collector exit, stop the session and pin its file.
+$etlPin = (Get-FileHash -Algorithm SHA256 -LiteralPath $etl).Hash
+& $exe --etl-image-lifetime $etl --sha256 $etlPin --capture $case --recipe-sha256 $capture.recipe_sha256
+```
+
+The collector marker carries the recipe digest and raw QPC intervals for
+1–64 reads. `loader_marker_submitted` reports the producer's call result.
+The join requires one matching event in the saved ETL. It accepts the manifest
+process start/end records (IDs 1/2, versions 0–5/0–2) and image load/unload
+records (IDs 5/6, version 0). Rundown records cannot qualify an endpoint.
+The file limit is 512 MiB, with at most two million events and 4,096 retained
+process boundaries and 4,096 retained image boundaries.
+[Windows EventWrite](https://learn.microsoft.com/en-us/windows/win32/api/evntprov/nf-evntprov-eventwrite)
+
+The `kn.image_loader_window.v1` report uses `bracketed` for a matching load
+before and unload after all reads. `transition_observed` identifies a load or
+unload strictly inside the capture. `unavailable` gives a reason, such as
+`capture_marker_missing` or `process_generation_unavailable`. Read windows
+remain available when a valid marker was present but process boundaries were
+missing. The original byte claim is reproduced independently. A matching
+interval describes the recorded loader activity for this capture. Event loss
+and the visibility of this provider limit conclusions about continuous mapping.
+[Windows ProcessTrace](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-processtrace)
+
 ## Saved Windows CPU samples
 
 `KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N]`

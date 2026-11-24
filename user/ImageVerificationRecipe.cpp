@@ -9,6 +9,7 @@
 #include "ImageSliceRecipe.h"
 #include "ImageSweepManifest.h"
 #include "ImageProcessMappings.h"
+#include "ImageLoaderWindow.h"
 #include <filesystem>
 #include <set>
 
@@ -455,6 +456,8 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
     uint64_t remaining = ImageRecipeReadBudget;
     bool exhausted = false;
     bool sourceChanged = false;
+    auto* loader = options ? options->LoaderWindow : nullptr;
+    static_assert(ImageRecipeMaxReads == std::tuple_size_v<decltype(image_loader::Window::Reads)>);
     const ObservationReader recording = [&](uint64_t address, size_t size, std::vector<uint8_t>* bytes)
     {
         bytes->clear();
@@ -481,7 +484,9 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         read.Length = request.Length;
         ImageReadMappings mappings;
         if (p.FormatVersion == 3) { mappings.Before = options->MappingObserver->ObserveMapping(address, request.Length, cancellation); }
+        if (loader) { loader->Reads[p.Reads.size()].Start = image_loader::Counter(); }
         read.Result = (recorded == nullptr ? source : *recorded).Read(request);
+        if (loader) { loader->Reads[p.Reads.size()].End = image_loader::Counter(); }
         if (p.FormatVersion == 3)
         {
             mappings.After = options->MappingObserver->ObserveMapping(address, request.Length, cancellation);
@@ -495,6 +500,7 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
     };
     ExecutablePageResult comparison;
     bool qualified = false;
+    if (loader) { loader->Capture.Start = image_loader::Counter(); }
     Execute(retained, metadata, p, recording, &comparison, &qualified, false);
     if (p.FormatVersion == 3)
     {
@@ -505,6 +511,7 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
                 { p.Mappings.Final.push_back(options->MappingObserver->ObserveMapping(read.Address, read.Length, cancellation)); }
         }
     }
+    if (loader) { loader->Capture.End = image_loader::Counter(); }
     if (operation != nullptr) { p.ReadSet = operation->Snapshot(); }
     p.RecordedResult = ResultWithMappings(p, &comparison, &qualified);
     if (exhausted || sourceChanged || !retained.Unchanged() || !original.Unchanged())

@@ -156,6 +156,16 @@ class PublicContentTests(unittest.TestCase):
                 data = ("receipt\n" + json.dumps(row)).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
 
+    def test_native_loader_window_evidence(self):
+        for item in (dict(schema="kn.image_loader_window.v1"), dict(capture_start_qpc="4", capture_end_qpc="9"),
+                     dict(strictly_inside_reads=["1"], image={}), dict(recorded_loader_interval=False),
+                     dict(loader_marker_status=0, loader_marker_submitted=True),
+                     dict(read="1", address="12", start_qpc="5", end_qpc="6"), dict(previous_image={}, next_image={}),
+                     dict(collector_generation={}, target_generation={})):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                raw = ("result " + json.dumps(item)).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", raw)})
+
     def test_saved_etl_comparison_archives_and_excerpts(self):
         self.assertEqual(AUDIT.path_rule(".knbench-etl-abc/summary.txt"), "local-state-directory")
         for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17), b"KNCORP1\0", b"KNCORP1\0" + bytes(12)):

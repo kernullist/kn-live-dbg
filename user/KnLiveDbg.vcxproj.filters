@@ -145,6 +145,9 @@
     <ClCompile Include="EtlProfile.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="EtlImageLifetime.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="WheaRecord.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -535,6 +538,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="EtlProfile.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="ImageLoaderWindow.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="SavedDumpCapability.h">

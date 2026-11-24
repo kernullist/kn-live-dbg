@@ -482,7 +482,7 @@ The result's ownership and coverage determine the byte-comparison outcome;
 New cases atomically retain the recipe and its original claim evaluation in
 `kn.image_claim_publication.v1`; `original_claim_recorded=true` confirms publication.
 
-`KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency`
+`KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency [--trace-loader]`
 captures the same direct comparison from a live process into a v3 case. PID,
 creation FILETIME and length are decimal; base and RVA are hexadecimal. The
 supplied generation must match the opened handle, and the caller needs process
@@ -505,6 +505,18 @@ identifies actual `MEM_IMAGE` observations at the declared allocation base.
 Matching queries do not exclude unobserved unmap/remap, prove original backing
 or establish execution. Both original and `/current` replay use retained query
 records, including after target exit. Existing v1/v2 cases remain readable.
+
+With `--trace-loader`, enable the collector provider before starting capture.
+The capture adds the inner `recipe_sha256`, Win32 `loader_marker_status` and
+`loader_marker_submitted` to its JSON. When the provider is disabled at startup,
+the command exits 1 before the first read. If submission fails after publication,
+the original case remains available and the command exits 1.
+
+`KnLiveDbg.exe --etl-image-lifetime <local.etl> --sha256 <etl-digest> --capture <case-directory|managed.kncapture> --recipe-sha256 <recipe-digest>`
+replays the original case and checks process and loader events against the
+recorded read times. Exit 0 covers a bracketed interval or a recorded transition.
+Exit 1 covers incomplete evidence or a digest mismatch. Exit 2 covers grammar
+and output errors. [Trace configuration and report fields](TRACE_IMPORT.md#native-loader-intervals-for-image-captures)
 
 `KnLiveDbg.exe --offline !kmon journal-image <case-directory> <private-store> <collection-id> /json`
 archives an existing direct recipe/claim publication and its exact reference into

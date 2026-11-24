@@ -54120,7 +54120,7 @@ static std::optional<int> RunRestrictedLaunch(int argc, wchar_t** argv)
             {
                 if (_wcsicmp(argv[i], L"--etl-profile") == 0 || _wcsicmp(argv[i], L"--etl-switches") == 0 ||
                     _wcsicmp(argv[i], L"--etl-disk-io") == 0 || _wcsicmp(argv[i], L"--etl-hard-faults") == 0 ||
-                    _wcsicmp(argv[i], L"--etl-rotation-set") == 0) { return code; }
+                    _wcsicmp(argv[i], L"--etl-rotation-set") == 0 || _wcsicmp(argv[i], L"--etl-image-lifetime") == 0) { return code; }
                 if (i + 1 < argc && (_wcsicmp(argv[i], capability_probes::SavedEtl.Selector) == 0 ||
                     _wcsicmp(argv[i], capability_probes::SavedDump.Selector) == 0 ||
                     (_wcsicmp(argv[i], L"dump-read") == 0 && _wcsicmp(argv[i - 1], L"!kmon") == 0))) { return code; }
@@ -54239,8 +54239,9 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --io-lifecycle [--completion-port] <wait-ms> <local-directory> [directories...]   record up to 8 overlapped directory requests\n";
         std::wcout << L"  KnLiveDbg.exe --wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>   capture one Windows wait chain\n";
         std::wcout << L"    --corroborate <peer-tid> <peer-creation-filetime> <rounds 2..8> <pause-ms 1..5000>   repeat paired WCT queries\n";
-        std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency\n";
+        std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency [--trace-loader]\n";
         std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";
+        std::wcout << L"  KnLiveDbg.exe --etl-image-lifetime <local.etl> --sha256 <digest> --capture <directory|managed.kncapture> --recipe-sha256 <digest>\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";
         std::wcout << L"  KnLiveDbg.exe --game-manifest create <image> <pdb> <layout-or-dash> <new-output>\n";
@@ -54297,6 +54298,10 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && ToLower(argv[1]) == L"--etl-switches")
     {
         return RunEtlSwitches(std::vector<std::wstring>(argv + 2, argv + argc));
+    }
+    if (argc >= 2 && ToLower(argv[1]) == L"--etl-image-lifetime")
+    {
+        return RunEtlImageLifetime(std::vector<std::wstring>(argv + 2, argv + argc));
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--etl-profile")
     {

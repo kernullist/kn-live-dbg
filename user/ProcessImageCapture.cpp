@@ -1,6 +1,7 @@
 #include "ProcessImageCapture.h"
 #include "ProcessObservationSource.h"
 #include "ImageVerificationRecipe.h"
+#include "ImageLoaderWindow.h"
 #include "RuntimeCapabilities.h"
 #include <iostream>
 
@@ -30,19 +31,24 @@ namespace
 int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation)
 {
     uint64_t pid = 0, creation = 0, base = 0, rva = 0, length = 0;
-    if (args.size() != 8 || !Unsigned(args[0], 10, &pid) || pid == 0 || pid > UINT32_MAX ||
+    const bool traceLoader = args.size() == 9 && args[8] == L"--trace-loader";
+    if ((args.size() != 8 && !traceLoader) || !Unsigned(args[0], 10, &pid) || pid == 0 || pid > UINT32_MAX ||
         !Unsigned(args[1], 10, &creation) || creation == 0 || args[2].empty() ||
         !Unsigned(args[3], 16, &base) || base == 0 || !Unsigned(args[4], 16, &rva) || rva > UINT32_MAX ||
         !Unsigned(args[5], 10, &length) || length == 0 || length > 4096 || args[6].empty() ||
         args[7] != L"--allow-residency" || base > UINT64_MAX - rva || base + rva > UINT64_MAX - length)
     {
-        std::wcerr << L"usage: --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length 1..4096> <new-directory> --allow-residency\n";
+        std::wcerr << L"usage: --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length 1..4096> <new-directory> --allow-residency [--trace-loader]\n";
         return 2;
     }
     std::wstring error;
     ImageVerificationRecipe recipe;
     bool captured = false;
     uint32_t openStatus = ERROR_SUCCESS;
+    image_loader::Window window;
+    image_loader::Registration registration;
+    ULONG markerStatus = ERROR_NOT_READY;
+    std::wstring recipeDigest;
     try
     {
         std::unique_ptr<void, CloseHandleDeleter> process(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
@@ -65,15 +71,26 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
             {
                 error = L"process handle identity or supported address shape did not match";
             }
+            else if (traceLoader && (markerStatus = registration.Open(window)) != ERROR_SUCCESS)
+            {
+                error = L"loader-window trace provider is unavailable";
+            }
             else
             {
+                markerStatus = ERROR_NOT_READY;
                 ImageRecipeCaptureOptions options;
                 options.TargetId = L"process:" + std::to_wstring(pid) + L":" + std::to_wstring(creation);
                 options.AddressSpaceId = options.TargetId + L":user";
                 options.AllowResidencyChanges = true;
                 options.MappingObserver = &source;
+                if (traceLoader) { options.LoaderWindow = &window; }
                 captured = CaptureObservedImageRecipe(args[2], source, base, static_cast<uint32_t>(rva),
                     static_cast<uint32_t>(length), args[6], options, &recipe, &error, cancellation);
+                if (traceLoader && captured)
+                {
+                    mcpjson::GetString(ImageRecipeJson(recipe), L"recipe_sha256", &recipeDigest);
+                    markerStatus = registration.Publish(window, recipeDigest, recipe.Reads.size());
+                }
             }
         }
     }
@@ -88,7 +105,10 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
         L",\"original_claim_recorded\":" + (captured ? L"true" : L"false") +
         L",\"collector_authenticated\":false,\"execution_observed\":false,\"residency_consent\":true,\"open_status\":" +
         std::to_wstring(openStatus) + L",\"error\":" + mcpjson::Quote(error) + L",\"result\":" +
-        (captured ? recipe.RecordedResult : L"null") + L"}";
+        (captured ? recipe.RecordedResult : L"null") +
+        (traceLoader ? L",\"loader_marker_status\":" + std::to_wstring(markerStatus) +
+            L",\"loader_marker_submitted\":" + (captured && markerStatus == ERROR_SUCCESS ? L"true" : L"false") +
+            L",\"recipe_sha256\":" + mcpjson::Quote(recipeDigest) : L"") + L"}";
     if (!WriteCapabilityJson(json)) { return 3; }
-    return captured ? 0 : 1;
+    return captured && (!traceLoader || markerStatus == ERROR_SUCCESS) ? 0 : 1;
 }
