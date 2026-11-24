@@ -102,7 +102,9 @@ namespace
             if (d.Version != 1 || !bytes || length < 64) { ++s.Malformed; return; }
             if (!std::equal(s.Pin.begin(), s.Pin.end(), bytes)) { return; }
             if (length != offsetof(image_loader::Window, Reads) + s.Recipe.Reads.size() * sizeof(image_loader::Interval) ||
-                length > sizeof(s.Window) || d.Opcode || d.Keyword != 1 || (h.Flags & EVENT_HEADER_FLAG_CLASSIC_HEADER))
+                length > sizeof(s.Window) || d.Channel != image_loader::Completed.Channel || d.Level != image_loader::Completed.Level ||
+                d.Opcode != image_loader::Completed.Opcode || d.Task != image_loader::Completed.Task || d.Keyword != image_loader::Completed.Keyword ||
+                (h.Flags & (EVENT_HEADER_FLAG_CLASSIC_HEADER | EVENT_HEADER_FLAG_STRING_ONLY | EVENT_HEADER_FLAG_TRACE_MESSAGE)))
                 { ++s.Malformed; return; }
             ++s.Markers;
             s.Marker = point;
@@ -228,6 +230,7 @@ namespace
         const Image* Load = nullptr;
         const Image* Unload = nullptr;
         std::vector<const Image*> Changes;
+        bool ReadWindowValidated = false;
         bool Qualified = false;
     };
 
@@ -262,6 +265,7 @@ namespace
                 { return L"read_clock_conflict"; }
             last = w.Reads[i].End;
         }
+        out.ReadWindowValidated = true;
         if (!EncloseProcess(s, s.Collector, w.Capture.Start, s.Marker.Tick, out.Collector) ||
             !EncloseProcess(s, s.Target, w.Capture.Start, w.Capture.End, out.Target) ||
             !(out.Collector.Start->Ordinal < s.Marker.Ordinal && s.Marker.Ordinal < out.Collector.End->Ordinal))
@@ -320,7 +324,40 @@ namespace
             L",\"end\":" + At(span.End) + L"}";
     }
 
-    int Read(const std::vector<std::wstring>& args, const std::wstring& tracePin, const std::wstring& recipePin)
+    struct Inputs
+    {
+        std::wstring TracePin, RecipePin, ExpectedPage, StatementPath;
+        etl_profile::StatementAuthority Authority;
+    };
+
+    struct WindowReplay
+    {
+        const Inputs& Expected;
+        std::wstring Trace, Recipe, Publication, Claim, Reference, Page;
+        const wchar_t* SourceStatus = nullptr;
+        std::wstring SourceIssue;
+        bool ReadWindowValidated = false;
+        etl_profile::CaptureStatement Statement;
+
+        std::wstring Json(const wchar_t* status) const
+        {
+            const auto nullable = [](const std::wstring& value) { return value.empty() ? std::wstring(L"null") : Quote(value); };
+            const bool match = !Page.empty() && Page == Expected.ExpectedPage;
+            return L"{\"schema\":\"kn.image_loader_window_replay.v1\",\"status\":" + Quote(status) +
+                L",\"expected_etl_sha256\":" + Quote(Expected.TracePin) + L",\"etl_sha256\":" + nullable(Trace) +
+                L",\"expected_recipe_sha256\":" + Quote(Expected.RecipePin) + L",\"recipe_sha256\":" + nullable(Recipe) +
+                L",\"claim_publication_sha256\":" + nullable(Publication) + L",\"original_claim_sha256\":" + nullable(Claim) +
+                L",\"reference_sha256\":" + nullable(Reference) + L",\"original_claim_reproduced\":" + (Claim.empty() ? L"false" : L"true") +
+                L",\"expected_page_sha256\":" + Quote(Expected.ExpectedPage) + L",\"replayed_page_sha256\":" + nullable(Page) +
+                L",\"page_bytes_match\":" + (Page.empty() ? L"null" : match ? L"true" : L"false") +
+                L",\"source_status\":" + (SourceStatus ? Quote(SourceStatus) : L"null") + L",\"source_issue\":" + nullable(SourceIssue) +
+                L",\"capture_statement\":" + (Expected.StatementPath.empty() ? std::wstring(L"null") : Statement.Json(Expected.Authority, match)) +
+                L",\"read_window_in_attested_etl\":" + (match && Statement.Bound() && ReadWindowValidated ? L"true" : L"false") +
+                L",\"collector_authenticated\":false,\"execution_observed\":false,\"continuous_mapping_proven\":false}";
+        }
+    };
+
+    int Read(const std::vector<std::wstring>& args, const Inputs& inputs)
     {
         const auto sink = GetStdHandle(STD_OUTPUT_HANDLE);
         const bool disk = GetFileType(sink) == FILE_TYPE_DISK;
@@ -329,11 +366,14 @@ namespace
         const bool directory = std::filesystem::is_directory(capture, ec);
         const bool managed = _wcsicmp(capture.extension().c_str(), L".kncapture") == 0;
         if (!directory && !managed) { return 2; }
-        DistinctArtifactInput traceGuard, rootGuard, referenceGuard;
+        DistinctArtifactInput traceGuard, rootGuard, referenceGuard, statementGuard;
         if (disk && (!traceGuard.Hold(sink, args[0]) ||
+            !statementGuard.Hold(sink, inputs.StatementPath) ||
             !rootGuard.Hold(sink, (directory ? capture / L"recipe.knverify" : capture).wstring()))) { return 2; }
+        WindowReplay receipt{inputs};
         const auto fail = [&](const wchar_t* reason) {
-            const auto json = L"{\"schema\":\"kn.image_loader_window.v1\",\"status\":\"unavailable\",\"issue\":" +
+            const auto json = !inputs.ExpectedPage.empty() ? receipt.Json(reason) :
+                L"{\"schema\":\"kn.image_loader_window.v1\",\"status\":\"unavailable\",\"issue\":" +
                 Quote(reason) + L",\"recorded_loader_interval\":false}";
             return WriteCapabilityJson(json) ? 1 : 2;
         };
@@ -344,16 +384,23 @@ namespace
             { return disk ? 2 : fail(L"original_claim_unavailable"); }
         const auto references = directory ? capture : capture.parent_path().parent_path() / L"image-references";
         if (disk && !referenceGuard.Hold(sink, (references / (original.Recipe.ReferenceSha256 + L".knblob")).wstring())) { return 2; }
-        if (replay.RecipeSha256 != recipePin) { return fail(L"recipe_pin_mismatch"); }
-        Scan scan{original.Recipe, recipePin};
+        receipt.Recipe = replay.RecipeSha256;
+        receipt.Publication = replay.ClaimPublicationSha256;
+        receipt.Claim = replay.RecordedClaimSha256;
+        receipt.Reference = original.Recipe.ReferenceSha256;
+        if (replay.RecipeSha256 != inputs.RecipePin) { return fail(L"recipe_pin_mismatch"); }
+        Scan scan{original.Recipe, inputs.RecipePin};
         if (!Identities(scan)) { return fail(L"native_process_recipe_required"); }
         etl_profile::SavedEtlInput source;
-        if (!source.Open(args[0]) || source.File.Sha256 != tracePin) { return fail(L"trace_unavailable_or_pin_mismatch"); }
+        if (!source.Open(args[0])) { return fail(L"trace_unavailable_or_pin_mismatch"); }
+        receipt.Trace = source.File.Sha256;
+        if (receipt.Trace != inputs.TracePin) { return fail(L"trace_unavailable_or_pin_mismatch"); }
         TRACE_LOGFILE_HEADER h{};
         if (const auto failure = ReadTrace(source, scan, h)) { return fail(failure); }
         Outcome out;
         const std::wstring issue = Assess(scan, h, out);
         const bool changed = issue == L"loader_transition_in_capture";
+        const auto status = out.Qualified ? L"bracketed" : changed ? L"transition_observed" : L"unavailable";
         const auto& w = scan.Window;
         std::wstring rows = L"[";
         if (scan.Markers == 1)
@@ -379,8 +426,8 @@ namespace
             changes += L"{\"image\":" + ImageJson(image) + L",\"strictly_inside_reads\":" + reads + L"]}";
         }
         const auto json = L"{\"schema\":\"kn.image_loader_window.v1\",\"status\":" +
-            Quote(out.Qualified ? L"bracketed" : changed ? L"transition_observed" : L"unavailable") + L",\"issue\":" + Quote(issue) +
-            L",\"etl_sha256\":" + Quote(tracePin) + L",\"recipe_sha256\":" + Quote(recipePin) +
+            Quote(status) + L",\"issue\":" + Quote(issue) +
+            L",\"etl_sha256\":" + Quote(inputs.TracePin) + L",\"recipe_sha256\":" + Quote(inputs.RecipePin) +
             L",\"original_claim_sha256\":" + Quote(replay.RecordedClaimSha256) + L",\"reference_sha256\":" + Quote(scan.Recipe.ReferenceSha256) +
             L",\"original_claim_reproduced\":true,\"collector_generation\":" + ProcessJson(scan.Collector, out.Collector) +
             L",\"target_generation\":" + ProcessJson(scan.Target, out.Target) + L",\"marker\":" + At(scan.Markers ? &scan.Marker : nullptr) +
@@ -393,14 +440,44 @@ namespace
             L",\"previous_image\":" + ImageJson(out.Load) + L",\"next_image\":" + ImageJson(out.Unload) +
             L",\"loader_transitions\":" + changes + L"],\"recorded_loader_interval\":" + (out.Qualified ? L"true" : L"false") +
             L",\"continuous_mapping_proven\":false,\"collector_authenticated\":false,\"execution_observed\":false,\"current_state_known\":false}";
-        return WriteCapabilityJson(json) ? (out.Qualified || changed ? 0 : 1) : 2;
+        const bool measured = out.Qualified || changed;
+        if (inputs.ExpectedPage.empty()) { return WriteCapabilityJson(json) ? (measured ? 0 : 1) : 2; }
+        const auto digest = etl_profile::ReportFileSha256(json);
+        if (digest.empty()) { return fail(L"page_hash_unavailable"); }
+        if (!inputs.StatementPath.empty())
+        {
+            const auto verified = etl_profile::ReadCaptureStatement(inputs.StatementPath, inputs.Authority, source.File);
+            if (!source.Revalidated()) { return fail(L"trace_identity_changed"); }
+            receipt.Statement = verified;
+        }
+        receipt.Page = digest;
+        receipt.SourceStatus = status;
+        receipt.SourceIssue = issue;
+        receipt.ReadWindowValidated = out.ReadWindowValidated;
+        const bool match = digest == inputs.ExpectedPage;
+        const bool accepted = inputs.StatementPath.empty() || receipt.Statement.Bound();
+        const auto disposition = !match ? L"page_mismatch" : accepted ? L"matched" : L"capture_statement_rejected";
+        return WriteCapabilityJson(receipt.Json(disposition)) ? (match && accepted && measured ? 0 : 1) : 2;
     }
 }
 
 int RunEtlImageLifetime(const std::vector<std::wstring>& args)
 {
-    std::wstring trace, recipe;
-    if (args.size() != 7 || args[1] != L"--sha256" || args[3] != L"--capture" || args[5] != L"--recipe-sha256" ||
-        !etl_profile::NormalizeDigest(args[2], trace) || !etl_profile::NormalizeDigest(args[6], recipe)) { return 2; }
-    return Read(args, trace, recipe);
+    Inputs inputs;
+    if (args.size() < 7 || args.size() > 13 || args[1] != L"--sha256" || args[3] != L"--capture" || args[5] != L"--recipe-sha256" ||
+        !etl_profile::NormalizeDigest(args[2], inputs.TracePin) || !etl_profile::NormalizeDigest(args[6], inputs.RecipePin)) { return 2; }
+    for (size_t i = 7; i < args.size();)
+    {
+        if (args[i] == L"--check-page" && inputs.ExpectedPage.empty() && i + 1 < args.size() &&
+            etl_profile::NormalizeDigest(args[i + 1], inputs.ExpectedPage)) { i += 2; }
+        else if (args[i] == L"--capture-statement" && inputs.StatementPath.empty() && i + 3 < args.size() && !args[i + 1].empty() &&
+            etl_profile::ParseStatementAuthority(args[i + 2], args[i + 3], inputs.Authority))
+        {
+            inputs.StatementPath = args[i + 1];
+            i += 4;
+        }
+        else { return 2; }
+    }
+    if (!inputs.StatementPath.empty() && inputs.ExpectedPage.empty()) { return 2; }
+    return Read(args, inputs);
 }

@@ -7,6 +7,36 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Signed replay of retained loader reports on 2026-11-24
+
+Two standard-user trials each recorded the same DLL loading twice at one
+address. The x64 Release reader reproduced all four saved loader reports.
+Each private recording contained one collector marker and seven timed reads.
+Separate test keys signed the recording as capture controller and archive
+witness. Both roles bound the exact ETL to the matching report. Only the
+controller signature authenticated the recording assertion.
+
+The reports still returned `process_generation_unavailable` and exit 1.
+Pairing a signed trace with the other capture reproduced `capture_marker_missing`
+and left `read_window_in_attested_etl` false. Crossing signatures between
+traces, choosing the wrong key or role, and changing the report's final LF
+also withheld the read-window claim. A positive kernel load/unload interval
+remains unverified on this account. The tests used 15 in-memory event and
+clock controls per recording.
+
+Six reports from three earlier trials reproduced byte for byte. After
+removal of the build intermediates, a new signed capture-only trial replayed
+with all 27 stored files and their modification times intact. In 64 paired
+publications, two simultaneous writers preserved the first complete report.
+Windows PowerShell 5.1 and PowerShell 7.6 each ran the documented signed
+example on two direct captures and one managed archive. The command suite
+passed 3,088 checks. The shared ETL verifier also passed its private
+controller, public archive and truncated-recording cases.
+
+Run `tools/validate-image-loader-window.ps1` with matching Release objects
+and `-OpenSsl <openssl.exe>` to repeat the signed private trial.
+[Command and receipt fields](TRACE_IMPORT.md#verify-a-retained-loader-report)
+
 ## Native loader windows for image captures on 2026-11-24
 
 On current main, a standard-user child loaded the same copy of Windows

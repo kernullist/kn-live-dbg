@@ -43,6 +43,42 @@ interval describes the recorded loader activity for this capture. Event loss
 and the visibility of this provider limit conclusions about continuous mapping.
 [Windows ProcessTrace](https://learn.microsoft.com/en-us/windows/win32/api/evntrace/nf-evntrace-processtrace)
 
+### Verify a retained loader report
+
+Keep the original report as the native command emitted it, including its final
+LF. `--check-page` reruns original-policy image replay, reads the pinned ETL
+and hashes the regenerated UTF-8 report. The resulting
+`kn.image_loader_window_replay.v1` receipt records both report digests, the
+image publication's payload digest, the original claim digest, the inner recipe
+digest and the retained reference digest. A direct case directory and its
+managed `.kncapture` archive can reproduce the same report.
+
+For a signed ETL, obtain the public point and role through the operator's
+key provisioning record. Here `$reportFile` contains the saved native JSON and
+`$recipePin` is the inner digest from the original capture.
+
+```powershell
+$reportPin = (Get-FileHash -Algorithm SHA256 -LiteralPath $reportFile).Hash
+$point = (Get-Content -Raw -LiteralPath $approvedPointFile).Trim()
+& $exe --etl-image-lifetime $etl --sha256 $etlPin --capture $case --recipe-sha256 $recipePin --check-page $reportPin --capture-statement $statement archive_witness $point
+```
+
+`read_window_in_attested_etl` requires an exact report match, a valid statement
+for the supplied role and ETL bytes, and one clock-validated marker for this
+recipe. A different event level, task or channel, or a string-only event
+header, leaves the read window unqualified. A report about a missing marker
+can reproduce byte for byte while this field stays false. `capture_controller`
+identifies the author of the recording assertion. `archive_witness` attests
+to the saved bytes.
+The image collector, continuous mapping identity and code execution each
+require other evidence. [Capture statement fields and signer roles](#verify-a-signed-capture-statement)
+
+`source_status` and `source_issue` carry the original loader result. A
+matching unavailable observation exits 1. A stale report returns
+`page_mismatch`. A matching report with a rejected statement returns
+`capture_statement_rejected` and the signature, role or file mismatch.
+If the ETL or original claim could not be replayed, `page_bytes_match` is null.
+
 ## Saved Windows CPU samples
 
 `KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N]`

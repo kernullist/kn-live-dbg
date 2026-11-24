@@ -1,6 +1,7 @@
 param(
     [string]$Executable = 'x64/Release/KnLiveDbg.exe',
     [string]$ObjectDirectory = 'x64/Release/user',
+    [string]$OpenSsl,
     [switch]$SystemTrace
 )
 $ErrorActionPreference = 'Stop'
@@ -39,9 +40,11 @@ finally {
     if (!(Get-ChildItem -Force -LiteralPath $trial)) { [IO.Directory]::Delete($trial, $false) }
 }
 $test = Join-Path $PSScriptRoot 'test-image-loader-window.py'
-& python -B $test --exe $product --private-capturer $fixture --root (Join-Path $trial 'private')
+$signing = @()
+if ($OpenSsl) { $signing = @('--openssl', (Resolve-Path -LiteralPath $OpenSsl).Path) }
+& python -B $test --exe $product --private-capturer $fixture --root (Join-Path $trial 'private') @signing
 if ($LASTEXITCODE) { throw "Private collector checks failed ($LASTEXITCODE)" }
 if ($SystemTrace) {
-    & python -B $test --exe $product --root (Join-Path $trial 'system')
+    & python -B $test --exe $product --root (Join-Path $trial 'system') @signing
     if ($LASTEXITCODE) { throw "System loader trace checks failed ($LASTEXITCODE)" }
 }

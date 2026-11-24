@@ -518,6 +518,12 @@ recorded read times. Exit 0 covers a bracketed interval or a recorded transition
 Exit 1 covers incomplete evidence or a digest mismatch. Exit 2 covers grammar
 and output errors. [Trace configuration and report fields](TRACE_IMPORT.md#native-loader-intervals-for-image-captures)
 
+To verify a saved loader report, add `--check-page <report-sha256>`.
+You can also supply `--capture-statement <statement.jws> <capture_controller|archive_witness> <trusted-p256-point>`.
+The receipt identifies the replayed recipe, original claim, claim publication,
+retained PE and exact report bytes. A matched report with missing process
+boundaries still exits 1. [Verify a retained loader report](TRACE_IMPORT.md#verify-a-retained-loader-report)
+
 `KnLiveDbg.exe --offline !kmon journal-image <case-directory> <private-store> <collection-id> /json`
 archives an existing direct recipe/claim publication and its exact reference into
 a store initialized by `init-store`. The collection ID is a canonical decimal
@@ -1482,7 +1488,9 @@ The same option works with `--etl-switches`, `--etl-disk-io` and `--etl-hard-fau
 key authorized to attest to archived bytes. A matching controller receipt
 identifies the signed claims, the original ETL, the regenerated page, the
 statement file and the trusted key. It records the role check separately
-from the signature check. [Signed statement fields](TRACE_IMPORT.md#verify-a-signed-capture-statement)
+from the signature check. Image loader reports also require the original
+capture and its recipe digest. [Signed statement fields](TRACE_IMPORT.md#verify-a-signed-capture-statement)
+[Loader report example](TRACE_IMPORT.md#verify-a-retained-loader-report)
 
 Use `--etl-rotation-set` to verify the order, file identities and any signed
 controller stop for a rotating recording. Supply an explicit ordinal for

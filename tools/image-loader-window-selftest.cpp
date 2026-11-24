@@ -23,10 +23,11 @@ namespace
             Value.LogFileNameOffset = offsetof(Properties, File);
         }
     };
-    int PrivateCapture(const wchar_t* path, const std::vector<std::wstring>& args)
+    int PrivateCapture(const wchar_t* path, const wchar_t* session, const std::vector<std::wstring>& args)
     {
         Properties open, close;
-        if (wcscpy_s(open.File, path) || FAILED(CoCreateGuid(&open.Value.Wnode.Guid))) { return 1; }
+        if (wcscpy_s(open.File, path) ||
+            FAILED(session ? IIDFromString(session, &open.Value.Wnode.Guid) : CoCreateGuid(&open.Value.Wnode.Guid))) { return 1; }
         close.Value.Wnode.Guid = open.Value.Wnode.Guid;
         const auto name = L"KnLiveDbg-private-loader-" + std::to_wstring(GetCurrentProcessId());
         REGHANDLE registered = 0;
@@ -57,6 +58,7 @@ namespace
         uint8_t Version;
         uint32_t HeaderPid;
         std::vector<uint8_t> Bytes;
+        uint8_t Level = image_loader::Completed.Level;
     };
     template<class T> void Append(std::vector<uint8_t>& dest, T value)
     {
@@ -90,7 +92,8 @@ namespace
         TRACE_LOGFILE_HEADER header{};
         Require(input.Open(etl) && !ReadTrace(input, actual, header) && actual.Markers == 1, "read private marker");
         Outcome missing;
-        Require(std::wstring(Assess(actual, header, missing)) == L"process_generation_unavailable", "private marker alone");
+        Require(std::wstring(Assess(actual, header, missing)) == L"process_generation_unavailable" && missing.ReadWindowValidated,
+            "valid private marker without process boundaries");
         const auto& w = actual.Window;
         const auto finish = actual.Marker.Tick + 1'000'000;
         std::vector<Row> rows{
@@ -114,6 +117,7 @@ namespace
                 event.EventHeader.TimeStamp.QuadPart = row.Tick;
                 event.EventHeader.EventDescriptor.Id = row.Id;
                 event.EventHeader.EventDescriptor.Version = row.Version;
+                event.EventHeader.EventDescriptor.Level = row.Level;
                 event.EventHeader.EventDescriptor.Keyword = IsEqualGUID(row.ProviderId, image_loader::Provider) ? 1 : 0;
                 event.UserData = const_cast<uint8_t*>(row.Bytes.data());
                 event.UserDataLength = static_cast<USHORT>(row.Bytes.size());
@@ -129,6 +133,8 @@ namespace
             if (std::wstring(issue) != expected) { std::wcerr << expected << L" returned " << issue << L'\n'; }
             Require(std::wstring(issue) == expected, "lifetime disposition");
             Require(out.Qualified == (std::wstring(expected) == L"recorded_loader_interval"), "interval promotion");
+            if (std::wstring(expected) == L"unsupported_or_malformed_record" || std::wstring(expected) == L"read_clock_conflict" || gap)
+                { Require(!out.ReadWindowValidated, "invalid evidence cannot bind a read window"); }
         };
         check(rows, L"recorded_loader_interval");
         check(rows, L"kernel_events_in_private_session", false, true);
@@ -142,6 +148,9 @@ namespace
         changed = rows;
         changed.back().Bytes.front() ^= 1;
         check(changed, L"capture_marker_missing");
+        changed = rows;
+        changed.back().Level = 0;
+        check(changed, L"unsupported_or_malformed_record");
         changed = rows;
         changed[4] = ProcessRow(finish, false, {actual.Collector.Pid, actual.Collector.Birth + 1});
         check(changed, L"process_generation_unavailable");
@@ -169,7 +178,7 @@ namespace
         const auto after = w.Capture.End + 100;
         std::memcpy(changed.back().Bytes.data() + offsetof(image_loader::Window, Reads), &after, sizeof(after));
         check(changed, L"read_clock_conflict");
-        std::cout << "Genuine collector marker and 14 in-memory disposition controls passed.\n";
+        std::cout << "Genuine collector marker and 15 in-memory disposition controls passed.\n";
     }
 }
 
@@ -177,7 +186,8 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
-        if (argc > 3 && std::wstring(argv[1]) == L"--private") { return PrivateCapture(argv[2], {argv + 3, argv + argc}); }
+        if (argc > 3 && std::wstring(argv[1]) == L"--private") { return PrivateCapture(argv[2], nullptr, {argv + 3, argv + argc}); }
+        if (argc > 4 && std::wstring(argv[1]) == L"--private-session") { return PrivateCapture(argv[3], argv[2], {argv + 4, argv + argc}); }
         if (argc == 5 && std::wstring(argv[1]) == L"--controls") { Controls(argv[2], argv[3], argv[4]); return 0; }
         return 2;
     }

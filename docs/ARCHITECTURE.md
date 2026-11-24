@@ -3552,6 +3552,15 @@ comparison describes events visible to one logger. Continuous VAD identity,
 collector authentication and instruction execution require separate evidence.
 [Trace inputs and command](TRACE_IMPORT.md#native-loader-intervals-for-image-captures)
 
+An optional loader replay receipt links the original claim publication and
+retained reference to the exact report produced by replay. A trusted controller
+or archive key can attest to the ETL's digest and length. The verification
+chain reaches an individual read window only when the regenerated report
+matches the requested digest and the recorded marker matches the collector
+descriptor, recipe and read clocks. The same receipt can establish that a
+report reproduced the absence of a matching marker.
+[Loader report replay](TRACE_IMPORT.md#verify-a-retained-loader-report)
+
 ### Direct recipe replay
 
 Default `replay-image` uses the recorded policy only when this binary implements

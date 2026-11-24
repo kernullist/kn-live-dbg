@@ -161,7 +161,9 @@ class PublicContentTests(unittest.TestCase):
                      dict(strictly_inside_reads=["1"], image={}), dict(recorded_loader_interval=False),
                      dict(loader_marker_status=0, loader_marker_submitted=True),
                      dict(read="1", address="12", start_qpc="5", end_qpc="6"), dict(previous_image={}, next_image={}),
-                     dict(collector_generation={}, target_generation={})):
+                     dict(collector_generation={}, target_generation={}), dict(schema="kn.image_loader_window_replay.v1"),
+                     dict(read_window_in_attested_etl=False), dict(expected_etl_sha256="x", expected_recipe_sha256="y"),
+                     dict(claim_publication_sha256="a", replayed_page_sha256="b")):
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 raw = ("result " + json.dumps(item)).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", raw)})

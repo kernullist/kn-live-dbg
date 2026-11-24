@@ -54242,6 +54242,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --verify-process-image <pid> <creation-filetime> <reference> <hex-base> <hex-rva> <length> <new-directory> --allow-residency [--trace-loader]\n";
         std::wcout << L"    record one live user image range through an owned process handle; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe --etl-image-lifetime <local.etl> --sha256 <digest> --capture <directory|managed.kncapture> --recipe-sha256 <digest>\n";
+        std::wcout << L"    [--check-page <report-sha256> [--capture-statement <statement.jws> <capture_controller|archive_witness> <p256-point>]]\n";
         std::wcout << L"  KnLiveDbg.exe --cloak                  relaunch with randomized session names\n";
         std::wcout << L"  KnLiveDbg.exe --connect <ipv4>:<port>   remote operator client; prompts for password\n";
         std::wcout << L"  KnLiveDbg.exe --game-manifest create <image> <pdb> <layout-or-dash> <new-output>\n";

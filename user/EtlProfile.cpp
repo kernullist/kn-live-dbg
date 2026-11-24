@@ -648,19 +648,6 @@ namespace
             OpenSource(path, parents, source, volumePath, maximum, memberBytes, apiError);
     }
 
-    etl_profile::CaptureStatement ReadCaptureStatement(const Options& options, const SchemaArtifact& etl)
-    {
-        etl_profile::SavedEtlInput statement;
-        etl_profile::CaptureStatement result;
-        result.Status = L"statement_unavailable";
-        if (!statement.Open(options.statementPath, etl_profile::MaxStatementBytes)) { return result; }
-        std::vector<uint8_t> bytes;
-        if (!statement.ReadStatement(bytes)) { result.Status = L"statement_changed"; }
-        else { result = etl_profile::VerifyCaptureStatement(bytes, options.statementAuthority, etl.Sha256, etl.Bytes()); }
-        result.FileSha256 = statement.File.Sha256;
-        return result;
-    }
-
     std::wstring Hex(uint64_t value)
     {
         wchar_t text[20]{};
@@ -1782,18 +1769,14 @@ static int ReadValidatedEtl(const std::vector<std::wstring>& args, Scan& scan)
     if (report.empty()) { return Failure(scan.options, L"reference_read_failed", source.Sha256, 0, reference.file.Sha256); }
     if (!scan.options.expectedPage.empty())
     {
-        const auto bytes = CapabilityJsonFileBytes(report);
-        ContentHash hash;
-        if (bytes.empty() || !hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()))
-        { return Failure(scan.options, L"page_hash_unavailable", source.Sha256); }
-        const auto digest = hash.Finish();
+        const auto digest = etl_profile::ReportFileSha256(report);
         if (digest.empty()) { return Failure(scan.options, L"page_hash_unavailable", source.Sha256); }
         const bool match = digest == scan.options.expectedPage;
         etl_profile::CaptureStatement statement;
         const bool withStatement = !scan.options.statementPath.empty();
         if (withStatement)
         {
-            statement = ReadCaptureStatement(scan.options, source);
+            statement = etl_profile::ReadCaptureStatement(scan.options.statementPath, scan.options.statementAuthority, source);
             if (!source.PathNamesFile(volumePath) || !source.Unchanged()) { return Failure(scan.options, L"source_changed"); }
             if (haveReference && (!reference.file.PathNamesFile(referenceVolumePath) || !reference.file.Unchanged()))
             { return Failure(scan.options, L"reference_changed", source.Sha256); }
@@ -1848,6 +1831,26 @@ bool etl_profile::SavedEtlInput::OpenMember(const std::wstring& name, uint64_t e
 bool etl_profile::SavedEtlInput::Revalidated()
 {
     return File.PathNamesFile(VolumePath) && File.Unchanged();
+}
+
+std::wstring etl_profile::ReportFileSha256(const std::wstring& report)
+{
+    const auto bytes = CapabilityJsonFileBytes(report);
+    ContentHash hash;
+    return !bytes.empty() && hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) ? hash.Finish() : std::wstring{};
+}
+
+etl_profile::CaptureStatement etl_profile::ReadCaptureStatement(const std::wstring& path, const StatementAuthority& key, const SchemaArtifact& etl)
+{
+    SavedEtlInput statement;
+    CaptureStatement result;
+    result.Status = L"statement_unavailable";
+    if (!statement.Open(path, MaxStatementBytes)) { return result; }
+    std::vector<uint8_t> bytes;
+    if (!statement.ReadStatement(bytes)) { result.Status = L"statement_changed"; }
+    else { result = VerifyCaptureStatement(bytes, key, etl.Sha256, etl.Bytes()); }
+    result.FileSha256 = statement.File.Sha256;
+    return result;
 }
 
 bool etl_profile::SavedEtlInput::ReadStatement(std::vector<uint8_t>& bytes)

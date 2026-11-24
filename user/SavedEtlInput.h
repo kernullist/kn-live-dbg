@@ -1,5 +1,6 @@
 #pragma once
 
+#include "EtlCaptureStatement.h"
 #include "SavedEtlCapability.h"
 #include "SchemaArtifact.h"
 #include "SymbolArtifactCache.h"
@@ -7,6 +8,8 @@
 namespace etl_profile
 {
     bool NormalizeDigest(const std::wstring& input, std::wstring& result);
+    std::wstring ReportFileSha256(const std::wstring& report);
+    CaptureStatement ReadCaptureStatement(const std::wstring& path, const StatementAuthority& key, const SchemaArtifact& etl);
 
     class SavedEtlInput
     {
