@@ -23119,7 +23119,7 @@ static void PrintKmonHelp()
     std::wcout << L"    TLS, qualified native KCT prefix, WorkerFactory metadata; static references only\n";
     std::wcout << L"  !kmon diff <before.json> <after.json> [/json]  absence is not resolution\n";
     std::wcout << L"  !kmon inventory <directory> <new-snapshot-directory> [/json]\n";
-    std::wcout << L"  --offline !kmon inventory <directory> <snapshot-directory> /resume [/chunks N] [/json]\n";
+    std::wcout << L"  --offline !kmon inventory <directory> <snapshot-directory> /resume [/chunks N] [/verify-entries N] [/json]\n";
     std::wcout << L"  !kmon trace <file> [/limit 1..128] [/cursor token] [/json]  offline normalized samples or saved ETL profile pages\n";
     std::wcout << L"  !kmon trace <local.log> /v8 <sha256> [/code-log <local.log.ll> <sha256>] [/limit N] [/cursor token] [/json]  saved V8 CPU samples\n";
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
@@ -23979,27 +23979,29 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
     if (action == L"inventory")
     {
         EvidenceInventoryBuildOptions buildOptions;
-        bool valid = args.size() >= 4 && args.size() <= 8 && !args[2].empty() && !args[3].empty();
+        bool valid = args.size() >= 4 && args.size() <= 10 && !args[2].empty() && !args[3].empty();
         std::set<std::wstring> seen;
         for (size_t i = 4; valid && i < args.size(); ++i)
         {
             const auto option = ToLower(args[i]);
             if (!seen.insert(option).second) { valid = false; }
             else if (option == L"/resume" && directJsonOutput) { buildOptions.Resume = true; }
-            else if (option == L"/chunks" && directJsonOutput && i + 1 < args.size())
+            else if ((option == L"/chunks" || option == L"/verify-entries") && directJsonOutput && i + 1 < args.size())
             {
                 const auto& value = args[++i];
                 uint64_t count = 0;
                 valid = !value.empty() && value.find_first_not_of(L"0123456789") == std::wstring::npos &&
-                    ParseUnsigned(value, 10, &count) && count >= 1 && count <= EvidenceInventoryMaxChunks;
-                if (valid) { buildOptions.NewChunkLimit = static_cast<size_t>(count); }
+                    ParseUnsigned(value, 10, &count) && count >= 1 &&
+                    count <= (option == L"/chunks" ? EvidenceInventoryMaxChunks : EvidenceInventoryMaxEntries);
+                if (valid && option == L"/chunks") { buildOptions.NewChunkLimit = static_cast<size_t>(count); }
+                else if (valid) { buildOptions.VerifyEntryLimit = static_cast<size_t>(count); }
             }
             else { valid = option == L"/json"; }
         }
-        if (!valid || (!buildOptions.Resume && seen.count(L"/chunks")))
+        if (!valid || (!buildOptions.Resume && (seen.count(L"/chunks") || seen.count(L"/verify-entries"))))
         {
             std::wcerr << L"!kmon inventory: usage: !kmon inventory <directory> <new-snapshot-directory> [/json]\n"
-                << L"--offline !kmon inventory <directory> <snapshot-directory> /resume [/chunks N] [/json]\n";
+                << L"--offline !kmon inventory <directory> <snapshot-directory> /resume [/chunks N] [/verify-entries N] [/json]\n";
             return 2;
         }
         buildOptions.Cancellation = &g_StopRequested;

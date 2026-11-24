@@ -25,7 +25,9 @@ class PublicContentTests(unittest.TestCase):
                     self.assertTrue(AUDIT.inspect("renamed.txt", text.encode(encoding)), (schema, encoding))
             self.assertFalse(AUDIT.inspect("guide.md", ("The format is " + schema).encode()))
         for fields in (dict(source_id="a", output_id="b", catalog_sha256="c"),
-                       dict(chunk_sha256="a", originals_sha256="b"), dict(reused_entries="1", verified_entries="0")):
+                       dict(chunk_sha256="a", originals_sha256="b"), dict(reused_entries="1", verified_entries="0"),
+                       dict(verified_through="5", verification_seal="00"), dict(verified_through="4", raw_witness_prefix=""),
+                       dict(raw_witness_prefix="", verification_seal="00")):
             self.assertTrue(AUDIT.inspect("fragment.txt", ("log\n" + json.dumps(fields)[:-1]).encode()))
 
     def test_release_path_rule_export(self):

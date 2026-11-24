@@ -1,5 +1,6 @@
 #include "EvidenceInventory.h"
 #include "EvidenceInventoryFiles.h"
+#include "EvidenceInventoryVerification.h"
 #include "AnalystSnapshot.h"
 #include "ContentHash.h"
 #include "McpJson.h"
@@ -9,7 +10,7 @@
 
 namespace
 {
-    constexpr size_t ChunkEntries = 128;
+    constexpr size_t ChunkEntries = EvidenceInventoryChunkEntries;
     constexpr size_t MaximumChunks = EvidenceInventoryMaxChunks;
     constexpr size_t ChunkBytes = 256 * 1024;
     constexpr size_t ManifestBytes = 2 * 1024 * 1024;
@@ -302,6 +303,7 @@ namespace
         explicit ResumableInventory(const EvidenceInventoryBuildOptions& options) : Options(options)
         {
             Result.Resume = true;
+            Result.VerifyEntryLimit = options.VerifyEntryLimit;
         }
 
         EvidenceInventoryBuildResult Run(const std::wstring& directory, const std::wstring& destination)
@@ -314,7 +316,8 @@ namespace
             }
             Index.DirectoryId = DirectoryId(Source.wstring());
             std::wstring catalog;
-            if (Index.DirectoryId.empty() || !Catalog(Names, catalog)) { return Result; }
+            if (Index.DirectoryId.empty() || !Catalog(Names, catalog, Options.VerifyEntryLimit ? &Generations : nullptr))
+            { return Result; }
             const auto extension = Output.extension();
             if ((extension == L".kncase" || extension == L".knledger") &&
                 DirectoryId(Output.parent_path().wstring()) == Index.DirectoryId) { Fail(L"invalid_path"); return Result; }
@@ -392,9 +395,11 @@ namespace
                 Result.Entries += count;
             }
 
-            // The sidecars are private, unauthenticated derived data. Reconstruct every row
-            // and its raw-byte witness before allowing an immutable manifest to represent it.
-            if (Result.Entries == Names.size() && !VerifyOriginals()) { return Result; }
+            if (Result.Entries == Names.size())
+            {
+                const bool verified = Options.VerifyEntryLimit ? VerifyBounded(previous) : VerifyOriginals();
+                if (!verified) { return Result; }
+            }
             std::wstring current;
             std::vector<std::wstring> currentNames;
             if (!Catalog(currentNames, current)) { return Result; }
@@ -458,7 +463,8 @@ namespace
             return !error || Fail(L"resume_marker_missing");
         }
 
-        bool Catalog(std::vector<std::wstring>& names, std::wstring& digest)
+        bool Catalog(std::vector<std::wstring>& names, std::wstring& digest,
+            std::vector<inventory_files::Generation>* generations = nullptr)
         {
             constexpr size_t maximumNameChars = 16 * 1024 * 1024;
             auto directory = inventory_files::Open(Source, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE);
@@ -487,10 +493,15 @@ namespace
             std::sort(names.begin(), names.end());
             if (std::adjacent_find(names.begin(), names.end()) != names.end()) { return Fail(L"source_changed"); }
             ContentHash hash;
+            if (generations) { generations->reserve(names.size()); }
             for (const auto& name : names)
             {
                 if (!Running()) { return false; }
-                if (!inventory_files::AddGeneration(hash, Source / name, name)) { return Fail(L"source_unavailable"); }
+                auto file = inventory_files::Open(Source / name, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+                inventory_files::Generation generation{};
+                if (!inventory_files::ReadGeneration(file.get(), generation) || !inventory_files::AddGeneration(hash, name, generation))
+                { return Fail(L"source_unavailable"); }
+                if (generations) { generations->push_back(generation); }
             }
             if (!GetFileInformationByHandleEx(directory.get(), FileBasicInfo, &after, sizeof(after)))
             { return Fail(L"source_unavailable"); }
@@ -536,6 +547,113 @@ namespace
             return true;
         }
 
+        std::filesystem::path VerificationPath(size_t through) const
+        {
+            return Output / (L"verify-" + std::to_wstring(through) + L".knindex");
+        }
+
+        bool RestoreVerification(const std::wstring& chain, std::wstring& witnesses)
+        {
+            // Each seal attests to the entire checked prefix. Only the greatest one is needed.
+            WIN32_FIND_DATAW item{};
+            const auto first = FindFirstFileW((Output / L"verify-*.knindex").c_str(), &item);
+            if (first == INVALID_HANDLE_VALUE)
+            { return GetLastError() == ERROR_FILE_NOT_FOUND || Fail(L"verification_unavailable"); }
+            const std::unique_ptr<void, decltype(&FindClose)> search(first, &FindClose);
+            size_t latest = 0;
+            do
+            {
+                if (!Running()) { return false; }
+                const std::wstring name = item.cFileName;
+                if (name.size() < 16 || name.size() > 22 || name.compare(0, 7, L"verify-") ||
+                    name.compare(name.size() - 8, 8, L".knindex")) { return Fail(L"invalid_verification_checkpoint"); }
+                const auto digits = name.substr(7, name.size() - 15);
+                if (digits.front() == L'0' || digits.find_first_not_of(L"0123456789") != digits.npos ||
+                    (item.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)))
+                { return Fail(L"invalid_verification_checkpoint"); }
+                const auto through = static_cast<size_t>(std::stoul(digits));
+                if (through > Names.size()) { return Fail(L"invalid_verification_checkpoint"); }
+                latest = (std::max)(latest, through);
+            }
+            while (FindNextFileW(search.get(), &item));
+            if (GetLastError() != ERROR_NO_MORE_FILES) { return Fail(L"verification_unavailable"); }
+            std::wstring document;
+            const auto partial = latest == Names.size() ? 0 : latest % ChunkEntries;
+            if (!LoadFile(VerificationPath(latest), inventory_verification::MaxReceiptBytes, document) ||
+                !Verification.Open(document, chain, latest, partial, witnesses))
+            { return Fail(L"invalid_verification_checkpoint"); }
+            Result.VerifiedEntries = Result.ReusedVerifiedEntries = latest;
+            return true;
+        }
+
+        bool CheckOriginal(size_t at, const Entry& expected, std::wstring& witnesses)
+        {
+            const auto path = Source / Names[at];
+            auto pin = inventory_files::Open(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ);
+            inventory_files::Generation actual{};
+            if (!inventory_files::ReadGeneration(pin.get(), actual)) { return Fail(L"source_unavailable"); }
+            if (!(actual == Generations[at])) { return Fail(L"source_changed"); }
+            const uint64_t limit = path.extension() == L".knledger" ? 32768 : EvidenceBundleMaxJsonBytes;
+            const auto size = static_cast<uint64_t>(actual.Size);
+            const bool regular = !(actual.Basic.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT));
+            if (regular && size <= limit && size > Options.ReadBudget - Result.ReadBytes) { return Fail(L"budget_exhausted"); }
+            std::wstring raw;
+            const auto row = ReadEntry(path, Reader, &raw);
+            Result.ReadBytes += row.Bytes;
+            if (row.Bytes && !KmonHuntHash(raw)) { return Fail(L"source_read_incomplete"); }
+            if (!inventory_files::ReadGeneration(pin.get(), actual) || !(actual == Generations[at])) { return Fail(L"source_changed"); }
+            if (row.Name != expected.Name || row.Valid != expected.Valid || row.Bytes != expected.Bytes || row.Digest != expected.Digest)
+            { return Fail(L"original_mismatch"); }
+            witnesses += raw + L"\n";
+            return true;
+        }
+
+        bool VerifyBounded(const std::wstring& chain)
+        {
+            std::wstring witnesses;
+            if (!RestoreVerification(chain, witnesses)) { return false; }
+            size_t saved = Result.VerifiedEntries;
+            const auto stop = (std::min)(Names.size(), saved + Options.VerifyEntryLimit);
+            const auto save = [&]()
+            {
+                if (saved == Result.VerifiedEntries) { return true; }
+                const auto proof = Verification.Seal(chain, Result.VerifiedEntries, witnesses);
+                if (proof.empty()) { return Fail(L"verification_unavailable"); }
+                if (!MatchFile(VerificationPath(Result.VerifiedEntries), proof, inventory_verification::MaxReceiptBytes,
+                    true, L"invalid_verification_checkpoint")) { return false; }
+                saved = Result.VerifiedEntries;
+                return true;
+            };
+            while (Result.VerifiedEntries < stop)
+            {
+                const auto i = Result.VerifiedEntries / ChunkEntries;
+                const auto& chunk = Index.Chunks[i];
+                std::vector<Entry> rows;
+                if (!ReadChunk(Output.wstring(), chunk, &rows, true)) { return Fail(L"corrupt_inventory_chunk"); }
+                const auto end = i * ChunkEntries + rows.size();
+                while (Result.VerifiedEntries < (std::min)(end, stop))
+                {
+                    const auto at = Result.VerifiedEntries;
+                    if (!Running() || !CheckOriginal(at, rows[at % ChunkEntries], witnesses))
+                    {
+                        if (Result.Status != L"budget_exhausted" && Result.Status != L"deadline_exhausted") { return false; }
+                        if (!save()) { return false; }
+                        if (saved > Result.ReusedVerifiedEntries || Result.Entries > Result.ReusedEntries)
+                        { return Fail(L"checkpointed"); }
+                        return false;
+                    }
+                    if (at + 1 == end)
+                    {
+                        if (Hash(witnesses) != OriginalDigests[i]) { return Fail(L"original_mismatch"); }
+                        witnesses.clear();
+                    }
+                    ++Result.VerifiedEntries;
+                }
+                if (!save()) { return false; }
+            }
+            return Result.VerifiedEntries == Names.size() || Fail(L"checkpointed");
+        }
+
         bool LoadFile(const std::filesystem::path& path, size_t limit, std::wstring& json)
         {
             std::wstring raw, error;
@@ -568,8 +686,10 @@ namespace
         const uint64_t Started = GetTickCount64();
         EvidenceInventoryBuildResult Result;
         inventory_files::Pins Pins;
+        inventory_verification::Signer Verification;
         std::filesystem::path Source, Output;
         std::vector<std::wstring> Names, OriginalDigests;
+        std::vector<inventory_files::Generation> Generations;
         Manifest Index;
         BundleReader Reader;
     };
@@ -580,6 +700,7 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
 {
     EvidenceInventoryBuildResult result;
     result.Resume = options.Resume;
+    result.VerifyEntryLimit = options.VerifyEntryLimit;
     if (options.Cancellation != nullptr && options.Cancellation->load())
     {
         result.Status = L"cancelled";
@@ -588,7 +709,8 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
     if (options.MaximumEntries == 0 || options.MaximumEntries > ChunkEntries * MaximumChunks ||
         options.ReadBudget == 0 || options.ReadBudget > 8ull * 1024 * 1024 * 1024 ||
         options.DeadlineMs == 0 || options.DeadlineMs > 120000 ||
-        (options.Resume && (options.NewChunkLimit == 0 || options.NewChunkLimit > MaximumChunks)))
+        (options.Resume && (options.NewChunkLimit == 0 || options.NewChunkLimit > MaximumChunks)) ||
+        options.VerifyEntryLimit > EvidenceInventoryMaxEntries || (!options.Resume && options.VerifyEntryLimit))
     {
         result.Status = L"invalid_budget";
         return result;
@@ -713,6 +835,11 @@ std::wstring EvidenceInventoryBuildJson(const EvidenceInventoryBuildResult& resu
     if (result.Resume)
     {
         progress = L",\"reused_entries\":" + Number(result.ReusedEntries) + L",\"verified_entries\":" + Number(result.VerifiedEntries);
+        if (result.VerifyEntryLimit)
+        {
+            progress += L",\"verify_entry_limit\":" + Number(result.VerifyEntryLimit) +
+                L",\"reused_verified_entries\":" + Number(result.ReusedVerifiedEntries);
+        }
     }
     return L"{\"schema\":" + mcpjson::Quote(schema) + L",\"status\":" + mcpjson::Quote(result.Status) +
         L",\"snapshot_digest\":" + mcpjson::Quote(result.Digest) + L",\"entries\":" + Number(result.Entries) +

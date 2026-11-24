@@ -3,6 +3,7 @@
 #include "ContentHash.h"
 #include "McpJson.h"
 
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -97,22 +98,43 @@ namespace inventory_files
 
     // Encode fixed-width fields on Windows in little-endian order, omitting last-access time.
     // Replacing a file with identical bytes is still a new generation.
-    inline bool AddGeneration(ContentHash& hash, const std::filesystem::path& path, const std::wstring& name)
+    struct Generation
     {
-        auto file = Open(path, FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-        FILE_ID_INFO id{};
-        FILE_BASIC_INFO basic{};
+        FILE_ID_INFO Id{};
+        FILE_BASIC_INFO Basic{};
+        LONGLONG Size = 0;
+
+        bool operator==(const Generation& other) const
+        {
+            return Id.VolumeSerialNumber == other.Id.VolumeSerialNumber &&
+                std::memcmp(Id.FileId.Identifier, other.Id.FileId.Identifier, sizeof(Id.FileId.Identifier)) == 0 &&
+                Basic.CreationTime.QuadPart == other.Basic.CreationTime.QuadPart &&
+                Basic.LastWriteTime.QuadPart == other.Basic.LastWriteTime.QuadPart &&
+                Basic.ChangeTime.QuadPart == other.Basic.ChangeTime.QuadPart &&
+                Basic.FileAttributes == other.Basic.FileAttributes && Size == other.Size;
+        }
+    };
+
+    inline bool ReadGeneration(HANDLE file, Generation& generation)
+    {
         FILE_STANDARD_INFO standard{};
-        if (!file || GetFileType(file.get()) != FILE_TYPE_DISK ||
-            !GetFileInformationByHandleEx(file.get(), FileIdInfo, &id, sizeof(id)) ||
-            !GetFileInformationByHandleEx(file.get(), FileBasicInfo, &basic, sizeof(basic)) ||
-            !GetFileInformationByHandleEx(file.get(), FileStandardInfo, &standard, sizeof(standard))) { return false; }
+        if (!file || GetFileType(file) != FILE_TYPE_DISK ||
+            !GetFileInformationByHandleEx(file, FileIdInfo, &generation.Id, sizeof(generation.Id)) ||
+            !GetFileInformationByHandleEx(file, FileBasicInfo, &generation.Basic, sizeof(generation.Basic)) ||
+            !GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) ||
+            standard.EndOfFile.QuadPart < 0) { return false; }
+        generation.Size = standard.EndOfFile.QuadPart;
+        return true;
+    }
+
+    inline bool AddGeneration(ContentHash& hash, const std::wstring& name, const Generation& generation)
+    {
         const auto utf8 = mcpjson::WideToUtf8(name);
         const uint32_t length = static_cast<uint32_t>(utf8.size());
         const auto add = [&](const auto& field) { return hash.Add(reinterpret_cast<const uint8_t*>(&field), sizeof(field)); };
         return !utf8.empty() && add(length) && hash.Add(reinterpret_cast<const uint8_t*>(utf8.data()), length) &&
-            add(id.VolumeSerialNumber) && add(id.FileId.Identifier) && add(basic.CreationTime.QuadPart) &&
-            add(basic.LastWriteTime.QuadPart) && add(basic.ChangeTime.QuadPart) && add(basic.FileAttributes) &&
-            add(standard.EndOfFile.QuadPart);
+            add(generation.Id.VolumeSerialNumber) && add(generation.Id.FileId.Identifier) &&
+            add(generation.Basic.CreationTime.QuadPart) && add(generation.Basic.LastWriteTime.QuadPart) &&
+            add(generation.Basic.ChangeTime.QuadPart) && add(generation.Basic.FileAttributes) && add(generation.Size);
     }
 }

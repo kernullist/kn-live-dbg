@@ -728,7 +728,7 @@ namespace
                 { L"watch", L"!kmon watch", L"optional reattach after Esc; bare !kmon does this" },
         { L"recent", L"!kmon recent [N]", L"print last N derived events" },
         { L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent kernel/user investigation leads" },
-        { L"inventory", L"!kmon inventory <directory> <new-snapshot-directory> [/json]", L"publish an immutable evidence index (direct --offline supports /resume)" },
+        { L"inventory", L"!kmon inventory <directory> <new-snapshot-directory> [/json]", L"publish an immutable evidence index (direct --offline /resume accepts /chunks and /verify-entries)" },
         { L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]", L"bounded offline reads with explicit missing pages and mapping failures" },
         { L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
         { L"replay", L"!kmon replay <file.kncase> [/json]", L"reconstruct static facts from stored original bytes" },

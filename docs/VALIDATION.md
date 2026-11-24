@@ -7,6 +7,80 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Bounded verification of legacy inventory originals on 2026-11-24
+
+The x64 Release CLI with SHA-256 prefix `d2a1db98d0f1` signed the first 17
+of 129 rows. A second executable (`189091008170`) under the same Windows
+profile returned `invalid_verification_checkpoint` before reading any
+source payloads. The original executable read the remaining 112 members
+and published the v1 manifest. Before this stage the builder could
+repeatedly exhaust a 32 KiB test budget before completing its first
+128-row verification window.
+
+The native case suite set a byte budget equal to two original files and
+observed exactly two more reads. A budget one byte smaller than the next file
+returned `budget_exhausted` with zero bytes read and the same acknowledged
+offset. Restoring the budget produced the same manifest as the original full
+pass. The current-user Windows key reported `ECDSA_P256`, signing-only use
+and an export policy of `None`.
+
+A separate native API probe used 513 originals. With a 250 ms cooperative
+deadline, one process advanced the signed prefix from 1 to 2 and read one
+1,055,268-byte case. Wall time including process startup was 1,469 ms. A fresh process then read the
+remaining 511 cases (539,241,948 bytes) and published the manifest. A single
+read, parse or checkpoint write can extend elapsed time past the deadline.
+
+The scale fixture used 8,141 names for a valid 1,055,268-byte case. Hard links
+kept its physical footprint small. Over 31 CLI processes, the builder read
+8,590,936,788 source bytes during construction and the same number during
+verification. The test checked every invocation's byte count, each canonical
+v1 chunk and the final manifest against an independent reconstruction. The
+total measures logical file reads through the Windows cache.
+
+In a mixed 270-member directory, four verification windows ended at 37, 107,
+162 and 270. The test rebuilt the signed frames from the executable, the
+construction record and individual raw source hashes, then verified them with
+Windows CNG. The earlier v1 reader (`ff4a73ee3b27`) opened the resulting
+manifest. An identical replacement after a signed 128-row window in a
+1,536-member directory returned `source_changed` at the final catalog check.
+The terminal receipt from that run also failed admission in the changed
+directory. No manifest was published.
+
+Terminating a writer after a verification record appeared left the last
+signed offset reusable. The next process read exactly the remaining original
+bytes and preserved the earlier records' hashes and write times. Negative
+controls covered a damaged signature, an edited count or witness prefix, a
+record copied from another output and an altered raw-witness digest with
+recomputed construction links. A pre-existing conflicting manifest retained
+its original bytes.
+
+The native suite passed 531 checks when run alone, including reopening a
+case in a fresh process. Two existing large-case checks had failed during a
+concurrent whole-program link. The preceding CLI successfully read those same
+three original files. The Release link reported MSVC C4744 alignment warnings
+for `KmonHuntIndex::NextQueryEpoch` in other translation units.
+
+The Windows AddressSanitizer suite also passed 531 checks and reopened a case
+after process exit. Its default runtime stopped during interceptor startup.
+With `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1` and
+`ASAN_OPTIONS=halt_on_error=1`, the runtime reported the unsupported
+instruction and completed the suite. Coverage is limited by that interceptor.
+
+All 15 direct CLI tests passed on the final image. Windows PowerShell and
+PowerShell 7 each ran the documented four-chunk, 64-original example on
+513 ledgers in ten calls and produced identical manifests. Command and
+console self-tests passed 3,086 and 570 checks. Restricted launches passed
+86 checks with zero remote accepts. The compiled capability contract
+identified signed verification and its key, executable and catalog limits
+across the 69-contract, 261-route suite. The generated support matrix matched.
+All 45 public-content tests passed, including private records under other
+filenames. The release packaging fixture passed 272 checks in each shell.
+
+These runs used a stopped local source. Full catalog and construction-chain
+validation must fit each call. Physical-media power interruption and a
+changing producer remain open. See the [CLI oracle](../tools/test-evidence-inventory-resume.py)
+and [native budget controls](../tools/evidence-inventory-selftest.h).
+
 ## Restartable legacy evidence inventories on 2026-11-24
 
 The preceding x64 Release CLI (`ff4a73ee3b27`) wrote a chunk for a directory

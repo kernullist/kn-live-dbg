@@ -1965,7 +1965,7 @@ chunk and the SHA-256 witnesses of the original bounded reads. An existing
 orphan chunk qualifies only when the reconstructed bytes match. A retry
 checks the committed prefix and reads new source payloads from the next offset.
 
-Before publishing or accepting the final v1 manifest, the builder reads all
+By default, before publishing or accepting the final v1 manifest, the builder reads all
 members again, reconstructs every row and byte witness, and repeats the
 catalog comparison. The catalog requires readable member identity and
 generation metadata. Unreadable or malformed payloads remain explicit invalid
@@ -1975,6 +1975,22 @@ read budget and 120-second deadline. The sorted member names have a combined
 limit of 16,777,216 UTF-16 code units. These observations describe a stopped
 source. They provide neither an atomic filesystem snapshot nor collector
 authentication.
+
+With `/verify-entries N`, each invocation verifies at most N additional
+originals (1–1,048,576). Each new read pins the member and checks its generation
+against the initial catalog before and after reconstructing the v1 row. The
+builder signs progress after each complete 128-row chunk and at a shorter
+entry or byte boundary. A partially verified chunk keeps the ordered raw-byte
+witnesses needed to finish its aggregate hash. A later process checks the
+highest `verify-<count>.knindex` signature against the exact executable digest,
+construction chain, count and witness prefix. It obtains the P-256 verification
+key by name from the current user's Microsoft Software Key Storage Provider.
+The first signature creates one non-exportable, signing-only key named
+`KnLiveDbg.InventoryVerification.v1` in that profile. Other software running
+as the same user can use the key. The completed v1 manifest retains its original
+format, and publication still requires a fresh comparison of the full source
+catalog. Catalog enumeration and construction-chain validation must fit in
+each invocation. [Windows CNG key storage](https://learn.microsoft.com/en-us/windows/win32/api/ncrypt/nf-ncrypt-ncryptcreatepersistedkey)
 
 With `/inventory`, a query verifies the manifest and consumes at most 4,096
 members and 64 MiB of source bytes per window. Metadata reads are separately

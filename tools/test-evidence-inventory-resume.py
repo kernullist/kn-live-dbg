@@ -22,6 +22,30 @@ def digest(data):
     return hashlib.sha256(data).hexdigest()
 
 
+def verify_profile_signature(frame, signature):
+    ncrypt = ctypes.WinDLL("ncrypt")
+    handle = ctypes.c_size_t
+    pointer = ctypes.POINTER(handle)
+    ncrypt.NCryptOpenStorageProvider.argtypes = [pointer, wintypes.LPCWSTR, wintypes.DWORD]
+    ncrypt.NCryptOpenKey.argtypes = [handle, pointer, wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+    ncrypt.NCryptVerifySignature.argtypes = [handle, ctypes.c_void_p, ctypes.c_void_p, wintypes.DWORD,
+                                             ctypes.c_void_p, wintypes.DWORD, wintypes.DWORD]
+    ncrypt.NCryptFreeObject.argtypes = [handle]
+    provider, key = handle(), handle()
+    try:
+        if ncrypt.NCryptOpenStorageProvider(ctypes.byref(provider), "Microsoft Software Key Storage Provider", 0):
+            raise RuntimeError("cannot open Windows software key provider")
+        if ncrypt.NCryptOpenKey(provider, ctypes.byref(key), "KnLiveDbg.InventoryVerification.v1", 0, 0x40):
+            raise RuntimeError("cannot open inventory verification key")
+        hashed = hashlib.sha256(frame).digest()
+        return ncrypt.NCryptVerifySignature(key, None, hashed, len(hashed), signature, len(signature), 0) == 0
+    finally:
+        if key.value:
+            ncrypt.NCryptFreeObject(key)
+        if provider.value:
+            ncrypt.NCryptFreeObject(provider)
+
+
 def ledger(number):
     return encode(dict(schema="kmon.evidence_session.v1", scope="attempted_hunt_bundle_publications", closed=True,
                        collection_id=f"owned-{number}", admitted="0", written="0", failed="0", dropped="0", bytes="0"))
@@ -140,6 +164,214 @@ class InventoryTests(unittest.TestCase):
             self.assertEqual({p.name: p.read_bytes() for p in self.output.iterdir()},
                              {p.name: p.read_bytes() for p in previous.iterdir()})
 
+    def test_bounded_original_windows(self):
+        self.fill(270)
+        member = self.source / "entry-00002.knledger"
+        member.write_bytes(b"\xef\xbb\xbf" + member.read_bytes())
+        (self.source / "entry-00040.knledger").write_bytes(b"")
+        (self.source / "entry-00128.knledger").write_bytes(b"\xff")
+        originals = [p.read_bytes() for p in sorted(self.source.iterdir())]
+        sizes = list(map(len, originals))
+        image = digest(ARGS.cli.read_bytes())
+        writer = ARGS.legacy or ARGS.cli
+        options = ["/resume", "/chunks", "1"]
+        first = subprocess.run(self.command(cli=writer) + options, capture_output=True, timeout=140)
+        if ARGS.legacy and first.returncode == 2:
+            # Earlier v1 readers can query the published manifest but predate resumable construction.
+            self.assertFalse(self.output.exists())
+            writer = ARGS.cli
+            first = subprocess.run(self.command(cli=writer) + options, capture_output=True, timeout=140)
+        self.assertEqual(first.returncode, 0, first.stderr[-400:])
+        self.assertEqual(json.loads(first.stdout)["entries"], "128")
+        offset = 0
+        manifest = self.output / "manifest.knindex"
+        for limit in (37, 70, 55, 108):
+            end = offset + limit
+            result = self.build("/resume", "/verify-entries", str(limit), "/chunks", "4", "/json",
+                                status="ok" if end == len(sizes) else "checkpointed")
+            self.assertEqual((int(result["entries"]), int(result["verify_entry_limit"]), int(result["verified_entries"]),
+                              int(result["reused_verified_entries"])), (len(sizes), limit, end, offset))
+            self.assertEqual(int(result["read_bytes"]), sum(sizes[offset:end]) + (sum(sizes[128:]) if not offset else 0))
+            self.assertEqual(bool(result["snapshot_digest"]), end == len(sizes))
+            self.assertEqual(manifest.exists(), end == len(sizes))
+            prefix = "" if end == len(sizes) else "".join((digest(data) if data else "") + "\n"
+                for data in originals[end - end % 128:end])
+            proof = json.loads((self.output / f"verify-{end}.knindex").read_bytes())
+            self.assertEqual((int(proof["verified_through"]), proof["raw_witness_prefix"]), (end, prefix))
+            chain = digest((self.output / "window-256.knindex").read_bytes())
+            frame = f"KnLiveDbg.inventory.verification.v1\n{image}\n{chain}\n{end}\n{prefix}".encode()
+            signature = bytes.fromhex(proof["verification_seal"])
+            self.assertTrue(verify_profile_signature(frame, signature))
+            self.assertFalse(verify_profile_signature(frame + b"\n", signature))
+            if end == 37:
+                pending = self.output / "verify-270.knindex.pending-11-1-1"
+                pending.write_bytes(b"{")
+            offset = end
+        self.assertEqual(pending.read_bytes(), b"{")
+        again = self.build("/resume", "/verify-entries", "1")
+        self.assertEqual((int(again["reused_verified_entries"]), int(again["read_bytes"])), (len(sizes), 0))
+        ordinary = self.build("/resume")
+        self.assertEqual((ordinary["snapshot_digest"], int(ordinary["read_bytes"])), (again["snapshot_digest"], sum(sizes)))
+        fresh = self.root / "fresh"
+        subprocess.run(self.command(output=fresh, cli=writer) + ["/resume"], capture_output=True, check=True, timeout=140)
+        self.assertEqual((fresh / manifest.name).read_bytes(), manifest.read_bytes())
+        self.assertEqual(self.query(ARGS.legacy or ARGS.cli)["snapshot_digest"], again["snapshot_digest"])
+        proof = (self.output / "verify-37.knindex").read_bytes()
+        audit = runpy.run_path(str(Path(__file__).with_name("validate-public-content.py")))["inspect"]
+        for text in (proof, b"diagnostic\n" + proof[:-1], proof.decode().encode("utf-16-be")):
+            self.assertTrue(audit("renamed.txt", text))
+        manifest.write_bytes(b"occupied")
+        self.build("/resume", "/verify-entries", "1", status="manifest_mismatch", code=1)
+        self.assertEqual(manifest.read_bytes(), b"occupied")
+
+    def test_verification_seal_and_raw_prefix(self):
+        self.fill(145)
+        self.build("/resume", "/verify-entries", "17", status="checkpointed")
+        path = self.output / "verify-17.knindex"
+        data = path.read_bytes()
+        other = self.root / "other"
+        self.build("/resume", "/verify-entries", "17", output=other, status="checkpointed")
+        edited = json.loads(data)
+        seal = edited["verification_seal"]
+        edited["verification_seal"] = seal[:-2] + f"{int(seal[-2:], 16) ^ 1:02x}"
+        wrong_prefix = dict(json.loads(data), raw_witness_prefix=("0" * 64 + "\n") * 17)
+        for raw in (encode(edited), encode(wrong_prefix), data[:-1], (other / path.name).read_bytes()):
+            path.write_bytes(raw)
+            self.build("/resume", "/verify-entries", "145", status="invalid_verification_checkpoint", code=1)
+        path.write_bytes(data)
+        jump = self.output / "verify-145.knindex"
+        jump.write_bytes(encode(dict(json.loads(data), verified_through="145")))
+        self.build("/resume", "/verify-entries", "145", status="invalid_verification_checkpoint", code=1)
+        jump.unlink()
+        # Recompute every unkeyed link. The existing protected prefix must fail in this new chain.
+        window = self.output / "window-0.knindex"
+        original = json.loads(window.read_bytes())
+        window.write_bytes(encode(dict(original, originals_sha256=digest(b"different original bytes"))))
+        tail = self.output / "window-128.knindex"
+        tail.write_bytes(encode(dict(json.loads(tail.read_bytes()), previous_sha256=digest(window.read_bytes()))))
+        self.build("/resume", "/verify-entries", "145", status="invalid_verification_checkpoint", code=1)
+        path.unlink()
+        self.build("/resume", "/verify-entries", "111", status="checkpointed")
+        self.build("/resume", "/verify-entries", "34", status="original_mismatch", code=1)
+        self.assertFalse((self.output / "verify-128.knindex").exists())
+        self.assertFalse((self.output / "manifest.knindex").exists())
+
+    def test_verified_member_replacement(self):
+        self.fill(131)
+        self.build("/resume", "/verify-entries", "128", status="checkpointed")
+        path = self.source / "entry-00001.knledger"
+        replacement = self.root / "replacement"
+        shutil.copy2(path, replacement)
+        self.assertNotEqual(path.stat().st_ino, replacement.stat().st_ino)
+        os.replace(replacement, path)
+        self.build("/resume", "/verify-entries", "3", status="resume_scope_mismatch", code=1)
+        self.assertFalse((self.output / "manifest.knindex").exists())
+
+    def test_change_after_signed_window(self):
+        self.fill(1536)
+        self.build("/resume", "/verify-entries", "1", status="checkpointed")
+        path = self.source / "entry-00000.knledger"
+        replacement = self.root / "copy"
+        shutil.copy2(path, replacement)
+        with subprocess.Popen(self.command() + ["/resume", "/verify-entries", "1536"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            try:
+                deadline = time.monotonic() + 60
+                while not (self.output / "verify-128.knindex").exists():
+                    self.assertIsNone(child.poll(), "no signed window before exit")
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.001)
+                os.replace(replacement, path)
+                stdout, stderr = child.communicate(timeout=140)
+                self.assertEqual(child.returncode, 1, stderr[-400:])
+                report = json.loads(stdout)
+                self.assertEqual((report["status"], report["verified_entries"], report["snapshot_digest"]),
+                                 ("source_changed", "1536", ""))
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=15)
+        self.assertTrue((self.output / "verify-1536.knindex").is_file())
+        self.build("/resume", "/verify-entries", "1536", status="resume_scope_mismatch", code=1)
+        self.assertFalse((self.output / "manifest.knindex").exists())
+
+    def test_termination_after_verification_receipt(self):
+        self.fill(1536)
+        self.build("/resume", "/verify-entries", "1", status="checkpointed")
+        with subprocess.Popen(self.command() + ["/resume", "/verify-entries", "1536"],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            try:
+                deadline = time.monotonic() + 60
+                while not (self.output / "verify-128.knindex").is_file():
+                    self.assertIsNone(child.poll(), "writer exited before the first full raw-witness check")
+                    self.assertLess(time.monotonic(), deadline)
+                    time.sleep(0.001)
+                child.kill()
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate(timeout=15)
+        self.assertFalse((self.output / "manifest.knindex").exists())
+        saved = {int(p.stem.split("-")[1]): (p.stat().st_mtime_ns, digest(p.read_bytes()))
+                 for p in self.output.glob("verify-*.knindex")}
+        offset = max(saved)
+        self.assertGreaterEqual(offset, 128)
+        self.assertLess(offset, 1536)
+        result = self.build("/resume", "/verify-entries", "1536")
+        self.assertEqual((int(result["verified_entries"]), int(result["reused_verified_entries"])), (1536, offset))
+        self.assertEqual(int(result["read_bytes"]), sum(len(ledger(i)) for i in range(offset, 1536)))
+        for end, receipt in saved.items():
+            path = self.output / f"verify-{end}.knindex"
+            self.assertEqual((path.stat().st_mtime_ns, digest(path.read_bytes())), receipt)
+
+    def test_original_payload_above_eight_gib(self):
+        if not ARGS.large_case:
+            self.skipTest("supply a synthetic --large-case to exercise more than 8 GiB of original reads")
+        data = ARGS.large_case.read_bytes()
+        member_size = len(data)
+        self.assertGreaterEqual(member_size, 1024**2, "use the case emitted by evidence-bundle-selftest --publish")
+        self.assertLessEqual(member_size, 2 * 1024**2)
+        count = (8 * 1024**3) // member_size + 1
+        value = json.loads(data)["payload_sha256"]
+        names = [f"member-{i:05}.kncase" for i in range(count)]
+        for i, name in enumerate(names):
+            path = self.source / name
+            if i % 900 == 0:
+                path.write_bytes(data)
+                anchor = path
+            else:
+                os.link(anchor, path)
+        entries = verified = reads = 0
+        for calls in range(1, 2 * ((count + 511) // 512) + 2):
+            proc = subprocess.run(self.command() + ["/resume", "/chunks", "4", "/verify-entries", "512"],
+                                  capture_output=True, timeout=150)
+            self.assertEqual(proc.returncode, 0, (proc.stdout[-600:], proc.stderr[-400:]))
+            result = json.loads(proc.stdout)
+            now, checked = int(result["entries"]), int(result["verified_entries"])
+            self.assertEqual((int(result["reused_entries"]), int(result["reused_verified_entries"])), (entries, verified))
+            self.assertGreater(now + checked, entries + verified)
+            self.assertEqual(int(result["read_bytes"]), (now - entries + checked - verified) * member_size)
+            self.assertLessEqual(int(result["read_bytes"]), 8 * 1024**3)
+            self.assertEqual(result["invalid_files"], "0")
+            entries, verified, reads = now, checked, reads + int(result["read_bytes"])
+            if result["status"] == "ok":
+                break
+            self.assertEqual(result["status"], "checkpointed")
+            self.assertFalse((self.output / "manifest.knindex").exists())
+        self.assertEqual((entries, verified, reads), (count, count, 2 * count * member_size))
+        chunks = []
+        for i in range(0, count, 128):
+            rows = [dict(name=name, digest=value, bytes=str(member_size), valid=True) for name in names[i:i + 128]]
+            raw = encode(dict(schema="kn.evidence_inventory_chunk.v1", entries=rows))
+            self.assertEqual((self.output / (digest(raw) + ".knchunk")).read_bytes(), raw)
+            chunks.append(dict(digest=digest(raw), entries=str(len(rows))))
+        source_id = json.loads((self.output / "build.knindex").read_bytes())["source_id"]
+        manifest = encode(dict(schema="kn.evidence_inventory.v1", capture="non_atomic_directory_walk",
+                               directory_id=source_id, entries=str(count), chunks=chunks))
+        self.assertEqual((self.output / "manifest.knindex").read_bytes(), manifest)
+        self.assertEqual(result["snapshot_digest"], digest(manifest))
+        print(f"large inventory: members={count} calls={calls} original_bytes={count * member_size} read_bytes={reads}", flush=True)
+
     def test_source_and_output_generations(self):
         self.fill(145)
         self.checkpoint()
@@ -218,7 +450,10 @@ class InventoryTests(unittest.TestCase):
     def test_writer_lease_and_arguments(self):
         self.fill(142)
         for options in (("/chunks", "1"), ("/resume", "/resume"), ("/resume", "/chunks", "0"),
-                        ("/resume", "/chunks", "8193"), ("/resume", "/chunks", "-1"), ("/resume", "/chunks")):
+                        ("/resume", "/chunks", "8193"), ("/resume", "/chunks", "-1"), ("/resume", "/chunks"),
+                        ("/verify-entries", "1"), ("/resume", "/verify-entries", "0"),
+                        ("/resume", "/verify-entries", "1048577"), ("/resume", "/verify-entries", "-1"),
+                        ("/resume", "/verify-entries", "1", "/verify-entries", "2")):
             self.build(*options, code=2)
             self.assertFalse(self.output.exists())
         self.checkpoint()
@@ -317,6 +552,9 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual((report["entries"], report["verified_entries"], report["read_bytes"]), ("0", "0", "0"))
         manifest = self.output / "manifest.knindex"
         self.assertEqual(digest(manifest.read_bytes()), report["snapshot_digest"])
+        empty = self.build("/resume", "/verify-entries", "1")
+        self.assertEqual((empty["verified_entries"], empty["reused_verified_entries"], empty["read_bytes"]), ("0", "0", "0"))
+        self.assertFalse(list(self.output.glob("verify-*.knindex")))
         manifest.write_bytes(b"occupied")
         self.build("/resume", status="manifest_mismatch", code=1)
         self.assertEqual(manifest.read_bytes(), b"occupied")
@@ -334,10 +572,13 @@ if __name__ == "__main__":
     parser.add_argument("--cli", type=Path, required=True)
     parser.add_argument("--legacy", type=Path, help="Also query a completed v1 manifest with a previous CLI")
     parser.add_argument("--work-dir", type=Path, help="Parent of the disposable fixture directories")
+    parser.add_argument("--large-case", type=Path, help="Synthetic valid .kncase for the optional 8 GiB logical input")
     ARGS = parser.parse_args()
     ARGS.cli = ARGS.cli.resolve(strict=True)
     if ARGS.legacy:
         ARGS.legacy = ARGS.legacy.resolve(strict=True)
     if ARGS.work_dir:
         ARGS.work_dir = ARGS.work_dir.resolve(strict=True)
+    if ARGS.large_case:
+        ARGS.large_case = ARGS.large_case.resolve(strict=True)
     unittest.main(argv=[__file__], verbosity=2)

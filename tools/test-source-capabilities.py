@@ -40,7 +40,9 @@ def main():
     by_key = dict(zip(keys, data["capabilities"]))
     inventory = by_key[("evidence", "build_inventory", "local_files")]
     assert "terminal_original_byte_and_row_recheck" in inventory["requirements"]
+    assert "signed_original_verification_windows" in inventory["requirements"]
     assert "bounded_terminal_pass" in inventory["limits"]
+    assert "same_user_key_and_verifier_image" in inventory["limits"] and "full_generation_catalog_each_call" in inventory["limits"]
     game = by_key[("objects", "game_object_lifetime", "game_build_manifest")]
     assert game["consistency"] == "game_reported_two_observations"
     assert "stable_even_publication_before_and_after" in game["requirements"] and "expected_container_and_member" in game["requirements"]

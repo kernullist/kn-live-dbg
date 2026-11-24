@@ -79,6 +79,7 @@ def main():
                     ["--schema-worker"], ["--symbol-index-worker"], ["--self-test", "all"],
                     ["--offline", "!kmon", "init-store", str(root / "denied-store"), "/acl-only"],
                     ["--offline", "!kmon", "inventory", str(root), str(root / "denied-index"), "/resume", "/chunks", "1"],
+                    ["--offline", "!kmon", "inventory", str(root), str(root / "denied-index"), "/resume", "/verify-entries", "1"],
                     ["--offline", "!kmon", "gc", str(root), "PRIVATE-SENTINEL", "/apply", "1"],
                     ["--crash-diagnose", str(trace), "--sha256", digest],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--whea"],

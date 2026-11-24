@@ -151,6 +151,29 @@ namespace evidence_inventory_test
         check(lastWork.Status == L"ok" && lastWork.ReusedEntries == 128 && lastWork.VerifiedEntries == 129 &&
             lastWork.InvalidFiles == 0 && verifiedCases.ImportedFiles == 129 && verifiedCases.DuplicateFiles == 128 &&
             verifiedCases.SnapshotDigest == lastWork.Digest, "v1 queries recheck case bytes after a resumed build");
+        const auto boundedIndex = root + L"\\bounded-original-index";
+        resume.NewChunkLimit = EvidenceInventoryMaxChunks;
+        resume.VerifyEntryLimit = 3;
+        const auto bounded = BuildEvidenceInventory(workSource, boundedIndex, resume);
+        check(bounded.Status == L"checkpointed" && bounded.VerifiedEntries == 3 && bounded.Digest.empty(),
+            "partial original verification commits a private prefix inside a chunk");
+        const auto caseSize = std::filesystem::file_size(original);
+        resume.VerifyEntryLimit = 129;
+        resume.ReadBudget = caseSize * 2;
+        const auto twoMore = BuildEvidenceInventory(workSource, boundedIndex, resume);
+        check(twoMore.Status == L"checkpointed" && twoMore.VerifiedEntries == 5 &&
+            twoMore.ReusedVerifiedEntries == 3 && twoMore.ReadBytes == caseSize * 2,
+            "the verification byte budget admits exactly two original files");
+        resume.ReadBudget = caseSize - 1;
+        const auto tooSmall = BuildEvidenceInventory(workSource, boundedIndex, resume);
+        check(tooSmall.Status == L"budget_exhausted" && tooSmall.ReusedVerifiedEntries == 5 &&
+            tooSmall.VerifiedEntries == 5 && tooSmall.ReadBytes == 0 && tooSmall.Digest.empty(),
+            "a budget smaller than the next original cannot advance or publish the snapshot");
+        resume.ReadBudget = EvidenceInventoryBuildOptions{}.ReadBudget;
+        const auto completed = BuildEvidenceInventory(workSource, boundedIndex, resume);
+        check(completed.Status == L"ok" && completed.ReusedVerifiedEntries == 5 &&
+            completed.VerifiedEntries == 129 && completed.ReadBytes == caseSize * 124 && completed.Digest == lastWork.Digest,
+            "restored budget finalizes the same manifest using only the remaining original payloads");
         const auto largeBuilt = BuildEvidenceInventory(large, largeIndex);
         check(largeBuilt.Status == L"ok" && largeBuilt.Entries == 4101, "snapshot retains files beyond legacy directory cap");
         inventory = {};

@@ -162,6 +162,21 @@ return exit 0. Wait for `ok` and a nonempty `snapshot_digest` before using
 `/inventory index-001`. Keep the source stopped throughout. A different
 membership or file generation needs a fresh output directory.
 
+Add `/verify-entries N` to spread the final read of originals across calls.
+For example, repeat `KnLiveDbg.exe --offline !kmon inventory cases index-001 /resume /chunks 4 /verify-entries 64 /json`.
+Each call verifies at most 64 additional members once construction is complete.
+`verified_entries` counts the entire checked prefix, `reused_verified_entries`
+counts rows accepted from the preceding signed record, and `read_bytes`
+counts source payload bytes read in this call. Use the same executable and
+Windows profile. The first signed record creates a non-exportable signing key
+in that user's Windows software key store. Keep the output directory private.
+A damaged signature, a different executable, or a key from another profile
+returns `invalid_verification_checkpoint`. Use a fresh bounded output or omit
+`/verify-entries` to recheck all originals in one call.
+After `deadline_exhausted`, the next bounded call can use the last completed
+verification record. The full catalog and construction-chain checks still
+have to fit within an invocation.
+
 `KnLiveDbg.exe --offline !kmon init-store <new-root> [/acl-only] [/json]`
 creates a new private local root under an existing directory. By default it
 requires EFS encryption and a protected current-user/SYSTEM ACL. `/acl-only`

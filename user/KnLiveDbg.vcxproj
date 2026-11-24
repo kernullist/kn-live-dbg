@@ -286,6 +286,7 @@
     <ClInclude Include="EvidenceInvestigation.h" />
     <ClInclude Include="EvidenceInventory.h" />
     <ClInclude Include="EvidenceInventoryFiles.h" />
+    <ClInclude Include="EvidenceInventoryVerification.h" />
     <ClInclude Include="EvidenceJournal.h" />
     <ClInclude Include="ImageArchiveDependencies.h" />
     <ClInclude Include="EvidencePrivacy.h" />

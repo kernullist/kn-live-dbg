@@ -15,9 +15,10 @@ and [retention validation](VALIDATION.md#retention-with-terminal-scan-receipts-o
 record the tested store sizes, interruption behavior and remaining limits.
 
 For legacy case and session directories, the direct offline inventory builder
-can resume at a committed chunk and verify the originals before publishing a
-v1 manifest. See the [command reference](COMMAND_REFERENCE.md#capability-reports-and-evidence-commands)
-and [interruption tests](VALIDATION.md#restartable-legacy-evidence-inventories-on-2026-11-24).
+can resume construction at a committed chunk. The `/verify-entries` option
+also resumes original checks from a signed progress record before publishing
+the v1 manifest. See the [command reference](COMMAND_REFERENCE.md#capability-reports-and-evidence-commands)
+and [bounded verification tests](VALIDATION.md#bounded-verification-of-legacy-inventory-originals-on-2026-11-24).
 
 ## Operation
 
