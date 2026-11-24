@@ -235,8 +235,23 @@ namespace
     {
         bool whea = false, wheaEvent = false, compareTime = false;
         size_t rebootArg = 0;
-        uint64_t recordId = 0;
+        uint64_t recordId = 0, firstClockRecord = 0;
     };
+
+    bool RecordId(const std::wstring& decimal, uint64_t& result)
+    {
+        if (decimal.empty() || decimal.size() > 20) { return false; }
+        uint64_t value = 0;
+        for (const auto c : decimal)
+        {
+            if (c < L'0' || c > L'9') { return false; }
+            const auto digit = static_cast<unsigned>(c - L'0');
+            if (value > (UINT64_MAX - digit) / 10) { return false; }
+            value = value * 10 + digit;
+        }
+        result = value;
+        return value != 0;
+    }
 
     bool ReadOptions(const std::vector<std::wstring>& args, Options& options)
     {
@@ -254,20 +269,16 @@ namespace
             }
         }
         if (i == args.size()) { return true; }
-        options.compareTime = args.size() - i == 7 && args.back() == L"--compare-time";
-        if (args.size() - i != (options.compareTime ? 7u : 6u) || args[i] != L"--reboot-log" || args[i + 2] != L"--log-sha256" ||
-            !IsDigest(args[i + 3]) || args[i + 4] != L"--record-id") { return false; }
-        const auto& decimal = args[i + 5];
-        if (decimal.empty() || decimal.size() > 20) { return false; }
-        for (const auto c : decimal)
-        {
-            if (c < L'0' || c > L'9') { return false; }
-            const auto digit = static_cast<unsigned>(c - L'0');
-            if (options.recordId > (UINT64_MAX - digit) / 10) { return false; }
-            options.recordId = options.recordId * 10 + digit;
-        }
+        if (args.size() - i < 6 || args[i] != L"--reboot-log" || args[i + 2] != L"--log-sha256" ||
+            !IsDigest(args[i + 3]) || args[i + 4] != L"--record-id" || !RecordId(args[i + 5], options.recordId)) { return false; }
         options.rebootArg = i;
-        return options.recordId != 0;
+        i += 6;
+        if (i == args.size()) { return true; }
+        if (args[i++] != L"--compare-time") { return false; }
+        options.compareTime = true;
+        if (i == args.size()) { return true; }
+        return args.size() - i == 2 && args[i] == L"--clock-history-from" && RecordId(args[i + 1], options.firstClockRecord) &&
+            RebootClockHistory::ValidWindow(options.firstClockRecord, options.recordId);
     }
 }
 
@@ -279,7 +290,7 @@ std::wstring SavedCrashStop::Json() const
 
 static int Diagnose(const std::vector<std::wstring>& args, const Options& options)
 {
-    const unsigned version = options.compareTime ? 4 : options.rebootArg ? 3 : options.whea ? 2 : 1;
+    const unsigned version = options.firstClockRecord ? 5 : options.compareTime ? 4 : options.rebootArg ? 3 : options.whea ? 2 : 1;
     const auto expected = LowerDigest(args[2]);
     std::filesystem::path path;
     symbol_artifacts::Directories parents;
@@ -313,11 +324,13 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     const bool stopEvidence = e.initialStop && ordinaryDump;
     std::optional<RebootEventComparison> reboot;
     std::optional<RebootTimeline> timeline;
+    std::optional<RebootClockHistory> history;
     if (options.rebootArg)
     {
         const auto i = options.rebootArg;
+        if (options.firstClockRecord) { history = RebootClockHistory{options.firstClockRecord, options.recordId}; }
         reboot = CompareSavedRebootEvent(args[i + 1], LowerDigest(args[i + 3]), options.recordId,
-            match && stopEvidence && stop.code ? &stop : nullptr, options.compareTime);
+            match && stopEvidence && stop.code ? &stop : nullptr, options.compareTime, history ? &*history : nullptr);
         if (options.compareTime) { timeline = CompareRebootTime(clock, *reboot); }
     }
     if (!source.Unchanged()) { return Failure(version, L"source_changed_or_unreadable"); }
@@ -337,6 +350,7 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     if (options.wheaEvent) { report += L",\"whea_event\":" + event.report; }
     if (reboot) { report += L",\"reboot_event\":" + reboot->Json(); }
     if (timeline) { report += L",\"reboot_timeline\":" + timeline->report; }
+    if (history) { report += L",\"clock_history\":" + history->Json(); }
     report += L",\"assessment\":{\"header_context_matches_selected\":" +
         std::wstring(e.sameContext ? Bool(*e.sameContext) : L"null") +
         L",\"header_context_matches_stack_top\":" + (e.topMatches ? Bool(*e.topMatches) : L"null") +
@@ -353,6 +367,7 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     if (options.whea) { report += record.Hypothesis() + L","; }
     if (options.wheaEvent) { report += event.Hypothesis() + L","; }
     if (reboot) { report += reboot->Hypothesis(timeline ? &*timeline : nullptr) + L","; }
+    if (history) { report += history->Hypothesis() + L","; }
     report += L"{\"candidate\":\"component_present_at_stop\",\"state\":" +
         Quote(located ? L"mapped_frame_observed" : L"unresolved") +
         L",\"support\":" + (located ?
@@ -375,7 +390,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
             return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
                 std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> "
                     L"[--whea [--event-xml <file> --event-sha256 <digest>]] "
-                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal> [--compare-time]]\n";
+                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal> [--compare-time [--clock-history-from <first-record-id>]]]\n";
                 return 2;
             });
         };

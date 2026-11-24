@@ -92,10 +92,12 @@ needed to distinguish a denied open, a mismatched process generation and
 a reference failure after a successful open.
 
 In P13, comparing saved crash and reboot times can expose an event that
-precedes a dump even when the stop fields agree. Establishing a common
-host, boot and clock history remains open.
-[Command example](COMMAND_REFERENCE.md#compare-dump-and-reboot-times) and
-[validation results](VALIDATION.md#saved-dump-and-reboot-event-times-on-2026-11-25).
+precedes a dump even when the stop fields agree. An operator can inspect
+recorded clock steps preceding Event 41 in the same EVTX, including gaps
+in a filtered export. Linking the dump to that host, boot and clock still
+requires incident-specific evidence.
+[Command example](COMMAND_REFERENCE.md#read-clock-changes-preceding-a-reboot-event) and
+[validation results](VALIDATION.md#saved-reboot-clock-history).
 
 The [source collection](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
 retains the original acquisition report and its image dependencies in one

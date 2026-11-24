@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 struct SavedCrashStop
 {
@@ -27,6 +28,33 @@ struct RebootTimeline
     std::wstring report;
 };
 
+struct RebootClockChange
+{
+    uint64_t recordId = 0;
+    std::optional<unsigned> version;
+    std::optional<uint64_t> oldTime, newTime, typedOldTime, typedNewTime;
+    std::optional<DWORD> error;
+    const wchar_t* status = L"clock_fields_unavailable";
+    std::optional<int64_t> Delta() const;
+};
+
+struct RebootClockHistory
+{
+    static constexpr uint64_t MaxRecordIds = 8192;
+    static bool ValidWindow(uint64_t first, uint64_t last)
+    {
+        return first && first <= last && last - first < MaxRecordIds;
+    }
+    uint64_t first, last;
+    unsigned recordsRead = 0, scopedRecords = 0, unclassified = 0;
+    const wchar_t* status = L"restart_record_unavailable";
+    std::optional<DWORD> error;
+    std::vector<RebootClockChange> changes;
+    bool complete = false;
+    std::wstring Json() const;
+    std::wstring Hypothesis() const;
+};
+
 struct RebootEventComparison
 {
     const wchar_t* status = L"event_source_unavailable";
@@ -45,6 +73,7 @@ struct RebootEventComparison
 
 // The saved System event parser accepts one Windows-rendered XML document.
 void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& comparison);
+const wchar_t* DecodeRebootClockChange(const BYTE* xml, UINT byteCount, RebootClockChange& change);
 RebootEventComparison CompareSavedRebootEvent(const std::wstring& path, const std::wstring& pin,
-    uint64_t recordId, const SavedCrashStop* qualifiedDumpStop, bool readTime = false);
+    uint64_t recordId, const SavedCrashStop* qualifiedDumpStop, bool readTime = false, RebootClockHistory* history = nullptr);
 RebootTimeline CompareRebootTime(const SavedCrashClock& dump, const RebootEventComparison& event);

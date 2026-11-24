@@ -397,13 +397,15 @@ class PublicContentTests(unittest.TestCase):
     def test_saved_reboot_event_and_comparison(self):
         self.assertIsNotNone(AUDIT.path_rule("system.EvTx"))
         self.assertIsNotNone(AUDIT.path_rule("system.EVTX.zip"))
-        for identity in ("Name='Microsoft-Windows-Kernel-Power'", 'Guid="{331C3B3A-2005-44C2-AC5E-77220C37D6B4}"'):
+        for identity in ("Name='Microsoft-Windows-Kernel-Power'", 'Guid="{331C3B3A-2005-44C2-AC5E-77220C37D6B4}"',
+                         "Name='Microsoft-Windows-Kernel-General'", 'Guid="{A68CA8B7-004F-D7B6-A698-07E2DE0F1F5D}"'):
             export = "log\n" + "<Event><System><Provider " + identity + "/></System></Event>"
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 self.assertIn("private-reboot-event", {f["rule"] for f in AUDIT.inspect("renamed.txt", export.encode(encoding))})
         for signature in (b"ElfFile\0", b"ElfChnk\0"):
             self.assertIn("private-windows-event-log", {f["rule"] for f in AUDIT.inspect("renamed.bin", signature + bytes(128))})
-        for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1", "kn.crash_diagnosis.v4", "kn.reboot_timeline.v1"):
+        for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1", "kn.crash_diagnosis.v4", "kn.reboot_timeline.v1",
+                       "kn.crash_diagnosis.v5", "kn.reboot_clock_history.v1"):
             for text in (json.dumps({"status": "example", "schema": schema}),
                          "log\n" + json.dumps({"schema": schema, "status": "example"}, indent=2)[:-3],
                          "log\n" + json.dumps({"requested_record_id": "1", "log_sha256": "example", "same_stop_tuple": None})):
@@ -411,7 +413,9 @@ class PublicContentTests(unittest.TestCase):
                     self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("capture.txt", text.encode(encoding))})
             self.assertFalse(AUDIT.inspect("guide.md", ("See " + schema).encode()))
         for key in ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
-                    "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime"):
+                    "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime",
+                    "clock_old_filetime", "clock_new_filetime", "clock_typed_old_filetime", "clock_typed_new_filetime",
+                    "clock_delta_100ns"):
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 cut = ("log\n" + json.dumps({"result": {key: "example"}}, indent=2)[:-4]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", cut)})

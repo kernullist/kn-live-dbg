@@ -2660,6 +2660,31 @@ both the matching stop fields and any contrary timing evidence. Check the
 host, boot and clock-change history before attributing the restart.
 [Clock sources and precision](ARCHITECTURE.md#saved-reboot-event-comparison)
 
+### Read clock changes preceding a reboot event
+
+Use an inclusive range of up to 8,192 System record IDs ending at the selected
+Kernel-Power event. Choose the first ID from the same saved EVTX. The example
+inspects up to the last 8,192 IDs using the dump, log, pins and record above.
+
+```powershell
+$first = [Math]::Max([long]1, [long]$record.RecordId - 8191)
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $dumpPin --reboot-log $log.FullName --log-sha256 $logPin --record-id $record.RecordId --compare-time --clock-history-from $first
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+if ($null -eq $report.clock_history) { throw $report.status }
+$report.clock_history | Select-Object status, requested_record_ids, records_read, same_channel_and_computer_records
+$report.clock_history.changes | Select-Object record_id, status, clock_delta_100ns
+```
+
+In `kn.crash_diagnosis.v5`, a negative `clock_delta_100ns` means the clock
+moved backward. A null delta leaves the change unresolved. A filtered export
+can preserve a specific adjustment while omitting thousands of intervening
+records. Check `saved_window_complete` before interpreting an empty list.
+If the endpoint is unavailable, `reboot_event.status` gives the archive or
+record lookup result.
+The original dump comparison is available in `reboot_timeline`.
+[Clock evidence and limits](ARCHITECTURE.md#saved-reboot-clock-changes)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

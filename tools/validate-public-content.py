@@ -21,15 +21,19 @@ PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", "
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
-REBOOT_TIME_SCHEMAS = ("kn.crash_diagnosis.v4", "kn.reboot_timeline.v1")
+REBOOT_TIME_SCHEMAS = ("kn.crash_diagnosis.v4", "kn.reboot_timeline.v1", "kn.crash_diagnosis.v5",
+                       "kn.reboot_clock_history.v1")
 REBOOT_CLOCK_FIELDS = ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
-                       "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime")
+                       "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime",
+                       "clock_old_filetime", "clock_new_filetime", "clock_typed_old_filetime", "clock_typed_new_filetime",
+                       "clock_delta_100ns")
 CRASH_SCHEMAS = (*REBOOT_TIME_SCHEMAS, "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
                  "kn.whea_event_comparison.v1", "kn.reboot_event_comparison.v1")
 EVENT_EXPORT_PROVIDER = re.compile(
     r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:'''
     r'''(?P<whea>Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})|'''
-    r'''Microsoft-Windows-Kernel-Power|\{331c3b3a-2005-44c2-ac5e-77220c37d6b4\})["']''')
+    r'''Microsoft-Windows-Kernel-Power|\{331c3b3a-2005-44c2-ac5e-77220c37d6b4\}|'''
+    r'''Microsoft-Windows-Kernel-General|\{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d\})["']''')
 ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1",
                           "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2", "kn.etl_reader_comparison.v3",
                           "kn.etl_reader_evaluation.v3", "kn.etl_reader_plan.v1", "kn.etl_reader_admission.v1",

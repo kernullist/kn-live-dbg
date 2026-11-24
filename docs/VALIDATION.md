@@ -7,6 +7,38 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved reboot clock history
+
+On 2026-11-25 the development x64 Release reader examined two saved
+Windows System log intervals. The first contained 4,815 consecutive
+record IDs and one forward adjustment. A controlled dump matched all
+five stop fields and recorded a time 30 seconds after the restart event.
+Adding the clock history preserved both the match and the contrary order.
+
+The second interval contained 6,120 consecutive IDs. Only 5,460 carried
+the endpoint's channel and computer label. The report marked the window
+partial and retained three forward steps and one backward step from those
+records. Windows PowerShell independently read the EVTX and converted
+the XML endpoints to UTC ticks. Its record counts and all signed
+differences agreed with the native reader.
+
+Filtering each export to one change and the endpoint preserved that change
+and exposed the missing IDs. Selecting only the endpoint yielded a complete
+one-record window with no adjustment. Other controls covered the wrong
+provider, an absent record, a bad archive hash, invalid ranges and output
+redirected to an input hard link. The documented example ran in PowerShell
+5.1 and 7. Across 29 invocations, report versions 1 through 4 matched the
+previous executable's stdout, stderr and exit status.
+
+The native parser passed 205 checks, including single-tick backward steps,
+equal endpoints, duplicate or missing fields, conflicting readers and
+future template versions. The host ASan runtime stopped at interception
+startup under its default setting. With continuation enabled it passed the
+same checks with reduced interception coverage. The exports establish
+recorded clock changes. The incident dump, its host and boot association,
+and clock behavior outside the saved records remain open.
+[Run the saved-window comparison](COMMAND_REFERENCE.md#read-clock-changes-preceding-a-reboot-event)
+
 ## Saved dump and reboot event times on 2026-11-25
 
 The development x64 Release binary read four records from a saved Windows

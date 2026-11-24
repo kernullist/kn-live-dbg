@@ -1,5 +1,6 @@
 #include "RebootEvent.h"
 #include "McpJson.h"
+#include <string_view>
 
 namespace
 {
@@ -74,4 +75,50 @@ RebootTimeline CompareRebootTime(const SavedCrashClock& dump, const RebootEventC
         L",\"event_time_fields_agree\":" + Agreement(agrees) + L",\"event_minus_dump_100ns\":" + delta +
         L",\"estimated_dump_boot_filetime\":" + boot + L",\"clock_correspondence_verified\":false}";
     return result;
+}
+
+std::optional<int64_t> RebootClockChange::Delta() const
+{
+    if (std::wstring_view(status) != L"observed" || !oldTime || !newTime || oldTime != typedOldTime || newTime != typedNewTime ||
+        !*oldTime || !*newTime || *oldTime > INT64_MAX || *newTime > INT64_MAX) { return {}; }
+    return static_cast<int64_t>(*newTime) - static_cast<int64_t>(*oldTime);
+}
+
+std::wstring RebootClockHistory::Json() const
+{
+    std::wstring rows;
+    for (const auto& c : changes)
+    {
+        if (!rows.empty()) { rows += L","; }
+        rows += L"{\"record_id\":" + Quote(std::to_wstring(c.recordId)) + L",\"version\":" +
+            (c.version ? std::to_wstring(*c.version) : L"null") + L",\"status\":" + Quote(c.status) +
+            L",\"clock_old_filetime\":" + DecimalString(c.oldTime) + L",\"clock_new_filetime\":" + DecimalString(c.newTime) +
+            L",\"clock_typed_old_filetime\":" + DecimalString(c.typedOldTime) + L",\"clock_typed_new_filetime\":" + DecimalString(c.typedNewTime) +
+            L",\"clock_delta_100ns\":" + DecimalString(c.Delta()) + L",\"win32_error\":" + (c.error ? std::to_wstring(*c.error) : L"null") + L"}";
+    }
+    return L"{\"schema\":\"kn.reboot_clock_history.v1\",\"status\":" + Quote(status) +
+        L",\"first_record_id\":" + Quote(std::to_wstring(first)) + L",\"last_record_id\":" + Quote(std::to_wstring(last)) +
+        L",\"requested_record_ids\":" + (ValidWindow(first, last) ? std::to_wstring(last - first + 1) : L"null") +
+        L",\"records_read\":" + std::to_wstring(recordsRead) +
+        L",\"same_channel_and_computer_records\":" + std::to_wstring(scopedRecords) + L",\"unclassified_records\":" + std::to_wstring(unclassified) +
+        L",\"saved_window_complete\":" + (complete ? L"true" : L"false") + L",\"win32_error\":" + (error ? std::to_wstring(*error) : L"null") +
+        L",\"changes\":[" + rows + L"],\"dump_clock_correspondence_verified\":false}";
+}
+
+std::wstring RebootClockHistory::Hypothesis() const
+{
+    bool forward = false, backward = false;
+    for (const auto& change : changes)
+    {
+        const auto delta = change.Delta();
+        if (delta) { forward |= *delta > 0; backward |= *delta < 0; }
+    }
+    const wchar_t* state = forward && backward ? L"forward_and_backward_steps_observed" : backward ? L"backward_step_observed" :
+        forward ? L"forward_step_observed" : complete ? L"no_step_in_saved_window" : L"unresolved";
+    const std::wstring evidence = L"[\"/reboot_event/log_sha256\",\"/clock_history/changes\",\"/clock_history/status\"]";
+    return L"{\"candidate\":\"wall_clock_step_in_saved_restart_window\",\"state\":" + Quote(state) +
+        L",\"support\":" + (forward || backward ? evidence : L"[]") + L",\"contrary\":" +
+        (complete && !forward && !backward ? evidence : L"[]") +
+        L",\"missing\":[" + (complete ? std::wstring() : L"\"/clock_history/status\",") +
+        L"\"/clock_history/dump_clock_correspondence_verified\"],\"next\":\"verify_boot_and_clock_provenance_for_the_dump\"}";
 }

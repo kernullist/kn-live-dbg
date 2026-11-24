@@ -4667,6 +4667,28 @@ stop-field evidence and timing evidence separately so a matching tuple and
 conflicting times can both be inspected. Relating the two clocks to one host
 and boot requires other evidence. [Windows event rendering](https://learn.microsoft.com/en-us/windows/win32/wes/rendering-events)
 
+### Saved reboot clock changes
+
+The optional clock history enumerates an inclusive interval of record IDs in
+the same pinned EVTX as the selected Event 41. IDs retain their meaning
+across a backward clock step. Each contributing record must carry the same
+System channel and computer label as the endpoint. The report counts all IDs
+read and those in scope. A complete saved window requires every requested ID
+once in increasing order and enough fields to classify the records. A
+duplicate or reversed ID invalidates the sequence. Enumeration is limited
+to 8,192 IDs with a cooperative 15-second deadline.
+
+For Microsoft-Windows-Kernel-General Event 1, versions 0 through 4, the
+reader checks the provider name and GUID, template version and record ID.
+It reads the old and new UTC values from the original rendered XML and from
+two named FILETIME properties. Each pair must agree to 100 ns before the
+reader subtracts old time from new time. The assessment cites observed
+forward and backward steps even in a filtered export. A complete window
+describes the records in that file. Clock discipline between discrete
+steps, the origin of the dump and correspondence across boots need separate
+evidence. [Windows clock reset events](https://learn.microsoft.com/en-us/troubleshoot/windows-server/active-directory/client-clock-reverts-to-previous-time)
+and [named event properties](https://learn.microsoft.com/en-us/windows/win32/wes/rendering-events).
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

@@ -39,6 +39,60 @@ namespace
         return result;
     }
 
+    void CheckChanges()
+    {
+        const std::wstring before = L"<Data Name='OldTime'>2024-02-29T12:00:00.1000000Z</Data>";
+        const std::wstring after = L"<Data Name='NewTime'>2024-02-29T12:00:00.0999999Z</Data>";
+        auto read = [&](unsigned version, const std::wstring& fields, unsigned expected, uint64_t record = 9) {
+            const std::wstring xml = L"<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>"
+                L"<Provider Name='Microsoft-Windows-Kernel-General' Guid='{A68CA8B7-004F-D7B6-A698-07E2DE0F1F5D}'/>"
+                L"<EventID>1</EventID><Version>" + std::to_wstring(version) +
+                L"</Version><TimeCreated SystemTime='2024-02-29T12:00:01Z'/><EventRecordID>9</EventRecordID>"
+                L"<Channel>System</Channel></System><EventData>" + fields + L"</EventData></Event>";
+            RebootClockChange row;
+            row.recordId = record;
+            row.version = expected;
+            const auto status = DecodeRebootClockChange(reinterpret_cast<const BYTE*>(xml.data()),
+                static_cast<UINT>(xml.size() * sizeof(wchar_t)), row);
+            row.status = status ? status : L"observed";
+            return row;
+        };
+        for (unsigned v = 0; v <= 4; ++v)
+        {
+            auto row = read(v, after + before, v);
+            Check(std::wstring(row.status) == L"observed" && row.oldTime && row.newTime, "named change fields across manifests");
+            Check(!row.Delta(), "raw XML does not qualify a step alone");
+            row.typedOldTime = row.oldTime; row.typedNewTime = row.newTime;
+            Check(row.Delta() == -1, "signed 100 ns backward step");
+            std::swap(row.typedOldTime, row.typedNewTime);
+            Check(!row.Delta(), "typed conflict blocks step");
+            std::swap(row.oldTime, row.newTime);
+            Check(row.Delta() == 1, "forward step");
+            row.typedOldTime = row.oldTime = row.newTime;
+            Check(row.Delta() == 0, "recorded equal endpoints");
+        }
+        Check(std::wstring(read(0, before + before + after, 0).status) == L"ambiguous_event_fields", "duplicate old time");
+        Check(std::wstring(read(1, after, 1).status) == L"clock_fields_invalid", "missing old time");
+        Check(std::wstring(read(2, before + L"<Data Name='NewTime'>1601-01-01T00:00:00Z</Data>", 2).status) == L"clock_fields_invalid",
+            "unavailable zero endpoint");
+        Check(std::wstring(read(3, before + L"<Data Name='NewTime'>2024-02-29T12:00:00.123456789Z</Data>", 3).status) ==
+            L"clock_fields_invalid", "unrepresentable precision");
+        Check(std::wstring(read(5, after + before, 5).status) == L"unsupported_event_template", "future template");
+        Check(std::wstring(read(4, after + before, 3).status) == L"unsupported_event_template", "rendered version conflict");
+        Check(std::wstring(read(4, after + before, 4, 8).status) == L"record_id_mismatch", "rendered ID conflict");
+        RebootClockHistory history{8, 9};
+        Check(history.Hypothesis().find(L"\"state\":\"unresolved\"") != std::wstring::npos, "missing interval is unresolved");
+        history.complete = true;
+        Check(history.Hypothesis().find(L"no_step_in_saved_window") != std::wstring::npos, "complete saved window without a step");
+        auto row = read(4, after + before, 4);
+        row.typedOldTime = row.oldTime; row.typedNewTime = row.newTime;
+        history.changes.push_back(row);
+        Check(history.Hypothesis().find(L"backward_step_observed") != std::wstring::npos, "observed backward alternative");
+        std::swap(row.oldTime, row.newTime); std::swap(row.typedOldTime, row.typedNewTime);
+        history.changes.push_back(row);
+        Check(history.Hypothesis().find(L"forward_and_backward_steps_observed") != std::wstring::npos, "both directions retained");
+    }
+
     void CheckClock()
     {
         constexpr int64_t t = 133536816000000000LL, ticks = 10000000;
@@ -112,6 +166,7 @@ int main()
         Parse(Replace(L">10</Version>", L">11</Version>"), L"unsupported_event_template");
         Parse(L"<!DOCTYPE Event [<!ENTITY x '123'>]>" + document, L"malformed_event_xml");
         CheckClock();
+        CheckChanges();
         std::cout << checked << " reboot event parser checks passed\n";
         return 0;
     }

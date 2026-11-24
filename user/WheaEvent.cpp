@@ -24,6 +24,7 @@ namespace
     constexpr View EventNamespace = L"http://schemas.microsoft.com/win/2004/08/events/event";
     constexpr wchar_t WheaProvider[] = L"{c26c4f3c-3f66-4e99-8f8a-39405cfed220}";
     constexpr wchar_t PowerProvider[] = L"{331c3b3a-2005-44c2-ac5e-77220c37d6b4}";
+    constexpr wchar_t GeneralProvider[] = L"{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d}";
 
     bool XmlSpace(wchar_t c) { return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r'; }
 
@@ -73,7 +74,7 @@ namespace
 
     enum class Group { Other, System, Data };
     enum Field { None, Provider, Time, Id, Version, RecordId, Channel, Length, Raw,
-        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, Count };
+        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, OldTime, NewTime, Count };
 
     bool Attribute(IXmlReader& reader, const wchar_t* name, std::wstring& out)
     {
@@ -95,7 +96,8 @@ namespace
 
     struct Event
     {
-        bool reboot = false;
+        enum class Kind { Whea, Reboot, Clock };
+        Kind kind = Kind::Whea;
         Group group = Group::Other;
         Field field = None;
         bool sawSystem = false, sawData = false, otherPayload = false;
@@ -155,13 +157,18 @@ namespace
                 std::wstring key;
                 if (Attribute(reader, L"Name", key))
                 {
-                    if (reboot)
+                    if (kind == Kind::Reboot)
                     {
                         if (key == L"BugcheckCode") { field = StopCode; }
                         else if (key == L"BugcheckParameter1") { field = Parameter1; }
                         else if (key == L"BugcheckParameter2") { field = Parameter2; }
                         else if (key == L"BugcheckParameter3") { field = Parameter3; }
                         else if (key == L"BugcheckParameter4") { field = Parameter4; }
+                    }
+                    else if (kind == Kind::Clock)
+                    {
+                        if (key == L"OldTime") { field = OldTime; }
+                        else if (key == L"NewTime") { field = NewTime; }
                     }
                     else if (key == L"RawData") { field = Raw; }
                     else if (key == L"Length") { field = Length; }
@@ -313,7 +320,7 @@ namespace
 void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& result)
 {
     Event event;
-    event.reboot = true;
+    event.kind = Event::Kind::Reboot;
     if (!Parse(xml, byteCount, event)) { result.status = event.status; return; }
     const auto id = event.Metadata(L"Microsoft-Windows-Kernel-Power", PowerProvider);
     if (!id) { result.status = event.status; return; }
@@ -343,6 +350,22 @@ void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& r
     }
     result.eventStop = stop;
     result.status = stop.code ? L"dump_stop_unqualified" : L"event_stop_code_unavailable";
+}
+
+const wchar_t* DecodeRebootClockChange(const BYTE* xml, UINT byteCount, RebootClockChange& change)
+{
+    Event event;
+    event.kind = Event::Kind::Clock;
+    if (!Parse(xml, byteCount, event)) { return event.status; }
+    const auto id = event.Metadata(L"Microsoft-Windows-Kernel-General", GeneralProvider);
+    if (!id) { return event.status; }
+    if (id->recordId != change.recordId) { return L"record_id_mismatch"; }
+    if (id->id != 1 || id->version > 4 || id->version != change.version) { return L"unsupported_event_template"; }
+    UtcTimestamp(event.text[OldTime], change.oldTime);
+    UtcTimestamp(event.text[NewTime], change.newTime);
+    if (!change.oldTime || !change.newTime || !*change.oldTime || !*change.newTime ||
+        *change.oldTime > INT64_MAX || *change.newTime > INT64_MAX) { return L"clock_fields_invalid"; }
+    return nullptr;
 }
 
 std::wstring WheaEventComparison::Hypothesis() const
