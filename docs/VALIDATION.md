@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Retained publisher root history on 2026-11-24
+
+The Sigstore 3.0.0 Python wheel supplied the initial production root, version
+5. The wheel matched its PyPI SHA-256. The verifier followed 11 consecutive
+signed roots from one recorded Sigstore repository revision to version 16. The
+terminal bytes also matched the root in the Sigstore 4.6.0 wheel. A separate
+canonical encoder and OpenSSL 3.5.9 checked the ECDSA signatures against both
+key sets at every transition. Versions 9, 10 and 13 changed the root key set.
+[Sigstore 3.0.0 wheel](https://pypi.org/project/sigstore/3.0.0/#files) and
+[published root history](https://github.com/sigstore/root-signing/tree/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata/root_history).
+
+At the selected verification time, 2026-11-24 00:00 UTC, the retained corpus
+reproduced four positive and two negative file comparisons, with four unknowns
+across ten planned cases. Dropping version 9 rejected the first skipped transition.
+Withholding the terminal root left an expired version 15. Requiring version
+17 rejected the complete history. Each rejection preserved all ten cases with
+unknown publisher truth. See the [original file comparisons](#publisher-file-comparisons-on-2026-11-24).
+
+A separate test approval authority used two key replacements and the same four
+retained native captures used in the preceding approval studies. All four
+derived policies matched their earlier bytes. The direct capture authorized
+one changed byte and remained incomplete. The temporal sweep authorized two.
+The two distributor-signed DLLs reproduced their unchanged observations. All
+four private archives reproduced their recorded assessments after removal of
+the working manifest and policy copies. The public Sigstore history validates
+release-file comparisons. Image change approvals in this study came from the
+test authority. Replay establishes trust in the retained revision at the
+chosen time. Newer online revisions and delegated targets require additional
+evidence. The documented preparation and replay commands ran under Windows
+PowerShell 5.1 and PowerShell 7.6 with both the single-root and rotated inputs.
+
 ## Windows publisher verification for retained PE files on 2026-11-24
 
 On Windows build 28000.3501, the native verifier captured a 64-byte executable
@@ -63,9 +94,10 @@ A separate negative control verified the publicly signed Sigstore
 Sigstore 4.6.0 wheel. The exact target bytes passed publisher verification and
 failed the native policy schema. Supplying the test authority's native policy
 under that same signed target name failed the file hash check. Both attempts
-returned a rejection receipt and created zero policies. Public vendor
-approval of Windows image changes, root rotation and delegated policy updates
-remain unverified. See the [public publisher revision](https://github.com/sigstore/root-signing/tree/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4).
+returned a rejection receipt and created zero policies. This study used one
+pinned root. The [root history study](#retained-publisher-root-history-on-2026-11-24)
+covers rotation. Public vendor approval of Windows image changes and delegated
+policy updates remain unverified. See the [public publisher revision](https://github.com/sigstore/root-signing/tree/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4).
 
 OpenSSL independently verified two root signatures, one timestamp signature,
 one snapshot signature and two targets signatures from the test authority.

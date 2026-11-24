@@ -89,6 +89,25 @@ class ApprovalFixture(unittest.TestCase):
         return receipt
 
 class ApprovalTests(ApprovalFixture):
+    def test_provision_with_rotated_approval_authority(self):
+        replacement = T["Repository"]()
+        anchor = self.repository.files({"root": {"expires": "2023-01-01T00:00:00Z"}})["root"]
+        update = T["successor"](self.repository, replacement, 2, expires="2024-03-01T00:00:00Z")
+        source = self.source.read_bytes()
+        descriptor = dict(length=len(source), hashes=dict(sha256=sha(source)))
+        files = replacement.files({"targets": {"targets": {NAME: descriptor}}})
+        self.env.write_bytes(T["history_bundle"](files, anchor, [update]))
+        self.root_pin = sha(anchor)
+        accepted = self.call(0, out=self.root / "rotated.knapproval", minimum_root_version=2)
+        self.assertEqual(accepted["publisher_proof"]["root_rotation"]["last_root_sha256"], sha(update))
+        cutoff = P["filetime"](datetime(2024, 3, 1, tzinfo=timezone.utc))
+        self.assertEqual(accepted["not_after_filetime"], str(cutoff))
+        self.assertEqual(self.call(1, minimum_root_version=3)["reason"], "root_version_below_minimum")
+        self.assertEqual(self.call(1, trusted_root_sha256=sha(update))["reason"], "untrusted_root")
+        self.call(2, minimum_root_version="01")
+        self.env.write_bytes(T["history_bundle"](files, anchor, [replacement.sign("root", json.loads(update)["signed"])]))
+        self.assertEqual(self.call(1)["reason"], "previous_root_threshold_failed")
+
     def test_projection_and_preservation(self):
         frozen = {p: p.read_bytes() for p in (self.source, self.change, self.image, self.env)}
         receipt = self.call(0)

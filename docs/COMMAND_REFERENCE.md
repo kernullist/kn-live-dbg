@@ -578,11 +578,14 @@ For a policy distributed by a TUF publisher, first install the optional
 dependencies in the selected Python environment with
 `python -m pip install -r tools/requirements-publisher-truth.txt`.
 Set `$python` and `$debugger` to that interpreter and the native executable.
-Set `$publisherReference` to the retained four-role envelope, `$sourcePolicy`
+Set `$publisherReference` to the retained TUF envelope, `$sourcePolicy`
 to the exact published policy file, `$manifest` to the change manifest and
 `$reference` to the whole retained PE file or its `.knblob` (up to 64 MiB).
 Use the approval authority's independently configured `$trustedRootSha256`
-and case-sensitive `$policyTarget`. Supply `$verificationTime` as UTC in
+for the initial root and its case-sensitive `$policyTarget`. A v2 reference
+can carry up to 32 successive root revisions. Set `$minimumRootVersion` to
+the last trusted root version recorded for this authority, or to `$null`
+to leave that check unset. Supply `$verificationTime` as UTC in
 `YYYYMMDDTHHMMSSZ` form, `$selectedPolicy` as a new filename in a private
 directory and `$capture` as the retained native capture to assess.
 
@@ -592,12 +595,13 @@ Set `$catalog` to the retained catalog file for a catalog row and to `$null`
 for an embedded or v1 row. The reference and catalog each have a 64 MiB limit.
 
 ```powershell
-$windowsOptions = @()
-if ($requireWindowsPublisher) { $windowsOptions += '--require-windows-publisher' }
-if ($catalog) { $windowsOptions += @('--catalog', $catalog) }
+$approvalOptions = @()
+if ($null -ne $minimumRootVersion) { $approvalOptions += @('--minimum-root-version', $minimumRootVersion) }
+if ($requireWindowsPublisher) { $approvalOptions += '--require-windows-publisher' }
+if ($catalog) { $approvalOptions += @('--catalog', $catalog) }
 $receiptJson = & $python -B tools/provision-image-approval.py --publisher-reference $publisherReference `
     --trusted-root-sha256 $trustedRootSha256 --verification-time $verificationTime --policy-target $policyTarget `
-    --policy $sourcePolicy --manifest $manifest --reference $reference --out $selectedPolicy @windowsOptions
+    --policy $sourcePolicy --manifest $manifest --reference $reference --out $selectedPolicy @approvalOptions
 if ($LASTEXITCODE -ne 0) { throw 'Image approval provisioning failed' }
 $receipt = $receiptJson | ConvertFrom-Json
 & $debugger --offline '!kmon' assess-image $capture $manifest $selectedPolicy $receipt.native_policy_sha256 /json

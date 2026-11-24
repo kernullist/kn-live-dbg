@@ -21,6 +21,7 @@ TASK = "publisher-target-bytes-match"
 ROLES = ("root", "timestamp", "snapshot", "targets")
 MAX_ROLE = 1 << 20
 MAX_SCOPE = 1 << 20
+MAX_ROOT_UPDATES = 32
 TRUTHS = ("positive", "negative", "unknown")
 
 
@@ -79,45 +80,106 @@ def strong_hashes(hashes):
                 for key, value in hashes.items()))
 
 
-def check_reference(raw, decode, trusted_root, instant):
+def root_version_floor(value):
+    if value is None:
+        return None
+    if not re.fullmatch(r"[1-9][0-9]{0,18}", value) or int(value) > (1 << 63) - 1:
+        raise ValueError("minimum root version must be a positive 63-bit decimal integer")
+    return int(value)
+
+
+def reference_updates(bundle):
+    need(type(bundle) is dict, "invalid_reference")
+    keys = {"schema", *ROLES}
+    if bundle.get("schema") == "kn.benchmark_tuf_reference.v1":
+        need(bundle.keys() == keys, "invalid_reference")
+        return []
+    need(bundle.get("schema") == "kn.benchmark_tuf_reference.v2" and bundle.keys() == (keys | {"root_updates"}),
+         "invalid_reference")
+    updates = bundle["root_updates"]
+    need(type(updates) is list and 1 <= len(updates) <= MAX_ROOT_UPDATES, "invalid_root_updates")
+    return updates
+
+
+def role_bytes(field):
+    need(type(field) is str and len(field) <= 4 * ((MAX_ROLE + 2) // 3), "invalid_role_bytes")
+    data = base64.b64decode(field, validate=True)
+    need(0 < len(data) <= MAX_ROLE, "invalid_role_bytes")
+    return data
+
+
+def parse_role(data, role, decode):
+    document = decode(data)
+    signed = document["signed"]
+    need(signed["_type"] == role and type(signed["version"]) is int and signed["version"] > 0 and
+         re.fullmatch(r"1\.[0-9]+(?:\.[0-9]+)?", signed["spec_version"]), "invalid_role_metadata")
+    if role == "root":
+        for name in ROLES:
+            policy = signed["roles"][name]
+            keyids = policy["keyids"]
+            need(type(keyids) is list and all(type(k) is str for k in keyids) and len(keyids) == len(set(keyids)) and
+                 type(policy["threshold"]) is int and 1 <= policy["threshold"] <= len(keyids), "invalid_role_threshold")
+    if role in ("timestamp", "snapshot"):
+        child = "snapshot.json" if role == "timestamp" else "targets.json"
+        link = signed["meta"][child]
+        # The TUF decoder folds JSON null and an omitted field into the same optional value.
+        need(type(link["version"]) is int and link["version"] > 0, "metadata_version_mismatch")
+        need("length" not in link or type(link["length"]) is int and link["length"] >= 0, "invalid_metadata_length")
+        need("hashes" not in link or strong_hashes(link["hashes"]), "invalid_metadata_hashes")
+    # Preserve exactly what was signed before the typed decoder consumes the mapping.
+    payload = encode_canonical(signed).encode("utf-8")
+    return Metadata.from_dict(document), payload
+
+
+def verified_root(anchor, updates, decode, pin, proof):
+    data = role_bytes(anchor)
+    need(hashlib.sha256(data).hexdigest() == pin, "untrusted_root")
+    metadata, payload = parse_role(data, "root", decode)
+    root = metadata.signed
+    result = root.get_verification_result("root", payload, metadata.signatures)
+    need(bool(result), "signature_threshold_failed")
+    if not updates:
+        return root, result
+    history = dict(anchor_version=root.version, presented_updates=len(updates), verified_updates=0,
+                   last_root_version=root.version, last_root_sha256=pin)
+    proof["root_rotation"] = history
+    for index, field in enumerate(updates, 1):
+        data = role_bytes(field)
+        metadata, payload = parse_role(data, "root", decode)
+        candidate = metadata.signed
+        need(candidate.version == root.version + 1, "root_version_not_sequential")
+        quorum = candidate.get_root_verification_result(root, payload, metadata.signatures)
+        need(bool(quorum.first), "previous_root_threshold_failed")
+        need(bool(quorum.second), "new_root_threshold_failed")
+        root, result = candidate, quorum.second
+        history.update(verified_updates=index, last_root_version=root.version, last_root_sha256=hashlib.sha256(data).hexdigest())
+    return root, result
+
+
+def role_receipt(signed, result):
+    return dict(version=signed.version, threshold=result.threshold, valid_key_ids=len(result.signed),
+                expires=signed.expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
+
+
+def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
     versions, links = {}, {}
+    proof = {} if minimum_version is None else dict(minimum_root_version=minimum_version)
     role = "reference"
     try:
+        need(0 < len(raw) <= MAX_DOCUMENT, "invalid_reference")
         bundle = decode(raw)
-        need(type(bundle) is dict and bundle.keys() == {"schema", *ROLES} and
-             bundle["schema"] == "kn.benchmark_tuf_reference.v1", "invalid_reference")
-        root = parent_link = None
-        for role in ROLES:
-            field = bundle[role]
-            need(type(field) is str and len(field) <= 4 * ((MAX_ROLE + 2) // 3), "invalid_role_bytes")
-            data = base64.b64decode(field, validate=True)
-            need(0 < len(data) <= MAX_ROLE, "invalid_role_bytes")
-            if role == "root":
-                need(hashlib.sha256(data).hexdigest() == trusted_root, "untrusted_root")
-            document = decode(data)
-            signed = document["signed"]
-            version = signed["version"]
-            need(signed["_type"] == role and type(version) is int and version > 0 and
-                 re.fullmatch(r"1\.[0-9]+(?:\.[0-9]+)?", signed["spec_version"]), "invalid_role_metadata")
-            if role == "root":
-                for name in ROLES:
-                    policy = signed["roles"][name]
-                    keyids = policy["keyids"]
-                    need(type(keyids) is list and all(type(k) is str for k in keyids) and len(keyids) == len(set(keyids)) and
-                         type(policy["threshold"]) is int and 1 <= policy["threshold"] <= len(keyids),
-                         "invalid_role_threshold")
-            if role in ("timestamp", "snapshot"):
-                child = "snapshot.json" if role == "timestamp" else "targets.json"
-                link = signed["meta"][child]
-                # The TUF decoder folds JSON null and an omitted field into the same optional value.
-                need(type(link["version"]) is int and link["version"] > 0, "metadata_version_mismatch")
-                need("length" not in link or type(link["length"]) is int and link["length"] >= 0, "invalid_metadata_length")
-                need("hashes" not in link or strong_hashes(link["hashes"]), "invalid_metadata_hashes")
-            # Verify exactly what the publisher signed, before the typed decoder consumes the mapping.
-            payload = encode_canonical(signed).encode("utf-8")
-            metadata = Metadata.from_dict(document)
-            if role == "root":
-                root = metadata.signed
+        updates = reference_updates(bundle)
+        role = "root"
+        root, result = verified_root(bundle[role], updates, decode, trusted_root, proof)
+        # Historical roots authorize the next transition. Only the terminal root authorizes these roles.
+        need(not root.is_expired(instant), "expired_metadata")
+        versions[role] = role_receipt(root, result)
+        need(minimum_version is None or root.version >= minimum_version, "root_version_below_minimum")
+        parent_link = None
+        for role in ROLES[1:]:
+            data = role_bytes(bundle[role])
+            metadata, payload = parse_role(data, role, decode)
+            version = metadata.signed.version
             result = root.get_verification_result(role, payload, metadata.signatures)
             need(bool(result), "signature_threshold_failed")
             need(not metadata.signed.is_expired(instant), "expired_metadata")
@@ -125,20 +187,19 @@ def check_reference(raw, decode, trusted_root, instant):
                 need(parent_link.version == version, "metadata_version_mismatch")
                 parent_link.verify_length_and_hashes(data)
                 links[role] = dict(version=version, length=parent_link.length, hashes=parent_link.hashes)
-            versions[role] = dict(version=version, threshold=result.threshold, valid_key_ids=len(result.signed),
-                                  expires=metadata.signed.expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
+            versions[role] = role_receipt(metadata.signed, result)
             if role == "timestamp":
                 parent_link = metadata.signed.snapshot_meta
             elif role == "snapshot":
                 parent_link = metadata.signed.meta["targets.json"]
-        return metadata.signed.targets, dict(status="verified", roles=versions, metadata_links=links)
+        return metadata.signed.targets, dict(status="verified", roles=versions, metadata_links=links, **proof)
     except Rejected as exc:
         reason = str(exc)
     except LengthOrHashMismatchError:
         reason = "metadata_length_or_hash_mismatch"
     except (KeyError, IndexError, TypeError, ValueError, AttributeError, OverflowError, RecursionError, RepositoryError, SigningLibraryError):
         reason = "invalid_role_metadata"
-    return {}, dict(status=reason, failed_role=role, roles=versions)
+    return {}, dict(status=reason, failed_role=role, roles=versions, **proof)
 
 
 def compare_target(scope, pin, original, targets, stream, sha512_cache):
@@ -176,7 +237,7 @@ def verification_time(at):
         raise ValueError("verification time must be a valid UTC YYYYMMDDTHHMMSSZ") from None
 
 
-def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio):
+def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, minimum_version=None):
     instant = verification_time(at)
     groups = defaultdict(list)
     coverage = {r["case_id"]: r for r in report["coverage"]["cases"]}
@@ -195,7 +256,7 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio):
         if gap:
             targets, proof = {}, dict(status="reference_" + gap)
         else:
-            targets, proof = check_reference(data, decode, trusted_root, instant)
+            targets, proof = check_reference(data, decode, trusted_root, instant, minimum_version)
         references.append(dict(truth_ref_sha256=ref, **proof))
         status = proof["status"]
         failed += status not in ("verified", "reference_missing")
@@ -219,6 +280,8 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio):
             contradictions += truth != "unknown" and case["truth"] not in ("unknown", truth)
 
     declared = Counter(c["truth"] for c in cases.values())
+    if minimum_version is not None:
+        report["minimum_root_version"] = minimum_version
     report.update(schema="kn.benchmark_publisher_report.v1", truth_basis="whole_file_against_signed_top_level_target",
                   file_scope_basis="registered_acquisition_extent_and_hole_map",
                   trusted_root_sha256=trusted_root, verification_time_utc=instant.strftime("%Y-%m-%dT%H:%M:%SZ"),

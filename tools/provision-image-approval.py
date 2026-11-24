@@ -157,6 +157,7 @@ def image_identity(path):
 
 def provision(args, receipt, publisher):
     root = digest(args.trusted_root_sha256)
+    minimum_version = publisher.root_version_floor(args.minimum_root_version)
     name = publisher.target_name(args.policy_target)
     instant = publisher.verification_time(args.verification_time)
     at = filetime(instant)
@@ -166,7 +167,7 @@ def provision(args, receipt, publisher):
     if os.path.lexists(destination):
         raise FileExistsError
     envelope = read_document(args.publisher_reference, MAX_DOCUMENT)
-    targets, proof = publisher.check_reference(envelope, DECODE, root, instant)
+    targets, proof = publisher.check_reference(envelope, DECODE, root, instant, minimum_version)
     receipt.update(trusted_root_sha256=root, verification_time_utc=instant.isoformat().replace("+00:00", "Z"),
                    publisher_reference_sha256=sha(envelope), policy_target=name, publisher_proof=proof)
     require(proof["status"] == "verified", proof["status"])
@@ -231,8 +232,8 @@ def main(argv):
         return 2
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     for flag, help_text in (
-            ("--publisher-reference", "retained four-role TUF reference file"),
-            ("--trusted-root-sha256", "independently provisioned SHA-256 of the publisher's raw root metadata"),
+            ("--publisher-reference", "retained TUF roles and any signed root updates"),
+            ("--trusted-root-sha256", "independently provisioned SHA-256 of the publisher's initial root metadata"),
             ("--verification-time", "UTC instant in YYYYMMDDTHHMMSSZ form"),
             ("--policy-target", "name in the signed top-level targets role"),
             ("--policy", "publisher's exact native image approval policy file"),
@@ -240,6 +241,7 @@ def main(argv):
             ("--reference", "complete retained PE reference bytes"),
             ("--out", "new filename for the selected native policy")):
         parser.add_argument(flag, required=True, help=help_text)
+    parser.add_argument("--minimum-root-version", help="lowest terminal version accepted from this publisher's retained root history")
     parser.add_argument("--catalog", help="exact retained Windows catalog required by the signed catalog row")
     parser.add_argument("--require-windows-publisher", action="store_true",
                         help="require a signed v2 policy and a matching Windows PE publisher")

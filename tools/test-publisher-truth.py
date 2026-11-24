@@ -41,6 +41,22 @@ def bundle(files):
                     **{k: base64.b64encode(v).decode("ascii") for k, v in files.items()}))
 
 
+def history_bundle(files, anchor, updates):
+    envelope = json.loads(bundle(files))
+    envelope.update(schema="kn.benchmark_tuf_reference.v2", root=base64.b64encode(anchor).decode("ascii"),
+                    root_updates=[base64.b64encode(data).decode("ascii") for data in updates])
+    return raw(envelope)
+
+
+def successor(previous, current, version, **changes):
+    body = {**current.base["root"], "version": version, **changes}
+    sigs = {}
+    for repo in (previous, current):
+        for sig in json.loads(repo.sign("root", body))["signatures"]:
+            sigs[sig["keyid"]] = sig
+    return raw(dict(signed=body, signatures=list(sigs.values())))
+
+
 class Repository:
     def __init__(self):
         self.private = {}
@@ -77,6 +93,86 @@ class Repository:
             body.update((overrides or {}).get(role, {}))
             files[role] = self.sign(role, body)
         return files
+
+
+class RootHistoryTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.first, cls.middle, cls.last = Repository(), Repository(), Repository()
+        cls.middle.quorum["root"].append(cls.middle.quorum["snapshot"][0])
+        cls.middle.base["root"]["roles"]["root"]["threshold"] = 3
+        cls.anchor = cls.first.files({"root": {"expires": "2023-01-01T00:00:00Z"}})["root"]
+        cls.two = successor(cls.first, cls.middle, 2, expires="2023-11-01T00:00:00Z")
+        cls.three = successor(cls.middle, cls.last, 3)
+        cls.files = cls.last.files()
+
+    def verify(self, updates, floor=None, files=None, pin=None):
+        targets, proof = publisher.check_reference(history_bundle(files or self.files, self.anchor, updates),
+                                                   corpus.decode_document, pin or sha(self.anchor), TIME, floor)
+        self.assertEqual(bool(targets), proof["status"] == "verified")
+        return proof
+
+    def test_trust_moves_across_expired_roots_and_distinct_quorums(self):
+        verified = self.verify([self.two, self.three], 3)
+        self.assertEqual(verified["status"], "verified")
+        self.assertEqual(verified["root_rotation"], dict(anchor_version=1, presented_updates=2, verified_updates=2,
+                                                        last_root_version=3, last_root_sha256=sha(self.three)))
+        self.assertEqual(verified["roles"]["root"], dict(version=3, threshold=2, valid_key_ids=2,
+                                                        expires="2025-01-01T00:00:00Z"))
+        self.assertEqual(verified["minimum_root_version"], 3)
+        older = self.first.files()
+        for role in ("timestamp", "snapshot", "targets"):
+            proof = self.verify([self.two, self.three], files={**self.files, role: older[role]})
+            self.assertEqual((proof["status"], proof["failed_role"]), ("signature_threshold_failed", role))
+        self.assertEqual(self.verify([self.two, self.three], pin=sha(self.three))["status"], "untrusted_root")
+
+    def test_both_root_thresholds_are_independently_mandatory(self):
+        for retain, status in ((self.first.quorum["root"], "new_root_threshold_failed"),
+                               (self.middle.quorum["root"], "previous_root_threshold_failed"),
+                               (self.first.quorum["root"] + self.middle.quorum["root"][:2], "new_root_threshold_failed")):
+            docs = json.loads(self.two)
+            docs["signatures"] = [s for s in docs["signatures"] if s["keyid"] in retain]
+            proof = self.verify([raw(docs), self.three])
+            self.assertEqual((proof["status"], proof["failed_role"]), (status, "root"))
+            self.assertEqual(proof["root_rotation"]["last_root_sha256"], sha(self.anchor))
+        docs = json.loads(self.three)
+        docs["signatures"] = [s for s in docs["signatures"] if s["keyid"] in self.last.quorum["root"]]
+        proof = self.verify([self.two, raw(docs)])
+        self.assertEqual((proof["status"], proof["root_rotation"]["verified_updates"]), ("previous_root_threshold_failed", 1))
+        docs["signatures"] += [docs["signatures"][0]]
+        self.assertNotEqual(self.verify([self.two, raw(docs)])["status"], "verified")
+
+    def test_exact_versions_terminal_expiry_and_operator_floor(self):
+        expired = successor(self.middle, self.last, 3, expires="2024-02-01T00:00:00Z")
+        self.assertEqual(self.verify([self.two, expired])["status"], "expired_metadata")
+        self.assertEqual(self.verify([self.two, self.three], 4)["status"], "root_version_below_minimum")
+        for sequence in ([self.three], [self.two, self.two], [self.two, self.anchor], [self.two, self.three, self.two]):
+            self.assertEqual(self.verify(sequence)["status"], "root_version_not_sequential")
+        single = self.first.files()
+        v1 = publisher.check_reference(bundle(single), corpus.decode_document, sha(single["root"]), TIME, 2)[1]
+        self.assertEqual((v1["status"], v1["minimum_root_version"], v1["roles"]["root"]["version"]),
+                         ("root_version_below_minimum", 2, 1))
+        for value in ("0", "+1", "01", "-1", "1.0", " 1", str(1 << 63)):
+            with self.assertRaises(ValueError):
+                publisher.root_version_floor(value)
+        self.assertEqual(publisher.root_version_floor(str((1 << 63) - 1)), (1 << 63) - 1)
+
+    def test_history_encoding_budgets_and_largest_valid_sequence(self):
+        doc = json.loads(history_bundle(self.files, self.anchor, [self.two, self.three]))
+        alternatives = [dict(doc, schema="kn.benchmark_tuf_reference.v1"), dict(doc, root_updates=[]),
+                        dict(doc, root_updates=None), dict(doc, root_updates=[""] * (publisher.MAX_ROOT_UPDATES + 1)),
+                        dict(doc, root_updates=[None]), dict(doc, root_updates=["!"]), dict(doc, root_updates=[doc["targets"]]),
+                        dict(doc, root_updates=[base64.b64encode(bytes(publisher.MAX_ROLE + 1)).decode("ascii")])]
+        for bad in alternatives:
+            targets, proof = publisher.check_reference(raw(bad), corpus.decode_document, sha(self.anchor), TIME)
+            self.assertFalse(targets)
+            self.assertNotEqual(proof["status"], "verified")
+        with mock.patch.object(corpus, "decode_document", side_effect=AssertionError("oversize envelope decoded")) as decode:
+            self.assertEqual(publisher.check_reference(bytes(archive.MAX_DOCUMENT + 1), decode, sha(self.anchor), TIME)[1]["status"],
+                             "invalid_reference")
+        rotations = [successor(self.first, self.first, i + 2) for i in range(publisher.MAX_ROOT_UPDATES)]
+        proof = self.verify(rotations, files=self.first.files())
+        self.assertEqual((proof["status"], proof["root_rotation"]["verified_updates"]), ("verified", publisher.MAX_ROOT_UPDATES))
 
 
 class PublisherTests(unittest.TestCase):
@@ -242,6 +338,26 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(partial["assessments_with_originals_per_planned_case"]["numerator"], 0)
             without_ref = run(replay((ref,)) + flags, 0)
             self.assertEqual(without_ref["publisher_references"][0]["status"], "reference_missing")
+
+            next_repo = Repository()
+            next_root = successor(self.repo, next_repo, 2)
+            rotated = keep(history_bundle(next_repo.files(), files["root"], [next_root]))
+            mixed = [dict(case, truth_ref_sha256=rotated) if case["id"] == "match" else case for case in cases]
+            new_plan = raw(dict(json.loads(plan), cases=mixed))
+            new_results = raw(dict(json.loads(results), corpus_sha256=sha(new_plan)))
+            path = directory / "rotation.knbench"
+            receipt = archive.seal(path, new_plan, new_results, inputs.values(), set(inputs))
+            command = ["--archive-corpus", path, "--sha256", receipt["package_sha256"], "--plan-sha256", sha(new_plan)]
+            self.assertEqual(run(command + flags, 0)["adjudicated_per_planned_case"]["numerator"], 3)
+            filtered = run(command + flags + ["--minimum-root-version", "2"], 1)
+            by_ref = {r["truth_ref_sha256"]: r for r in filtered["publisher_references"]}
+            self.assertEqual(by_ref[ref]["status"], "root_version_below_minimum")
+            self.assertEqual(by_ref[rotated]["root_rotation"]["last_root_sha256"], sha(next_root))
+            self.assertEqual(filtered["minimum_root_version"], 2)
+            ratio = filtered["adjudicated_per_planned_case"]
+            self.assertEqual((ratio["numerator"], ratio["denominator"]), (1, len(cases)))
+            self.assertEqual(run(command + flags + ["--minimum-root-version", "0"], 2), b"")
+            self.assertEqual(run(command + ["--minimum-root-version", "2"], 2), b"")
 
     def test_changed_original_is_an_archive_failure(self):
         with self.assertRaisesRegex(ValueError, "changed"):

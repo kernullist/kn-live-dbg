@@ -3819,11 +3819,20 @@ another host or at another time. See [WinTrust verification flags](https://learn
 The PE distributor signs the image or its catalog membership. The TUF
 authority approves the precise change manifest. A personal signature by the
 manifest issuer and collector authentication each require separate evidence.
-TUF verification covers one pinned metadata revision. Discovering
-newer revisions, root rotation, delegated targets and revocation between
-revisions remain open. Retain the source policy, four original metadata files,
-independent trust configuration and private provisioning receipt alongside the
-native replay inputs. See the [publisher reference format](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release).
+
+When the authority changes keys, the operator can retain its consecutive TUF
+root revisions with the release metadata. The verifier authenticates every
+successor under the previous and replacement root policies. The final root
+authorizes the timestamp, snapshot and targets roles. Its expiry also bounds
+the derived native policy. An independently recorded minimum root version
+lets the operator reject an older terminal revision. Both single-root and
+rotated references work with either source approval policy.
+
+Retain the original roots and release roles, source policy, independent trust
+configuration and private provisioning receipt alongside the native inputs.
+Discovering a newer revision, delegated targets and evidence of revocation
+between retained revisions remain open. See the
+[publisher reference format](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release).
 
 ### Approved image collections
 

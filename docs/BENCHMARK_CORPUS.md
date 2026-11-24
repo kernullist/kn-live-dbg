@@ -593,8 +593,12 @@ independently of the corpus. Install the optional verifier into the Python
 environment used for this command with
 `python -m pip install -r tools/requirements-publisher-truth.txt`.
 
-The truth reference is a UTF-8 `kn.benchmark_tuf_reference.v1` document. Its
-four role fields each hold the Base64 encoding of one original metadata file.
+The truth reference is a UTF-8 document. In `kn.benchmark_tuf_reference.v1`,
+each of the four role fields holds the Base64 encoding of an original metadata
+file. A `kn.benchmark_tuf_reference.v2` envelope also contains `root_updates`,
+an array of 1 to 32 Base64-encoded successor roots in version order. The
+`root` field always holds the original independently pinned root. The last
+successor supplies the keys for `timestamp`, `snapshot` and `targets`.
 Several cases can share a reference. The per-case hole map uses
 `kn.benchmark_target_scope.v1`. Record the exact, case-sensitive target name,
 the acquisition's declared file size in bytes and its sorted, nonoverlapping
@@ -602,7 +606,12 @@ missing intervals as pairs of zero-based offsets with an exclusive end.
 
 This PowerShell example writes both inputs for a complete capture to a new
 private working directory. Set `$metadata` to the directory containing the
-four original JSON files, `$work` to the empty working directory,
+four original JSON files. Use the initial root as `root.json` and the three
+other roles from the revision being evaluated. Set `$rootUpdates` to an
+ordered array of paths to successive root files, or `@()` for v1. For
+example, for a v5 anchor and v16 terminal root in the same metadata directory,
+use `$rootUpdates = @(6..16 | ForEach-Object { Join-Path $metadata "$_.root.json" })`.
+Set `$work` to the empty working directory,
 `$targetName` to the signed name and `$capturedSize` to the whole-file size
 recorded during acquisition. Use the recorded missing intervals for a capture
 with gaps.
@@ -612,14 +621,30 @@ with gaps.
 import base64, json, sys
 from pathlib import Path
 metadata, work = map(Path, sys.argv[1:3])
+def role_bytes(path):
+    with path.open("rb") as stream:
+        data = stream.read((1 << 20) + 1)
+    if not 0 < len(data) <= 1 << 20:
+        raise ValueError("role exceeds its size limit or is empty")
+    return base64.b64encode(data).decode("ascii")
+
 reference = dict(schema="kn.benchmark_tuf_reference.v1")
 for role in ("root", "timestamp", "snapshot", "targets"):
-    reference[role] = base64.b64encode((metadata / (role + ".json")).read_bytes()).decode("ascii")
+    reference[role] = role_bytes(metadata / (role + ".json"))
+updates = sys.argv[5:]
+if len(updates) > 32:
+    raise ValueError("too many root updates")
+if updates:
+    reference["schema"] = "kn.benchmark_tuf_reference.v2"
+    reference["root_updates"] = [role_bytes(Path(p)) for p in updates]
 scope = dict(schema="kn.benchmark_target_scope.v1", target_path=sys.argv[3], file_bytes=int(sys.argv[4]), missing=[])
 for name, document in (("publisher.json", reference), ("scope.json", scope)):
+    encoded = json.dumps(document, separators=(",", ":")).encode("utf-8")
+    if len(encoded) > 8 << 20:
+        raise ValueError("document exceeds its size limit")
     with (work / name).open("xb") as out:
-        out.write(json.dumps(document, separators=(",", ":")).encode("utf-8"))
-'@ | python -B - $metadata $work $targetName $capturedSize
+        out.write(encoded)
+'@ | python -B - $metadata $work $targetName $capturedSize @rootUpdates
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare publisher inputs' }
 ```
 
@@ -629,12 +654,16 @@ Register the SHA-256 of `publisher.json` as `truth_ref_sha256`, that of
 assessment evidence, tool and configuration. To replay, set `$archive`,
 `$pin` and `$plan` as in the retention example above. Set `$trustedRoot` to
 the root metadata supplied by your independent trust source. Choose the UTC
-instant for expiry checks explicitly. The date below is the instant used for
-the Sigstore study.
+instant for expiry checks explicitly. If a trusted source has already recorded
+a minimum root version for this publisher, set `$minimumRootVersion` to that
+positive decimal integer. Set it to `$null` to use only the pinned anchor and
+the presented revisions. The date below is the instant used for the Sigstore study.
 
 ```powershell
 $anchor = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedRoot).Hash.ToLowerInvariant()
-$json = python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan --trusted-root-sha256 $anchor --verification-time 20261124T000000Z
+$rootOptions = @()
+if ($null -ne $minimumRootVersion) { $rootOptions += @('--minimum-root-version', $minimumRootVersion) }
+$json = python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan --trusted-root-sha256 $anchor --verification-time 20261124T000000Z @rootOptions
 $status = $LASTEXITCODE
 if ($status -eq 2) { throw 'Publisher evaluation failed' }
 $report = $json | ConvertFrom-Json
@@ -642,15 +671,25 @@ $report.adjudicated_per_planned_case
 $report.coverage.cases | Select-Object case_id, declared_truth, publisher_truth, truth_reason
 ```
 
-The verifier checks the exact root bytes against the independent pin, verifies
-the signatures and thresholds for all four roles, and checks expiry at the
+The verifier checks the exact initial root bytes against the independent pin
+and verifies its own signature threshold. Every successor must increment the
+version by one and meet both its predecessor's root signature threshold and
+its own. Expired intermediate roots can still establish signature continuity.
+The terminal root and all three release roles must be unexpired at the
 selected instant. The timestamp binds the snapshot version and the snapshot
 binds the targets version. Any supplied length and SHA-256 or SHA-512 digests
 must also match. The report records the actual link fields and the number of
-valid key IDs for each role. A version-only link remains visible. Replay uses
-one pinned root and direct top-level targets. Root rotation, delegated target
-lookup, the newest available version and proof of historical publication are
-outside this check. [TUF specification](https://github.com/theupdateframework/specification/blob/master/tuf-spec.md)
+valid key IDs for each role. A version-only link remains visible. For a root
+history, `root_rotation` records the starting version, the presented and
+verified update counts, and the version and raw SHA-256 of the last root whose
+signatures passed. The reference's top-level `status` determines acceptance.
+The operator's optional `--minimum-root-version` applies to both envelope
+versions. It accepts decimal integers from 1 through 2⁶³−1. Replay evaluates
+the retained top-level targets. Timestamp and snapshot rollback checks across
+runs require a client's previously trusted metadata. Online discovery of
+newer revisions, delegated targets and proof of historical publication remain
+outside this check.
+[TUF root update rules](https://theupdateframework.github.io/specification/latest/#update-root)
 
 A positive file matches the signed length and every signed digest. A complete
 file that differs is negative. Missing originals, unsupported digests,

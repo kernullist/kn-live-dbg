@@ -674,6 +674,17 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Read native_policy_sha256 from the provisioning receipt."))
 
+    def test_publisher_root_history_and_detached_progress(self):
+        samples = (dict(schema="kn.benchmark_tuf_reference.v2"), dict(root_updates=["metadata"]),
+                   dict(root_rotation={}), dict(last_root_sha256=None), dict(anchor_version=5, presented_updates=11),
+                   dict(presented_updates=2, verified_updates=1), dict(verified_updates=3, last_root_version=8),
+                   dict(minimum_root_version=2, failed_role="root"))
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("record\n" + json.dumps({"part": [sample]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Supply root_updates in ascending order."))
+
     def test_windows_publisher_policy_and_receipts(self):
         samples = (dict(schema="kn.image_approval_policy.v2"), dict(schema="kn.image_approval_provision.v2"),
                    dict(windows_publisher={}), dict(reference_signature={}, issuer="team"),

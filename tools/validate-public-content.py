@@ -367,7 +367,8 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v1", "kn.benchmark_original_recovery.v1",
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
-                    "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.image_approval_provision.v1",
+                    "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
+                    "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2")
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
@@ -375,7 +376,8 @@ RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"original_status"', '"original_files"', 
                     '"policy_target"', '"source_approval_count"', '"publisher_reference_sha256"', '"source_policy_sha256"',
                     '"reference_bytes"', '"policy_epoch"', '"windows_publisher"', '"signature_policy"',
                     '"reference_signature"', '"signer_certificate_sha256"', '"catalog_member_sha256"', '"catalog_sha256"',
-                    '"wintrust_status"', '"finished_utc"')
+                    '"wintrust_status"', '"finished_utc"', '"root_updates"', '"root_rotation"', '"last_root_sha256"',
+                    '"presented_updates"', '"verified_updates"', '"minimum_root_version"')
 RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("case_id", "original_status"), ("referenced_objects", "verified_objects"), ("missing_sha256",), ("original_files",),
     ("package_sha256", "results_sha256", "corpus_sha256"), ("package_sha256", "original_sha256", "original_bytes"),
@@ -388,6 +390,8 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("windows_publisher",), ("signature_policy", "started_utc"), ("reference_signature", "issuer"),
     ("signer_certificate_sha256",), ("catalog_member_sha256",), ("catalog_sha256", "catalog_bytes"),
     ("wintrust_status",), ("win32_status", "finished_utc"),
+    ("root_updates",), ("root_rotation",), ("last_root_sha256",), ("anchor_version", "presented_updates"),
+    ("presented_updates", "verified_updates"), ("verified_updates", "last_root_version"), ("minimum_root_version", "failed_role"),
 ))
 DETACHED_FIELD_SETS = RETAINED_FIELDS + READY_ORIGIN_FIELDS + WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + ETL_ROTATION_FIELDS + tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),
