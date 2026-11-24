@@ -7,6 +7,36 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Cross-channel bugcheck reports
+
+On 2026-11-25 the development x64 Release reader compared one saved
+System WER record with all 87 BlueScreen records in a saved Application
+export. Get-WinEvent independently decoded the original provider
+properties. Forty-six Application records agreed on the report GUID,
+computer label, stop code and four parameters. The remaining 41 had a
+different GUID and stop tuple. Of the 46 matches, 45 had recorded
+submission times later than a subsequent OS start in the System log.
+There were two distinct report GUIDs in the Application export.
+
+The corroborating Event 41 and the System WER record were 15 record IDs
+apart. All 16 inclusive records passed the same-label System check.
+Removing one interior record kept the matching stop and the cross-channel
+report comparison and withheld reboot corroboration. The Event 41 used
+for an earlier boot-window control came 780 record IDs after this WER
+report and contained a different stop tuple. A wrong Application archive
+pin preserved the System observations. Independent controls covered lookup failures and
+redirected output to a hard link of either input.
+
+The new native parser and comparison tests passed 32 checks, and the
+existing reboot parser passed 241. The default MSVC AddressSanitizer
+stopped during Windows interception startup. With continuation enabled
+the 32 checks ran with partial interception. All 63 historical v1 through
+v6 crash-diagnosis invocations matched the previous executable's stdout,
+stderr and exit status. The selected System report's dump was unavailable.
+These results corroborate recorded reports. Establishing a crash cause
+requires incident-specific dump and provenance evidence.
+[Run the saved WER comparison](COMMAND_REFERENCE.md#compare-windows-error-reporting-records-across-saved-logs)
+
 ## Saved boot window comparison
 
 On 2026-11-25 the development x64 Release executable compared controlled

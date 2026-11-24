@@ -1,6 +1,7 @@
 #include "WheaEvent.h"
 #include "WheaRecord.h"
 #include "RebootEvent.h"
+#include "WerReports.h"
 #include "SchemaArtifact.h"
 #include "SymbolArtifactCache.h"
 #include "McpJson.h"
@@ -74,7 +75,7 @@ namespace
 
     enum class Group { Other, System, Data };
     enum Field { None, Provider, Time, Id, Version, RecordId, Channel, Length, Raw,
-        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, OldTime, NewTime, StartTime, Count };
+        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, OldTime, NewTime, StartTime, Computer, ReportGuid, EventName, Count };
 
     bool Attribute(IXmlReader& reader, const wchar_t* name, std::wstring& out)
     {
@@ -96,8 +97,9 @@ namespace
 
     struct Event
     {
-        enum class Kind { Whea, Reboot, Clock, BootStart };
+        enum class Kind { Whea, Reboot, Clock, BootStart, WerSystem, WerApplication };
         Kind kind = Kind::Whea;
+        bool readComputer = false;
         Group group = Group::Other;
         Field field = None;
         bool sawSystem = false, sawData = false, otherPayload = false;
@@ -151,6 +153,7 @@ namespace
                 else if (name == L"Version") { field = Version; }
                 else if (name == L"EventRecordID") { field = RecordId; }
                 else if (name == L"Channel") { field = Channel; }
+                else if (readComputer && name == L"Computer") { field = Computer; }
             }
             if (group == Group::Data && name == L"Data")
             {
@@ -173,6 +176,18 @@ namespace
                     else if (kind == Kind::BootStart)
                     {
                         if (key == L"StartTime") { field = StartTime; }
+                    }
+                    else if (kind == Kind::WerSystem)
+                    {
+                        if (key == L"param1") { field = StopCode; }
+                        else if (key == L"param3") { field = ReportGuid; }
+                    }
+                    else if (kind == Kind::WerApplication)
+                    {
+                        if (key == L"EventName") { field = EventName; }
+                        else if (key == L"ReportId") { field = ReportGuid; }
+                        else if (key.size() == 2 && key[0] == L'P' && key[1] >= L'1' && key[1] <= L'5')
+                        { field = static_cast<Field>(StopCode + (key[1] - L'1')); }
                     }
                     else if (key == L"RawData") { field = Raw; }
                     else if (key == L"Length") { field = Length; }
@@ -250,17 +265,17 @@ namespace
 
         struct Identity { uint64_t id, version, recordId; std::optional<uint64_t> fileTime; };
 
-        std::optional<Identity> Metadata(const wchar_t* name, const wchar_t* guid)
+        std::optional<Identity> Metadata(const wchar_t* name, const wchar_t* guid, const wchar_t* channel = L"System")
         {
             if (!seen[Provider] || text[Provider] != name || providerGuid.size() != 38 ||
                 CompareStringOrdinal(providerGuid.c_str(), 38, guid, 38, TRUE) != CSTR_EQUAL ||
-                text[Channel] != L"System") { status = L"different_event_source"; return {}; }
+                text[Channel] != channel) { status = L"different_event_source"; return {}; }
             const auto id = Decimal(text[Id], UINT16_MAX), version = Decimal(text[Version], UINT8_MAX);
             const auto recordId = Decimal(text[RecordId], UINT64_MAX);
             std::optional<uint64_t> time;
             if (!id || !version || !recordId || !*recordId || !UtcTimestamp(text[Time], time))
             { status = L"event_metadata_incomplete"; return {}; }
-            metadata = L"{\"provider\":" + Quote(name) + L",\"channel\":\"System\",\"event_id\":" +
+            metadata = L"{\"provider\":" + Quote(name) + L",\"channel\":" + Quote(channel) + L",\"event_id\":" +
                 std::to_wstring(*id) + L",\"version\":" + std::to_wstring(*version) + L",\"event_record_id\":" +
                 Quote(std::to_wstring(*recordId)) + L",\"system_time_utc\":" + Quote(text[Time]) + L"}";
             return Identity{*id, *version, *recordId, time};
@@ -321,16 +336,19 @@ namespace
     }
 }
 
-void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& result)
+void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& result, std::wstring* computer)
 {
     Event event;
     event.kind = Event::Kind::Reboot;
+    event.readComputer = computer != nullptr;
+    if (computer) { computer->clear(); }
     if (!Parse(xml, byteCount, event)) { result.status = event.status; return; }
     const auto id = event.Metadata(L"Microsoft-Windows-Kernel-Power", PowerProvider);
     if (!id) { result.status = event.status; return; }
     result.metadata = event.metadata;
     if (id->recordId != result.recordId) { result.status = L"record_id_mismatch"; return; }
     if (id->id != 41 || id->version > 10) { result.status = L"unsupported_event_template"; return; }
+    if (computer) { *computer = event.text[Computer]; }
     result.eventVersion = static_cast<unsigned>(id->version);
     result.xmlFileTime = id->fileTime;
     if (!id->version) { result.status = L"event_stop_code_unavailable"; return; }
@@ -355,6 +373,113 @@ void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& r
     }
     result.eventStop = stop;
     result.status = stop.code ? L"dump_stop_unqualified" : L"event_stop_code_unavailable";
+}
+
+namespace
+{
+    View Trim(View v)
+    {
+        while (!v.empty() && XmlSpace(v.front())) { v.remove_prefix(1); }
+        while (!v.empty() && XmlSpace(v.back())) { v.remove_suffix(1); }
+        return v;
+    }
+
+    std::optional<uint64_t> WerHex(View v, bool prefixed, size_t maxDigits)
+    {
+        v = Trim(v);
+        if (prefixed)
+        {
+            if (v.size() < 2 || v[0] != L'0' || (v[1] != L'x' && v[1] != L'X')) { return {}; }
+            v.remove_prefix(2);
+        }
+        if (v.empty() || v.size() > maxDigits) { return {}; }
+        uint64_t value = 0;
+        for (const auto c : v)
+        {
+            const auto digit = Nibble(c);
+            if (digit < 0) { return {}; }
+            value = (value << 4) | static_cast<unsigned>(digit);
+        }
+        return value;
+    }
+
+    std::optional<SavedCrashStop> WerStop(const Event& event, bool system)
+    {
+        std::array<View, 5> words{};
+        if (system)
+        {
+            View packed = Trim(event.text[StopCode]);
+            auto open = packed.find(L'(');
+            if (open == View::npos || packed.back() != L')') { return {}; }
+            words[0] = packed.substr(0, open);
+            packed.remove_prefix(open + 1);
+            packed.remove_suffix(1);
+            for (size_t i = 1; i < words.size() - 1; ++i)
+            {
+                const auto comma = packed.find(L',');
+                if (comma == View::npos) { return {}; }
+                words[i] = packed.substr(0, comma);
+                packed.remove_prefix(comma + 1);
+            }
+            words.back() = packed;
+        }
+        else
+        {
+            for (size_t i = 0; i < words.size(); ++i) { words[i] = event.text[StopCode + i]; }
+        }
+        SavedCrashStop stop;
+        const auto code = WerHex(words[0], system, 8);
+        if (!code || !*code) { return {}; }
+        stop.code = static_cast<ULONG>(*code);
+        for (size_t i = 0; i < stop.args.size(); ++i)
+        {
+            const auto value = WerHex(words[i + 1], system, 16);
+            if (!value) { return {}; }
+            stop.args[i] = *value;
+        }
+        return stop;
+    }
+
+    std::wstring ReportId(View v)
+    {
+        if (v.size() == 38 && v.front() == L'{' && v.back() == L'}') { v = v.substr(1, 36); }
+        if (v.size() != 36) { return {}; }
+        std::wstring canonical(v);
+        bool nonzero = false;
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            if (i == 8 || i == 13 || i == 18 || i == 23)
+            { if (v[i] != L'-') { return {}; } continue; }
+            const auto digit = Nibble(v[i]);
+            if (digit < 0) { return {}; }
+            canonical[i] = L"0123456789abcdef"[digit];
+            nonzero = nonzero || digit != 0;
+        }
+        return nonzero ? canonical : L"";
+    }
+}
+
+void DecodeWerReport(const BYTE* xml, UINT byteCount, WerRecordKind kind, WerRecord& row)
+{
+    row = WerRecord{row.id};
+    if (kind == WerRecordKind::Restart) { row.status = L"unsupported_event_template"; return; }
+    const bool system = kind == WerRecordKind::SystemReport;
+    Event event;
+    event.kind = system ? Event::Kind::WerSystem : Event::Kind::WerApplication;
+    event.readComputer = true;
+    if (!Parse(xml, byteCount, event)) { row.status = event.status; return; }
+    const auto id = system ? event.Metadata(L"Microsoft-Windows-WER-SystemErrorReporting", L"{abce23e7-de45-4366-8631-84fa6c525952}") :
+        event.Metadata(L"Windows Error Reporting", L"{0ead09bd-2157-539a-8d6d-c87f95b64d70}", L"Application");
+    if (!id) { row.status = event.status; return; }
+    if (id->recordId != row.id) { row.status = L"record_id_mismatch"; return; }
+    if (id->id != 1001 || id->version != (system ? 1u : 0u)) { row.status = L"unsupported_event_template"; return; }
+    if (!system && event.text[EventName] != L"BlueScreen") { row.status = L"other_report_type"; return; }
+    row.version = static_cast<unsigned>(id->version);
+    row.time = id->fileTime;
+    row.computer = event.text[Computer];
+    row.reportGuid = ReportId(event.text[ReportGuid]);
+    row.stop = WerStop(event, system);
+    row.status = !row.stop ? L"stop_tuple_unavailable" : row.reportGuid.empty() ? L"report_identifier_unavailable" : L"observed";
 }
 
 const wchar_t* DecodeRebootClockChange(const BYTE* xml, UINT byteCount, RebootClockChange& change)

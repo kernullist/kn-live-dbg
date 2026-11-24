@@ -99,7 +99,8 @@ struct RebootEventComparison
 };
 
 // The saved System event parser accepts one Windows-rendered XML document.
-void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& comparison);
+bool ParseEventRecordId(const std::wstring& decimal, uint64_t& result);
+void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& comparison, std::wstring* computer = nullptr);
 const wchar_t* DecodeRebootClockChange(const BYTE* xml, UINT byteCount, RebootClockChange& change);
 const wchar_t* DecodeRebootBootStart(const BYTE* xml, UINT byteCount, RebootBootStart& start);
 RebootEventComparison CompareSavedRebootEvent(const std::wstring& path, const std::wstring& pin,

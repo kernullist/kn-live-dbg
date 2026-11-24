@@ -58,6 +58,12 @@ def main():
     assert "optional_header_dbgeng_and_event_clock_comparison" in crash["requirements"] and "clock_correspondence_unverified" in crash["limits"]
     assert crash["address_contract"] == "typed_amd64_saved_context;no_arbitrary_address_input"
     assert "no_host_crash_or_culprit_attribution" in crash["limits"]
+    assert "optional_clock_history_and_adjacent_boot_starts" in crash["requirements"] and "history_8192_record_ids_15s" in crash["limits"]
+    wer = by_key[("diagnostics", "wer_reports", "saved_evtx")]
+    assert wer["implementation"] == "implemented" and wer["consistency"] == "pinned_system_and_application_records"
+    assert wer["address_contract"] == "not_an_address_reader" and wer["probe_contract"] is None
+    assert "two_local_evtx_sha256_pins" in wer["requirements"] and "channel_scoped_record_ids" in wer["requirements"]
+    assert "restart_interval_8192_ids_15s" in wer["limits"] and "no_dump_content_host_boot_or_cause_verification" in wer["limits"]
     reference_scheduler = by_key[("scheduler", "reference_admission", "native")]
     assert "confirmed_live_source_for_dispatch" in reference_scheduler["requirements"]
     assert "admitted_subject_role_round_robin" in reference_scheduler["limits"]

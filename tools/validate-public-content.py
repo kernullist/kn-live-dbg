@@ -21,21 +21,30 @@ PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", "
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
-REBOOT_TIME_SCHEMAS = ("kn.crash_diagnosis.v4", "kn.reboot_timeline.v1", "kn.crash_diagnosis.v5",
-                       "kn.reboot_clock_history.v1", "kn.crash_diagnosis.v6", "kn.reboot_boot_window.v1")
-REBOOT_CLOCK_FIELDS = ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
+REBOOT_REPORT_SCHEMAS = ("kn.crash_diagnosis.v4", "kn.reboot_timeline.v1", "kn.crash_diagnosis.v5",
+                         "kn.reboot_clock_history.v1", "kn.crash_diagnosis.v6", "kn.reboot_boot_window.v1", "kn.wer_report_comparison.v1")
+REBOOT_EVIDENCE_FIELDS = ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
                        "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime",
                        "clock_old_filetime", "clock_new_filetime", "clock_typed_old_filetime", "clock_typed_new_filetime",
                        "clock_delta_100ns", "boot_start_record_id", "boot_start_xml_filetime", "boot_start_typed_filetime",
                        "contiguous_from_record_id", "last_read_record_id", "last_shutdown_marker_id", "earlier_restart_record_id",
-                       "previous_start_in_estimated_boot")
-CRASH_SCHEMAS = (*REBOOT_TIME_SCHEMAS, "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
+                       "previous_start_in_estimated_boot", "wer_record_id", "wer_event_filetime", "wer_report_guid", "wer_bugcheck_code",
+                       "wer_bugcheck_parameters", "wer_log_sha256", "same_wer_report_id", "wer_intervening_record", "restart_report_corroborated")
+CRASH_SCHEMAS = (*REBOOT_REPORT_SCHEMAS, "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
                  "kn.whea_event_comparison.v1", "kn.reboot_event_comparison.v1")
 EVENT_EXPORT_PROVIDER = re.compile(
     r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:'''
     r'''(?P<whea>Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})|'''
     r'''Microsoft-Windows-Kernel-Power|\{331c3b3a-2005-44c2-ac5e-77220c37d6b4\}|'''
-    r'''Microsoft-Windows-Kernel-General|\{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d\})["']''')
+    r'''Microsoft-Windows-Kernel-General|\{a68ca8b7-004f-d7b6-a698-07e2de0f1f5d\}|'''
+    r'''Microsoft-Windows-WER-SystemErrorReporting|\{abce23e7-de45-4366-8631-84fa6c525952\}|'''
+    r'''Windows Error Reporting|\{0ead09bd-2157-539a-8d6d-c87f95b64d70\})["']''')
+WER_EVENT_FIELD = re.compile(
+    r'''(?im)(?:^|>)\s*<(?:[\w.-]+:)?Data\b[^<>]{0,1024}?\bName\s*=\s*(?:'''
+    r'''["'](?:ReportId|AttachedFiles|StorePath)["'][^<>]*>\s*[^\s<]|'''
+    r'''["']param1["'][^<>]*>\s*0x[0-9a-f]{1,8}\s*\(\s*0x|'''
+    r'''["']param2["'][^<>]*>\s*(?:[a-z]:[\\/]|\\\\|[^<>\r\n]*\.dmp\b)|'''
+    r'''["']param3["'][^<>]*>\s*\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-)''')
 ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1",
                           "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2", "kn.etl_reader_comparison.v3",
                           "kn.etl_reader_evaluation.v3", "kn.etl_reader_plan.v1", "kn.etl_reader_admission.v1",
@@ -238,7 +247,7 @@ WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
     ("evaluated_views", "required_views", "capture_bytes"), ("pid", "process_created", "tid", "thread_created"),
     ("receiver_tid", "receiver_created"), ("send_return_tick", "handler_entry_tick", "handler_leave_tick"),
 ))
-DUMP_EVIDENCE_SCHEMAS = (*REBOOT_TIME_SCHEMAS, "kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
+DUMP_EVIDENCE_SCHEMAS = (*REBOOT_REPORT_SCHEMAS, "kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
 ETL_COMPARISON_MARKERS = (*ETL_COMPARISON_SCHEMAS, '"retained_sha256"', '"before_sha256"', '"supported_descriptors"',
                           '"verdict"', '"process_state"', '"started_ns"', '"unresolved_opcode_names"', '"admission_id"',
                           '"admission_sha256"', '"planned_slots"', '"distinct_source_hashes"', '"agreement_per_planned"', '"acquisition"', '"prefix_sha256"', '"observed_sha256"',
@@ -257,7 +266,7 @@ ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
     ("agreement_per_planned_group", "agreement_per_comparable_group"),
     ("case_id", "sample_family", "partition", "independence_group"), ("supplied_source_partition", "case_id", "acquisition"),
 ))
-DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, *(f'"{field}"' for field in REBOOT_CLOCK_FIELDS),
+DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, *(f'"{field}"' for field in REBOOT_EVIDENCE_FIELDS), "same_recorded_bugcheck_report",
                          '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')
 DISK_IO_MARKERS = (DISK_IO_SCHEMA, DISK_REQUEST_SCHEMA, *FILE_OPERATION_SCHEMAS, '"disk_event_ordinal"', '"high_res_response_ticks"', '"longest_response_ties"',
@@ -377,7 +386,7 @@ ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *LOADER_WINDOW_MARKERS, *READY_ORIGIN_M
                    '"group_masks"', '"profile_source_name"', '"payload_bytes"', '"group_mask_bracket"', '"reported_period_100ns"')
 
 DUMP_EVIDENCE_FIELDS = tuple(frozenset(fields) for fields in (
-    *((field,) for field in REBOOT_CLOCK_FIELDS),
+    *((field,) for field in REBOOT_EVIDENCE_FIELDS),
     ("expected_header_sha256", "digest_scope"), ("availability_scope", "range_evidence"),
     ("range_state", "captured_bytes", "unobserved_bytes"), ("range_offset", "state", "span_sha256"),
     ("physical_read_sequence", "native_status_domain", "win32_status"), ("range_offset", "translation_state", "translation_reason"),
@@ -665,7 +674,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
                     any(tag.encode(encoding) in data for tag in (*CRASH_SCHEMAS, "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
                                                                   "kn.wait_", "ey", "ew", "Files Processed:", *IO_TIMING_MARKERS, *STORE_REPORT_MARKERS, *STORE_RETENTION_MARKERS, *DISCLOSURE_MARKERS, *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, *RETAINED_MARKERS, '"target_created"', '"begin_qpc"',
-                                                                 "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"requested_record_id"', '"virtual"', '"captured_sha256"', '"type_guid"',
+                                                                 "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", "ReportId", "AttachedFiles", "StorePath", "param1", "param2", "param3", '"system_time_utc"', '"requested_record_id"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
@@ -691,6 +700,12 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             provider = EVENT_EXPORT_PROVIDER.search(text)
             if provider:
                 add("private-whea-event" if provider["whea"] else "private-reboot-event")
+        if (not binary or view is not data) and "Data" in text and WER_EVENT_FIELD.search(text):
+            add("private-reboot-event")
+        if (not binary or view is not data) and "same_recorded_bugcheck_report" in text:
+            candidate = re.search(r'(?m)(?:^|[{,])\s*"candidate"\s*:\s*"same_recorded_bugcheck_report"', text)
+            if candidate:
+                add("private-evidence-bundle", text.count("\n", 0, candidate.start()) + 1)
         if (not binary or view is not data) and any(m in text for m in (
                 "saved_etl_probe", "kn.etl_capability_probe.v1", "saved_dump_probe", "kn.dump_capability_probe.v1")):
             # Outer scope and detached probe metadata can survive a truncated export.

@@ -1,4 +1,5 @@
 #include "RebootEvent.h"
+#include "WerReports.h"
 #include "McpJson.h"
 #include "SavedEtlInput.h"
 
@@ -17,6 +18,55 @@ namespace
     using mcpjson::Quote;
     constexpr uint64_t MaxLogBytes = 256ull << 20;
     constexpr DWORD MaxRenderedBytes = 256u << 10;
+
+    const wchar_t* OpenEventArchive(etl_profile::SavedEtlInput& archive, const std::wstring& name, const std::wstring& pin,
+        std::wstring& digest, uint64_t& bytes, std::optional<DWORD>* error)
+    {
+        DWORD code = 0;
+        if (!archive.Open(name, MaxLogBytes, error ? &code : nullptr))
+        {
+            if (error && code) { *error = code; }
+            return L"event_source_unavailable";
+        }
+        digest = archive.File.Sha256;
+        bytes = archive.File.Bytes();
+        if (digest != pin) { return L"event_digest_mismatch"; }
+        std::array<char, 8> signature{};
+        DWORD used = 0;
+        if (!approved_file::ReadAt(archive.File.Handle(), 0, signature.data(), static_cast<DWORD>(signature.size()), &used) ||
+            used != signature.size() || std::memcmp(signature.data(), "ElfFile", signature.size()) != 0)
+        { return L"unsupported_event_archive"; }
+        return nullptr;
+    }
+
+    struct SelectedRecord
+    {
+        EventHandle query{nullptr, EvtClose}, event{nullptr, EvtClose};
+        const wchar_t* Open(const std::wstring& path, uint64_t id, std::optional<DWORD>& error)
+        {
+            const auto filter = L"*[System[EventRecordID=" + std::to_wstring(id) + L"]]";
+            query.reset(EvtQuery(nullptr, path.c_str(), filter.c_str(), EvtQueryFilePath | EvtQueryForwardDirection));
+            if (!query) { error = GetLastError(); return L"event_query_failed"; }
+            EVT_HANDLE raw = nullptr;
+            DWORD count = 0;
+            if (!EvtNext(query.get(), 1, &raw, 5000, 0, &count))
+            {
+                error = GetLastError();
+                return *error == ERROR_NO_MORE_ITEMS ? L"record_not_found" : L"event_query_failed";
+            }
+            event.reset(raw);
+            if (!event || count != 1) { return L"event_query_failed"; }
+            raw = nullptr;
+            if (EvtNext(query.get(), 1, &raw, 5000, 0, &count))
+            {
+                EventHandle other(raw, EvtClose);
+                return L"ambiguous_record_id";
+            }
+            const DWORD end = GetLastError();
+            if (end != ERROR_NO_MORE_ITEMS) { error = end; return L"event_query_failed"; }
+            return nullptr;
+        }
+    };
 
     void ReadFileTime(EVT_HANDLE event, EVT_HANDLE context, std::optional<uint64_t>& time, std::optional<DWORD>& error)
     {
@@ -109,6 +159,8 @@ namespace
 
     constexpr GUID GeneralGuid = {0xa68ca8b7,0x004f,0xd7b6,{0xa6,0x98,0x07,0xe2,0xde,0x0f,0x1f,0x5d}};
     constexpr GUID PowerGuid = {0x331c3b3a,0x2005,0x44c2,{0xac,0x5e,0x77,0x22,0x0c,0x37,0xd6,0xb4}};
+    constexpr GUID SystemWerGuid = {0xabce23e7,0xde45,0x4366,{0x86,0x31,0x84,0xfa,0x6c,0x52,0x59,0x52}};
+    constexpr GUID ApplicationWerGuid = {0x0ead09bd,0x2157,0x539a,{0x8d,0x6d,0xc8,0x7f,0x95,0xb6,0x4d,0x70}};
 
     bool MatchesGuid(const EVT_VARIANT& value, const GUID& expected)
     {
@@ -229,36 +281,158 @@ namespace
 
     void ReadRecord(const std::wstring& path, RebootEventComparison& result, bool readTime, RebootClockHistory* history)
     {
-        const auto queryText = L"*[System[EventRecordID=" + std::to_wstring(result.recordId) + L"]]";
-        EventHandle query(EvtQuery(nullptr, path.c_str(), queryText.c_str(), EvtQueryFilePath | EvtQueryForwardDirection), EvtClose);
-        if (!query) { result.win32Error = GetLastError(); result.status = L"event_query_failed"; return; }
-
-        EVT_HANDLE raw = nullptr;
-        DWORD count = 0;
-        if (!EvtNext(query.get(), 1, &raw, 5000, 0, &count))
-        {
-            result.win32Error = GetLastError();
-            result.status = *result.win32Error == ERROR_NO_MORE_ITEMS ? L"record_not_found" : L"event_query_failed";
-            return;
-        }
-        EventHandle event(raw, EvtClose);
-        if (!event || count != 1) { result.status = L"event_query_failed"; return; }
-        raw = nullptr;
-        if (EvtNext(query.get(), 1, &raw, 5000, 0, &count))
-        {
-            EventHandle other(raw, EvtClose);
-            result.status = L"ambiguous_record_id";
-            return;
-        }
-        const DWORD end = GetLastError();
-        if (end != ERROR_NO_MORE_ITEMS) { result.win32Error = end; result.status = L"event_query_failed"; return; }
-
+        SelectedRecord selected;
+        if (auto failure = selected.Open(path, result.recordId, result.win32Error)) { result.status = failure; return; }
+        const auto& event = selected.event;
         std::vector<wchar_t> xml;
         if (auto failure = RenderXml(event.get(), xml, result.win32Error)) { result.status = failure; return; }
         DecodeRebootEvent(reinterpret_cast<const BYTE*>(xml.data()), static_cast<UINT>((xml.size() - 1) * sizeof(wchar_t)), result);
         if (readTime) { ReadEventTime(event.get(), result); }
         if (history && result.xmlFileTime) { ReadHistory(path, event.get(), *history, result.eventVersion); }
     }
+
+    void ReadWerRecord(const std::wstring& path, WerRecordKind kind, WerRecord& row)
+    {
+        SelectedRecord selected;
+        if (auto failure = selected.Open(path, row.id, row.error)) { row.status = failure; return; }
+        std::vector<wchar_t> xml;
+        if (auto failure = RenderXml(selected.event.get(), xml, row.error)) { row.status = failure; return; }
+        const auto data = reinterpret_cast<const BYTE*>(xml.data());
+        const auto bytes = static_cast<UINT>((xml.size() - 1) * sizeof(wchar_t));
+        const bool restart = kind == WerRecordKind::Restart, application = kind == WerRecordKind::ApplicationReport;
+        if (restart)
+        {
+            RebootEventComparison parsed;
+            parsed.recordId = row.id;
+            DecodeRebootEvent(data, bytes, parsed, &row.computer);
+            row.time = parsed.xmlFileTime;
+            row.version = parsed.eventVersion;
+            if (parsed.eventStop && parsed.eventStop->code) { row.stop = parsed.eventStop; }
+            row.status = row.stop ? L"observed" : parsed.status;
+        }
+        else { DecodeWerReport(data, bytes, kind, row); }
+        if (!row.version) { return; }
+
+        EventHandle context(EvtCreateRenderContext(0, nullptr, EvtRenderContextSystem), EvtClose);
+        if (!context) { row.error = GetLastError(); }
+        std::vector<EVT_VARIANT> v(EvtSystemPropertyIdEND);
+        const auto provider = restart ? L"Microsoft-Windows-Kernel-Power" :
+            application ? L"Windows Error Reporting" : L"Microsoft-Windows-WER-SystemErrorReporting";
+        if (context && SystemValues(context.get(), selected.event.get(), v, row.error) &&
+            v[EvtSystemEventRecordId].Type == EvtVarTypeUInt64 && v[EvtSystemEventRecordId].UInt64Val == row.id &&
+            v[EvtSystemEventID].Type == EvtVarTypeUInt16 && v[EvtSystemEventID].UInt16Val == (restart ? 41 : 1001) &&
+            v[EvtSystemVersion].Type == EvtVarTypeByte && row.version == v[EvtSystemVersion].ByteVal &&
+            EventString(v[EvtSystemProviderName]) == provider &&
+            MatchesGuid(v[EvtSystemProviderGuid], restart ? PowerGuid : application ? ApplicationWerGuid : SystemWerGuid) &&
+            EventString(v[EvtSystemChannel]) == (application ? L"Application" : L"System") &&
+            !row.computer.empty() && std::none_of(row.computer.begin(), row.computer.end(), [](wchar_t c) { return c <= L' ' || c == 0x7f; }) &&
+            EventString(v[EvtSystemComputer]) == row.computer &&
+            row.time && *row.time && *row.time <= INT64_MAX &&
+            v[EvtSystemTimeCreated].Type == EvtVarTypeFileTime && v[EvtSystemTimeCreated].FileTimeVal == *row.time) { return; }
+        const auto error = row.error;
+        row = WerRecord{row.id};
+        row.error = error;
+        row.status = L"event_identity_unqualified";
+    }
+
+    void ReadWerInterval(const std::wstring& path, const WerRecord& report, WerRestartInterval& span)
+    {
+        const auto& restart = span.restart;
+        if (!report.time || !restart.time || report.computer.empty() || restart.computer.empty()) { return; }
+        if (report.computer != restart.computer) { span.status = L"different_computer_labels"; return; }
+        if (restart.id >= report.id) { span.status = L"record_order_conflict"; return; }
+        if (!RebootClockHistory::ValidWindow(restart.id, report.id)) { span.status = L"record_window_limit"; return; }
+        const auto filter = L"*[System[(EventRecordID >= " + std::to_wstring(restart.id) +
+            L" and EventRecordID <= " + std::to_wstring(report.id) + L")]]";
+        span.status = L"interval_query_failed";
+        EventHandle context(EvtCreateRenderContext(0, nullptr, EvtRenderContextSystem), EvtClose);
+        if (!context) { span.error = GetLastError(); return; }
+        EventHandle query(EvtQuery(nullptr, path.c_str(), filter.c_str(), EvtQueryFilePath | EvtQueryForwardDirection), EvtClose);
+        if (!query) { span.error = GetLastError(); return; }
+        std::vector<EVT_VARIANT> v(EvtSystemPropertyIdEND);
+        const auto deadline = GetTickCount64() + 15000;
+        uint64_t previous = 0;
+        for (;;)
+        {
+            const auto now = GetTickCount64();
+            if (now >= deadline) { span.status = L"interval_deadline_reached"; return; }
+            EVT_HANDLE raw = nullptr;
+            DWORD count = 0;
+            if (!EvtNext(query.get(), 1, &raw, static_cast<DWORD>(deadline - now), 0, &count))
+            {
+                const DWORD end = GetLastError();
+                if (end == ERROR_NO_MORE_ITEMS) { break; }
+                span.error = end;
+                if (end == ERROR_TIMEOUT) { span.status = L"interval_deadline_reached"; }
+                return;
+            }
+            EventHandle event(raw, EvtClose);
+            if (!event || count != 1) { span.error = ERROR_INVALID_DATA; return; }
+            ++span.recordsRead;
+            if (!SystemValues(context.get(), event.get(), v, span.error)) { return; }
+            const auto& id = v[EvtSystemEventRecordId];
+            if (id.Type != EvtVarTypeUInt64 || id.UInt64Val < restart.id || id.UInt64Val > report.id || id.UInt64Val <= previous)
+            { span.status = L"invalid_record_sequence"; return; }
+            previous = id.UInt64Val;
+            const auto provider = EventString(v[EvtSystemProviderName]);
+            const auto& number = v[EvtSystemEventID];
+            if (EventString(v[EvtSystemChannel]) != L"System" || EventString(v[EvtSystemComputer]) != report.computer ||
+                provider.empty() || number.Type != EvtVarTypeUInt16) { continue; }
+            ++span.classifiedRecords;
+            if (previous == restart.id || previous == report.id || span.interveningRecord) { continue; }
+            const auto& guid = v[EvtSystemProviderGuid];
+            if (((number.UInt16Val == 12 || number.UInt16Val == 13) && (provider == L"Microsoft-Windows-Kernel-General" || MatchesGuid(guid, GeneralGuid))) ||
+                (number.UInt16Val == 41 && (provider == L"Microsoft-Windows-Kernel-Power" || MatchesGuid(guid, PowerGuid))) ||
+                (number.UInt16Val == 1001 && (provider == L"Microsoft-Windows-WER-SystemErrorReporting" || MatchesGuid(guid, SystemWerGuid))))
+            { span.interveningRecord = previous; }
+        }
+        if (span.classifiedRecords != report.id - restart.id + 1) { span.status = L"incomplete_record_coverage"; }
+        else if (span.interveningRecord) { span.status = L"intervening_restart_shutdown_or_report"; }
+        else if (*restart.time > *report.time) { span.status = L"recorded_clock_order_conflict"; }
+        else { span.status = L"continuous_saved_system_records"; }
+    }
+}
+
+bool ParseEventRecordId(const std::wstring& decimal, uint64_t& result)
+{
+    if (decimal.empty() || decimal.size() > 20) { return false; }
+    uint64_t value = 0;
+    for (const auto c : decimal)
+    {
+        if (c < L'0' || c > L'9') { return false; }
+        const auto digit = static_cast<unsigned>(c - L'0');
+        if (value > (UINT64_MAX - digit) / 10) { return false; }
+        value = value * 10 + digit;
+    }
+    result = value;
+    return value != 0;
+}
+
+WerArchive ReadWerArchive(const std::wstring& name, const std::wstring& pin, WerRecordKind kind, uint64_t reportId, uint64_t restartId)
+{
+    WerArchive result;
+    result.report.id = reportId;
+    if (restartId) { result.interval.emplace().restart.id = restartId; }
+    etl_profile::SavedEtlInput archive;
+    if (auto failure = OpenEventArchive(archive, name, pin, result.digest, result.bytes, &result.error))
+    { result.status = failure; return result; }
+    const auto& path = archive.PinnedVolumePath();
+    ReadWerRecord(path, kind, result.report);
+    if (result.interval)
+    {
+        ReadWerRecord(path, WerRecordKind::Restart, result.interval->restart);
+        ReadWerInterval(path, result.report, *result.interval);
+    }
+    if (!archive.Revalidated())
+    {
+        result = WerArchive{};
+        result.report.id = reportId;
+        if (restartId) { result.interval.emplace().restart.id = restartId; }
+        result.status = L"event_source_changed_or_unreadable";
+        return result;
+    }
+    result.status = L"pinned_archive_read";
+    return result;
 }
 
 RebootEventComparison CompareSavedRebootEvent(const std::wstring& name, const std::wstring& pin,
@@ -268,17 +442,8 @@ RebootEventComparison CompareSavedRebootEvent(const std::wstring& name, const st
     result.recordId = recordId;
     result.dumpQualified = qualifiedDumpStop != nullptr;
     etl_profile::SavedEtlInput archive;
-    DWORD openError = 0;
-    if (!archive.Open(name, MaxLogBytes, history ? &openError : nullptr))
-    { if (history && openError) { result.win32Error = openError; } return result; }
-    result.logDigest = archive.File.Sha256;
-    result.logBytes = archive.File.Bytes();
-    if (result.logDigest != pin) { result.status = L"event_digest_mismatch"; return result; }
-    std::array<char, 8> signature{};
-    DWORD used = 0;
-    if (!approved_file::ReadAt(archive.File.Handle(), 0, signature.data(), static_cast<DWORD>(signature.size()), &used) ||
-        used != signature.size() || std::memcmp(signature.data(), "ElfFile", signature.size()) != 0)
-    { result.status = L"unsupported_event_archive"; return result; }
+    if (auto failure = OpenEventArchive(archive, name, pin, result.logDigest, result.logBytes,
+        history ? &result.win32Error : nullptr)) { result.status = failure; return result; }
     ReadRecord(archive.PinnedVolumePath(), result, readTime, history);
     if (!archive.Revalidated())
     {

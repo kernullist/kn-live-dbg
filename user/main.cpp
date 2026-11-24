@@ -91,6 +91,7 @@
 #include "PendingIrpEvidence.h"
 #include "ProcessImageCapture.h"
 #include "CrashDumpDiagnosis.h"
+#include "WerReports.h"
 #include "EtlProfile.h"
 #include "SavedDumpCapability.h"
 #include "IoLifecycleCapture.h"
@@ -54251,6 +54252,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe --etl-disk-io <local.etl> --sha256 <digest> [--after N] [--limit N] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved disk I/O timings\n";
         std::wcout << L"  KnLiveDbg.exe --etl-hard-faults <local.etl> --sha256 <digest> [[--activity-markers|--handoff-markers [--thread-id TID]] [--after N] [--limit N] | --schedule-of <fault-ordinal> | --activity-window <start-record> <stop-record>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read fault timings, scheduling, or fault time within an activity\n";
         std::wcout << L"  KnLiveDbg.exe --etl-switches <local.etl> --sha256 <digest> [[--after N] [--limit N] [[--intervals] [--thread-id N] [--capture-settings] | --schedule-activity <start-record> <stop-record>] | --ready-origin <record> | --ready-origins <record,...>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved context switches\n";
+        std::wcout << L"  KnLiveDbg.exe --wer-reports <system.evtx> --sha256 <digest> --system-record <id> --application-log <application.evtx> --application-sha256 <digest> --application-record <id> [--restart-record <id>]   compare saved Windows bugcheck reports\n";
         std::wcout << L"  KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> [--whea [--event-xml <file> --event-sha256 <digest>]] [--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal> [--compare-time [--clock-history-from <first-record-id> [--boot-window]]]]   compare saved stop, stack and event evidence\n";
         std::wcout << L"  KnLiveDbg.exe --io-lifecycle [--completion-port] <wait-ms> <local-directory> [directories...]   record up to 8 overlapped directory requests\n";
         std::wcout << L"  KnLiveDbg.exe --wait-chain <pid> <process-creation-filetime> <tid> <thread-creation-filetime>   capture one Windows wait chain\n";
@@ -54325,6 +54327,10 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && ToLower(argv[1]) == L"--etl-profile")
     {
         return RunEtlProfile(std::vector<std::wstring>(argv + 2, argv + argc));
+    }
+    if (argc >= 2 && ToLower(argv[1]) == L"--wer-reports")
+    {
+        return RunWerReports(std::vector<std::wstring>(argv + 2, argv + argc));
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--crash-diagnose")
     {

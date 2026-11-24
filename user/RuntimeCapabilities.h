@@ -121,7 +121,7 @@ inline const wchar_t* CapabilityAddressContract(const std::wstring& domain,
     }
     if ((backend == L"etl" && operation == L"hard_fault") ||
         domain == L"schema" || domain == L"session" || domain == L"scheduler" ||
-        backend == L"windows_wct" || backend == L"win32_directory_changes")
+        backend == L"windows_wct" || backend == L"win32_directory_changes" || backend == L"saved_evtx")
     {
         return L"not_an_address_reader";
     }

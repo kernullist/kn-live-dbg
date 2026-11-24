@@ -139,6 +139,9 @@
     <ClCompile Include="CrashDumpDiagnosis.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="WerReports.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="SavedDumpCapability.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -514,6 +517,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="CrashDumpDiagnosis.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="WerReports.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="ArtifactOutput.h">

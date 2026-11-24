@@ -4719,6 +4719,35 @@ events, sleep and clock behavior outside the captured records remain possible.
 Linking the files to the same host and boot requires independent acquisition
 provenance.
 
+### Cross-channel Windows error reports
+
+The offline WER reader pins each local EVTX by SHA-256 and reads a unique
+record at the supplied ID. Each file is limited to 256 MiB. It checks the
+XML provider name and GUID, channel, event number, template version, record
+ID, computer label and creation time against native event metadata. It
+decodes the System version-one `param1` as a hexadecimal stop code and
+four parameters and `param3` as a nonzero report GUID. On the Application
+side it accepts the version-zero `BlueScreen` template and reads
+`ReportId` and hexadecimal `P1` through `P5` by name. The JSON writes
+the numeric stop fields as decimal strings, including 64-bit parameters.
+
+Two distinct pinned archives, matching report GUIDs, matching stop tuples
+and identical recorded computer labels support a report correspondence.
+The individual comparisons retain missing and contrary values. Repeated
+Application submissions can share the same GUID. Either channel's record
+number locates a row only within its own archive. The Application event
+time records a report submission and can fall in a later boot.
+
+An optional System Event 41 supplies a second comparison. The reader
+checks the entire same-label System interval through the WER record,
+up to 8,192 inclusive record IDs under a 15-second scan deadline. A gap,
+an unclassifiable record, reversed endpoint clocks, or an intervening
+startup, shutdown, restart or System WER report withholds corroboration.
+The observed stop tuple can still match. The separate Application report
+comparison remains available. Verifying the physical host and boot, the
+contents of a reported dump and the component responsible for a crash
+requires additional evidence. [Windows System reboot records](https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-unexpected-reboots-system-event-logs)
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

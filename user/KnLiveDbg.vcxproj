@@ -267,6 +267,7 @@
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
     <ClCompile Include="RebootTimeline.cpp" />
     <ClCompile Include="RebootEvent.cpp" />
+    <ClCompile Include="WerReports.cpp" />
     <ClCompile Include="EtlProfile.cpp" />
     <ClCompile Include="EtlImageLifetime.cpp" />
     <ClCompile Include="WheaRecord.cpp" />
@@ -493,6 +494,7 @@
     <ClInclude Include="ProcessImageSourceReceipt.h" />
     <ClInclude Include="CrashDumpDiagnosis.h" />
     <ClInclude Include="RebootEvent.h" />
+    <ClInclude Include="WerReports.h" />
     <ClInclude Include="ArtifactOutput.h" />
     <ClInclude Include="EtlProfile.h" />
     <ClInclude Include="ImageLoaderWindow.h" />

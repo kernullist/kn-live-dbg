@@ -91,6 +91,7 @@ A dash means the binary declares no standalone probe for that operation.
 | memory / read_virtual | process_handle | implemented | caller_descriptor_la48_la57;user_only;pointer_bytes_8 | handle_bound_single_read | `owned_read` |
 | io / request_graph | native | implemented | source_descriptor_la48_la57;amd64;pointer_bytes_8;selected_paths_only | repeated_snapshot | `native_connection` |
 | diagnostics / crash_diagnosis | dbgeng_dump | implemented | typed_amd64_saved_context;no_arbitrary_address_input | pinned_offline_dump | — |
+| diagnostics / wer_reports | saved_evtx | implemented | not_an_address_reader | pinned_system_and_application_records | — |
 | diagnostics / io_request_lifetime | win32_directory_changes | implemented | not_an_address_reader | retained_overlapped_request | — |
 | diagnostics / wait_chain | windows_wct | implemented | not_an_address_reader | one_live_traversal | — |
 | diagnostics / wait_cycle_corroboration | windows_wct | implemented | not_an_address_reader | paired_live_traversals | — |

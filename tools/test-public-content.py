@@ -399,14 +399,17 @@ class PublicContentTests(unittest.TestCase):
         self.assertIsNotNone(AUDIT.path_rule("system.EvTx"))
         self.assertIsNotNone(AUDIT.path_rule("system.EVTX.zip"))
         for identity in ("Name='Microsoft-Windows-Kernel-Power'", 'Guid="{331C3B3A-2005-44C2-AC5E-77220C37D6B4}"',
-                         "Name='Microsoft-Windows-Kernel-General'", 'Guid="{A68CA8B7-004F-D7B6-A698-07E2DE0F1F5D}"'):
+                         "Name='Microsoft-Windows-Kernel-General'", 'Guid="{A68CA8B7-004F-D7B6-A698-07E2DE0F1F5D}"',
+                         "Name='Microsoft-Windows-WER-SystemErrorReporting'", 'Guid="{abce23e7-de45-4366-8631-84fa6c525952}"',
+                         "Name='Windows Error Reporting'", 'Guid="{0ead09bd-2157-539a-8d6d-c87f95b64d70}"'):
             export = "log\n" + "<Event><System><Provider " + identity + "/></System></Event>"
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 self.assertIn("private-reboot-event", {f["rule"] for f in AUDIT.inspect("renamed.txt", export.encode(encoding))})
         for signature in (b"ElfFile\0", b"ElfChnk\0"):
             self.assertIn("private-windows-event-log", {f["rule"] for f in AUDIT.inspect("renamed.bin", signature + bytes(128))})
         for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1", "kn.crash_diagnosis.v4", "kn.reboot_timeline.v1",
-                       "kn.crash_diagnosis.v5", "kn.reboot_clock_history.v1", "kn.crash_diagnosis.v6", "kn.reboot_boot_window.v1"):
+                       "kn.crash_diagnosis.v5", "kn.reboot_clock_history.v1", "kn.crash_diagnosis.v6", "kn.reboot_boot_window.v1",
+                       "kn.wer_report_comparison.v1"):
             for text in (json.dumps({"status": "example", "schema": schema}),
                          "log\n" + json.dumps({"schema": schema, "status": "example"}, indent=2)[:-3],
                          "log\n" + json.dumps({"requested_record_id": "1", "log_sha256": "example", "same_stop_tuple": None})):
@@ -417,7 +420,9 @@ class PublicContentTests(unittest.TestCase):
                     "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime",
                     "clock_old_filetime", "clock_new_filetime", "clock_typed_old_filetime", "clock_typed_new_filetime",
                     "clock_delta_100ns", "boot_start_record_id", "boot_start_xml_filetime", "boot_start_typed_filetime", "contiguous_from_record_id",
-                    "last_read_record_id", "last_shutdown_marker_id", "earlier_restart_record_id", "previous_start_in_estimated_boot"):
+                    "last_read_record_id", "last_shutdown_marker_id", "earlier_restart_record_id", "previous_start_in_estimated_boot",
+                    "wer_record_id", "wer_event_filetime", "wer_report_guid", "wer_bugcheck_code", "wer_bugcheck_parameters",
+                    "wer_log_sha256", "same_wer_report_id", "wer_intervening_record", "restart_report_corroborated"):
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 cut = ("log\n" + json.dumps({"result": {key: "example"}}, indent=2)[:-4]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", cut)})
@@ -426,6 +431,22 @@ class PublicContentTests(unittest.TestCase):
             prefix = json.dumps({where: row}, indent=2).split('"status"')[0]
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("cut.txt", prefix.encode(encoding))})
+
+    def test_detached_wer_fields(self):
+        fields = dict(ReportId="12345678-aaaa-4444-8888-123456789abc", AttachedFiles="synthetic attachment",
+                      StorePath="synthetic directory", param1="0x10 (0x1, 0x2, 0x3, 0x4)",
+                      param2=r"C:\Windows\test.dmp", param3="12345678-aaaa-4444-8888-123456789abc")
+        for name, value in fields.items():
+            xml = f'<e:Data xmlns:e="urn:test" Name="{name}">{value}</e:Data>'
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-reboot-event", {f["rule"] for f in AUDIT.inspect("excerpt.txt", xml.encode(encoding))})
+        assessment = json.dumps(dict(candidate="same_recorded_bugcheck_report", support=[]), indent=2)
+        for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", assessment.encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Use the WER ReportId and the recorded stop tuple."))
+        self.assertFalse(AUDIT.inspect("ordinary.xml", b'<Data Name="param1">normal</Data>'))
+        partial_path = '<Data Name="param2">' + "C:" + "\\" + "a" * 300
+        self.assertIn("private-reboot-event", {f["rule"] for f in AUDIT.inspect("cut.txt", partial_path.encode())})
 
     def test_whea_export_and_event_comparison(self):
         name = "Microsoft-Windows-WHEA-Logger"

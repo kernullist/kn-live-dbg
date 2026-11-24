@@ -2708,6 +2708,39 @@ match. A second spanning a boundary leaves placement open. Inspect
 `previous_start`, `receiving_start` and the two clock-change counts when
 the comparison is unresolved. [Boot window evidence](ARCHITECTURE.md#saved-boot-windows)
 
+### Compare Windows Error Reporting records across saved logs
+
+`--wer-reports` works without a dump. Choose a System Event 1001 from
+`Microsoft-Windows-WER-SystemErrorReporting` and an Application Event 1001
+from `Windows Error Reporting` whose event name is `BlueScreen`. Each record
+ID belongs to its own log. To check a particular reboot, also select its
+Kernel-Power Event 41 from the same System export. Windows records the stop
+parameters and report ID in the System error report. [Windows reboot events](https://learn.microsoft.com/en-us/troubleshoot/windows-server/performance/troubleshoot-unexpected-reboots-system-event-logs)
+
+Set the two file paths and three selected record IDs in the environment
+variables below. Omit `--restart-record` and its argument to compare just
+the two WER records.
+
+```powershell
+$systemLog = Get-Item -LiteralPath $env:KN_SYSTEM_EVTX -ErrorAction Stop
+$applicationLog = Get-Item -LiteralPath $env:KN_APPLICATION_EVTX -ErrorAction Stop
+$systemPin = (Get-FileHash -LiteralPath $systemLog.FullName -Algorithm SHA256).Hash
+$applicationPin = (Get-FileHash -LiteralPath $applicationLog.FullName -Algorithm SHA256).Hash
+$json = & KnLiveDbg.exe --wer-reports $systemLog.FullName --sha256 $systemPin --system-record $env:KN_SYSTEM_WER_RECORD --application-log $applicationLog.FullName --application-sha256 $applicationPin --application-record $env:KN_APPLICATION_WER_RECORD --restart-record $env:KN_RESTART_RECORD
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the WER comparison output.' }
+$report = $json | ConvertFrom-Json
+$report.report_pair
+$report.restart_interval | Select-Object coverage, records_read, same_reported_stop, restart_report_corroborated
+```
+
+Exit 0 means the selected reports agree and any requested reboot comparison
+is corroborated. Exit 1 carries the available observations, including
+conflicts and missing evidence. Exit 2 indicates invalid arguments or an
+output failure. Several Application records can refer to one WER report.
+The report ID, stop fields and computer-label comparisons are available
+separately. The assessment cites the fields supporting or contradicting
+the comparison and identifies missing evidence. [Recorded evidence and limits](ARCHITECTURE.md#cross-channel-windows-error-reports)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

@@ -90,6 +90,8 @@ def main():
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--reboot-log", str(trace), "--log-sha256", digest, "--record-id", "1", "--compare-time"],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--reboot-log", str(trace), "--log-sha256", digest, "--record-id", "2", "--compare-time", "--clock-history-from", "1"],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--reboot-log", str(trace), "--log-sha256", digest, "--record-id", "2", "--compare-time", "--clock-history-from", "1", "--boot-window"],
+                    ["--wer-reports", str(trace), "--sha256", digest, "--system-record", "2", "--application-log", str(trace),
+                     "--application-sha256", digest, "--application-record", "3", "--restart-record", "1"],
                     ["--io-lifecycle", "50", str(root)],
                     ["--wait-chain", "1", "1", "1", "1", "--corroborate", "2", "2", "2", "10"],
                     ["--wait-chain", "1", "1", "1", "1"], ["--verify-process-image"], ["write", "on"], ["!kmon", "on"], ["kdinit"],

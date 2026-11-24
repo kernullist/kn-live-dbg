@@ -238,21 +238,6 @@ namespace
         uint64_t recordId = 0, firstClockRecord = 0;
     };
 
-    bool RecordId(const std::wstring& decimal, uint64_t& result)
-    {
-        if (decimal.empty() || decimal.size() > 20) { return false; }
-        uint64_t value = 0;
-        for (const auto c : decimal)
-        {
-            if (c < L'0' || c > L'9') { return false; }
-            const auto digit = static_cast<unsigned>(c - L'0');
-            if (value > (UINT64_MAX - digit) / 10) { return false; }
-            value = value * 10 + digit;
-        }
-        result = value;
-        return value != 0;
-    }
-
     bool ReadOptions(const std::vector<std::wstring>& args, Options& options)
     {
         if (args.size() < 3 || args[1] != L"--sha256" || !IsDigest(args[2])) { return false; }
@@ -270,14 +255,14 @@ namespace
         }
         if (i == args.size()) { return true; }
         if (args.size() - i < 6 || args[i] != L"--reboot-log" || args[i + 2] != L"--log-sha256" ||
-            !IsDigest(args[i + 3]) || args[i + 4] != L"--record-id" || !RecordId(args[i + 5], options.recordId)) { return false; }
+            !IsDigest(args[i + 3]) || args[i + 4] != L"--record-id" || !ParseEventRecordId(args[i + 5], options.recordId)) { return false; }
         options.rebootArg = i;
         i += 6;
         if (i == args.size()) { return true; }
         if (args[i++] != L"--compare-time") { return false; }
         options.compareTime = true;
         if (i == args.size()) { return true; }
-        if (args.size() - i < 2 || args[i] != L"--clock-history-from" || !RecordId(args[i + 1], options.firstClockRecord) ||
+        if (args.size() - i < 2 || args[i] != L"--clock-history-from" || !ParseEventRecordId(args[i + 1], options.firstClockRecord) ||
             !RebootClockHistory::ValidWindow(options.firstClockRecord, options.recordId)) { return false; }
         i += 2;
         if (i == args.size()) { return true; }

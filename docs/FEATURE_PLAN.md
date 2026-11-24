@@ -102,6 +102,13 @@ still requires incident-specific evidence.
 [boot window comparison](COMMAND_REFERENCE.md#compare-a-dump-with-the-previous-boot-window)
 and [validation results](VALIDATION.md#saved-boot-window-comparison).
 
+With System and Application exports, an investigator can also compare a
+Windows bugcheck report with its BlueScreen submissions by the recorded
+report GUID and stop tuple. A selected Event 41 can be corroborated across
+an unbroken interval in the same System log. Dump contents, acquisition
+identity and component attribution require further evidence.
+[Cross-channel report comparison](COMMAND_REFERENCE.md#compare-windows-error-reporting-records-across-saved-logs)
+
 The [source collection](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
 retains the original acquisition report and its image dependencies in one
 private journal. It also closes attempts that produced no image. The
