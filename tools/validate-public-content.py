@@ -83,7 +83,7 @@ PRIVATE_FILE_RULES = (
         ".kncampaign", ".knruns")) + END_OF_NAME)),
     ("credential-file", re.compile(r"^\.env(?!\.example" + END_OF_NAME + ")|^" + alternatives(PRIVATE_NAMES) + END_OF_NAME)),
     ("private-container-or-capture", re.compile(
-        r"^\.knbench-[\s\S]*\.tmp" + END_OF_NAME + "|" + alternatives(PRIVATE_EXTENSIONS) + END_OF_NAME + "|" +
+        r"^\.kniat-recover-|^\.knbench-[\s\S]*\.tmp" + END_OF_NAME + "|" + alternatives(PRIVATE_EXTENSIONS) + END_OF_NAME + "|" +
         alternatives(ext for ext in PRIVATE_EXTENSIONS if ext.startswith(".kn")) + r"\.pending-")),
 )
 
@@ -391,7 +391,7 @@ RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"packing_reade
                     '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
                     '"iat_slot_rva"', '"import_lookup_rva"', '"instruction_reread"',
                     '"slot_value_sha256"', '"slot_file_spans"', '"instruction_file_spans"', '"module_list_index"',
-                    '"expected_dump_sha256"',
+                    '"expected_dump_sha256"', '"pending_archive_sha256"', '"retained_prefix_bytes"',
                     '"declaration_fields"', '"declaration_spans"', '"reference_field_sha256"', '"field_offset"',
                     '"reference_import_name"', '"read_error_bytes"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
@@ -408,6 +408,7 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("slot_value_sha256",), ("slot_file_spans",), ("instruction_file_spans",), ("module_list_index", "basename", "coff_timestamp"),
     ("expected_dump_sha256", "expected_reference_sha256", "export"),
     ("packing_reader_sha256",), ("original_report_reproduced", "report_sha256"),
+    ("pending_archive_sha256",), ("retained_prefix_bytes", "appended_bytes"),
     ("declaration_fields",), ("declaration_spans",), ("reference_field_sha256",),
     ("field_offset", "state", "bytes"), ("reference_import_name", "reference_module", "reference_ordinal"),
     ("different_bytes", "excluded_bytes", "read_error_bytes"),
@@ -791,9 +792,11 @@ def is_reparse(file: Path) -> bool:
 
 def inspect_stream(name, stream, allow_private_symbols=False):
     header = stream.read(8)
-    if header in PRIVATE_ARCHIVE_HEADERS:
-        # This signature already rejects the file. Account for its full extent without
-        # buffering the dump. Git delivers immutable blobs through a non-seekable pipe.
+    basename = name.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if (header in PRIVATE_ARCHIVE_HEADERS or header.startswith(b"MDMP\x93\xa7") or
+            basename.startswith((".kniat-recover-", ".kniatarchive.pending-", ".knapprovalarchive.pending-"))):
+        # These signatures or reserved names already reject the file, even for a torn write.
+        # Count the full extent without buffering the dump or recovery copy.
         # Windows may report an anonymous Git pipe as seekable and return the buffered position.
         try:
             info = os.fstat(stream.fileno())

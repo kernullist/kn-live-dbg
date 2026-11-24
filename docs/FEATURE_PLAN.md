@@ -21,6 +21,8 @@ Its import declaration can be checked field by field against the retained PE,
 including name or ordinal evidence and an explicit count of missing bytes.
 The dump, PE and original report can be archived together and replayed after
 all three standalone files have been removed.
+An interrupted publication can reuse its verified on-disk prefix. Once a
+complete member is present, recovery can finish without its standalone copy.
 The live capture recipe still needs its own slot reads. Callback and vtable
 bindings, the exact destination function and mapping lifetime remain open.
 See [source replay](COMMAND_REFERENCE.md#replay-a-process-image-source-receipt),

@@ -62,6 +62,7 @@
 *.kniatarchive.pending-*
 .knapproval-replay-*/
 .kniat-replay-*/
+.kniat-recover-*
 auth.json
 credentials.json
 id_rsa

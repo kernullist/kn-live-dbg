@@ -16,6 +16,7 @@ import sys
 import tempfile
 
 from etl_reader_process import WindowsFiles
+from minidump_archive_recovery_oracle import check_recovery, check_sparse_recovery
 
 CLI = Path(__file__).with_name("archive-minidump-iat.py")
 FRAME = struct.Struct("<8sIIQQ32s")
@@ -255,6 +256,10 @@ def exercise(args, outer):
     altered(header, fabricated + body[nr:], "original native report did not reproduce", hashlib.sha256(fabricated).hexdigest())
     check(pin(archive) == package_pin, "original archive preserved across altered controls")
     print(f"Passed {count} minidump archive checks and reproduced {len(saved)} original native reports after source removal.")
+    check_recovery(exe, originals, inputs, work, secure if args.require_efs else None)
+    if args.large_recovery:
+        for size, offset in ((64 << 20, 36 << 20), ((2 << 30) + (8 << 20), 2 << 30), (8 << 30, 4 << 30)):
+            check_sparse_recovery(exe, originals, outer, size=size, retained=offset + 777)
 
 
 if __name__ == "__main__":
@@ -263,5 +268,6 @@ if __name__ == "__main__":
     parser.add_argument("--fixtures", type=Path, help="reuse the owned regular/full dumps and PE from test-minidump-iat.py")
     parser.add_argument("--link", default="link.exe")
     parser.add_argument("--require-efs", action="store_true", help="also require verified NTFS EFS publication and replay")
+    parser.add_argument("--large-recovery", action="store_true", help="verify sparse NTFS recovery through trailing zeros and the 8 GiB limit")
     with tempfile.TemporaryDirectory() as temporary:
         exercise(parser.parse_args(), Path(temporary))

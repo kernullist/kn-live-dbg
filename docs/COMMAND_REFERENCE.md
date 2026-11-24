@@ -1126,6 +1126,43 @@ require an EFS private store. An EFS archive requires an EFS replay workspace.
 The scratch copies are removed after replay.
 [Validation](VALIDATION.md#portable-user-minidump-observations)
 
+### Recover an interrupted minidump archive
+
+If the publisher exits before the final rename, select its
+`.kniatarchive.pending-<32 hex digits>` file in the private store. Record its
+current SHA-256 after the writer exits. Supply the original report digest and a
+trusted reader as for `pack`. Recovery verifies the existing prefix and
+reproduces the original native report before appending to the same file.
+
+For example, when the header, report and PE survived and the dump stopped
+partway through, supply just the original dump. Here `$pending` is the exact
+file selected for this operation and `$archive` is a new name in the same store.
+
+```powershell
+$pendingPin = (Get-FileHash -LiteralPath $pending -Algorithm SHA256).Hash
+$readerOptions = @('--debugger', $exe, '--debugger-sha256', $readerPin, '--report-sha256', $reportPin)
+$resumed = python -B tools/archive-minidump-iat.py recover @readerOptions --pending $pending --pending-sha256 $pendingPin --out $archive --dump $dump | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $resumed.reason }
+$resumed | Select-Object status, retained_prefix_bytes, appended_bytes, archive_sha256, native_exit_code
+```
+
+Supply each incomplete member with `--report`, `--reference` or `--dump`.
+A complete pending file needs only the pins. If the 64-byte header is
+incomplete, use its original reader and supply all three originals. With a
+complete header, a compatible reader can replay the report when
+`--packing-reader-sha256` identifies the original verifier. Its digest
+defaults to the digest of the reader performing recovery.
+
+After another interruption, inspect the pending file again. A longer prefix
+has a new digest. Keep any conflicting destination and choose a fresh name.
+If the final name already exists and the reply was lost, use `replay` with
+the expected archive digest to verify the published result. A successful
+recovery returns exit 0 and carries forward the original native exit code.
+If recovery runs out of space, its JSON includes the system error number
+when available. Free space in the same private store and hash the surviving
+pending file before retrying.
+[Recovery tests](VALIDATION.md#interrupted-minidump-publication)
+
 ### Archive a process image acquisition
 
 Use an initialized private store and a new collection ID. Supply the

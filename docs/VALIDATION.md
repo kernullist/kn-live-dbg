@@ -7,6 +7,47 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Interrupted minidump publication
+
+On 2026-11-25 a Windows x64 publisher exited after flushing a 28,095,212-byte
+archive but before renaming it. The destination was absent. Recovery used
+the existing file and the original report pin to verify the native result
+and publish it under the selected name.
+
+The regression harness interrupts the real publisher at specific byte
+offsets in the header, report, reference PE and dump. It removes the original
+files for complete members. An independent frame reader compares the entire
+published file with the expected bytes and checks that the Windows file ID
+survived publication. A second interruption during the append left a longer
+prefix that required a fresh digest. If another writer created the destination
+first, its bytes and the fully assembled pending file both survived.
+
+On ACL-only and EFS private stores, the harness also interrupted verification
+while copying a retained PE and a retained dump. A retry verified the surviving
+prefixes and removed both copies after native replay. A changed copy stayed
+in place. Extra NTFS streams, hard links, a widened DACL, redirected output
+and a repinned false native verdict all prevented publication. The suite
+passed 246 recovery checks and 158 ordinary archive checks, including replay
+of eight original native reports. Both store policies also reproduced archives
+started by the previous publisher under a separately pinned compatible reader.
+
+A sparse 64 MiB dump retained its final zero-filled block. With a
+2,155,872,256-byte dump, the publisher stopped at 2,147,484,425 archive
+bytes. Recovery appended 8,395,513 bytes. After removing the three input
+files, replay reproduced the report and the final archive digest matched
+the independently assembled frame. An 8 GiB plus one byte input was rejected
+before publication.
+
+A larger run flushed 4,294,968,073 bytes before interruption. With about
+7.9 GiB available at the start, this host reported insufficient disk space
+when reading the sparse checkpoint for its digest. End-to-end recovery at
+that offset and for an entire 8 GiB input remains unverified. From an x64
+Native Tools prompt, use `--require-efs` to exercise encryption and
+`--large-recovery` for the optional NTFS size trials. Allow room for both
+the original and the archive on the volume used by `TEMP`. Physical
+power-loss recovery requires separate evidence.
+[Recovery command](COMMAND_REFERENCE.md#recover-an-interrupted-minidump-archive)
+
 ## Portable user-minidump observations
 
 On 2026-11-25 the Windows x64 archive test used an owned DLL and DbgHelp's
@@ -39,8 +80,8 @@ last byte and the original native report reproduced after removing the three
 inputs. The publication scan rejected the renamed archive by its signature
 and counted all 4,294,979,074 bytes. NTFS compression kept the zero-filled
 test data small on disk.
-These tests covered process exit and ordinary file operations. Power-loss
-recovery and the full 8 GiB input limit remain unverified.
+That trial covered ordinary publication and replay. The interruption and
+size-limit results are recorded in [interrupted publication](#interrupted-minidump-publication).
 
 From an x64 Native Tools prompt, run the following command on an NTFS volume
 with EFS available.

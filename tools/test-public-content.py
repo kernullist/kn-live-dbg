@@ -195,12 +195,14 @@ class PublicContentTests(unittest.TestCase):
 
     def test_minidump_observation_archive(self):
         self.assertEqual(AUDIT.path_rule(".kniat-replay-owned/copied.bin"), "local-state-directory")
-        for name in ("saved.KNIATARCHIVE", ".kniatarchive.pending-owned"):
+        for name in ("saved.KNIATARCHIVE", ".kniatarchive.pending-owned", ".KNIAT-RECOVER-owned.partial"):
             self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")
         for data in (b"KNMDIAT1", b"KNMDIAT1" + bytes(100)):
             self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.bin", data)})
         for row in (dict(schema="kn.minidump_iat_archive.v1"), dict(packing_reader_sha256="a" * 64),
-                    dict(original_report_reproduced=True, report_sha256="b" * 64)):
+                    dict(original_report_reproduced=True, report_sha256="b" * 64),
+                    dict(pending_archive_sha256="c" * 64),
+                    dict(retained_prefix_bytes="4294967297", appended_bytes="0")):
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 found = AUDIT.inspect("excerpt.txt", json.dumps(row).encode(encoding))
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in found})
@@ -213,13 +215,15 @@ class PublicContentTests(unittest.TestCase):
                     raise AssertionError("archive payload read exceeded the chunk limit")
                 return super().read(size)
 
-        data = b"KNMDIAT1" + bytes((2 << 20) + 7)
-        for seekable in (False, True):
+        for name, prefix, rule in (("renamed.bin", b"KNMDIAT1", "private-evidence-bundle"),
+                                   ("renamed.bin", b"MDMP\x93\xa7", "private-user-minidump"),
+                                   (".KNIAT-Recover-owned.partial", b"partial", "private-container-or-capture"),
+                                   (".kniatarchive.pending-owned", b"damaged", "private-container-or-capture")):
+            data = prefix + bytes((2 << 20) + 7)
             with ArchiveStream(data) as stream:
-                stream.seekable = lambda: seekable
-                size, findings = AUDIT.inspect_stream("renamed.bin", stream)
+                size, findings = AUDIT.inspect_stream(name, stream)
                 self.assertEqual(size, len(data))
-                self.assertEqual([f["rule"] for f in findings], ["private-evidence-bundle"])
+                self.assertEqual([f["rule"] for f in findings], [rule])
 
     def test_portable_approval_evidence(self):
         for name in ("case.knapprovalarchive", ".knapprovalarchive.pending-owned"):

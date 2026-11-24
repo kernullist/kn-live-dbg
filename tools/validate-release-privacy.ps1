@@ -144,7 +144,8 @@ try
     }
     foreach ($name in @("samples/session.log.ll", "source.etl.zip", "system.evtx.zip", "ops.knmcpjournal.tmp.3", "ops.knmcpjournal",
             "truth.kncampaign-wal", "input.kncampaign-shm", "input.kncampaign-journal", "case.kncampaign", "report.knruns",
-            ".knbench-owned.tmp", "logs/private.txt", ".knbench-etl-owned/rows.txt", ".kniat-replay-owned/fragment.bin", "docs/SYMBOLS/note.txt", ".pem"))
+            ".knbench-owned.tmp", "logs/private.txt", ".knbench-etl-owned/rows.txt", ".kniat-replay-owned/fragment.bin",
+            ".kniat-recover-owned.partial", "docs/SYMBOLS/note.txt", ".pem"))
     {
         Assert-RejectedCopy -Name $name
         Assert-RejectedCopy -Name $name -Relative

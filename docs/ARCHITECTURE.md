@@ -735,6 +735,34 @@ compatible reader to verify an older observation. The store's ACL and EFS
 requirements apply to both the temporary files and the published archive.
 [Windows file encryption](https://learn.microsoft.com/en-us/windows/win32/fileio/file-encryption)
 
+During an interrupted minidump publication, the pending file can contain
+anything from an empty prefix to all the verified bytes. Recovery requires
+the operator to select and pin that file in its original private store. An
+exclusive handle binds its owner, protected DACL, encryption, link count and
+single unnamed data stream. Only the portions missing from the prefix require
+standalone originals. Recovery hashes the canonical members, compares the
+retained bytes and reproduces the exact native report before the first append.
+It flushes and verifies the completed file and publishes the same file
+identity under a new name. A competing destination keeps its own contents.
+[Windows file streams](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_stream_info)
+[Windows handle-based rename](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-setfileinformationbyhandle)
+
+When the native reader needs a retained member, recovery materializes it
+under one of two private names derived from the selected pending filename.
+A retry verifies any surviving copy against the same retained bytes before
+using it. It checks the file identity and contents again before removing the
+copy. An unexplained copy stays in place for inspection. Verification copies
+close before writes to the main pending file resume. The returned byte counts
+describe the retained prefix and the appended suffix of that file.
+[Recovery command](COMMAND_REFERENCE.md#recover-an-interrupted-minidump-archive)
+
+On an ACL-only NTFS store, a sparse source dump lets the publisher mark the
+archive sparse. When an append consists entirely of zeros, the writer can
+advance the logical end of a sparse file. Extraction can preserve these holes
+in temporary copies. The archive digest includes every logical byte through
+the end of the file. EFS stores keep their encrypted representation.
+[Windows sparse file operations](https://learn.microsoft.com/en-us/windows/win32/fileio/sparse-file-operations)
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a
