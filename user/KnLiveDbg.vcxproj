@@ -248,6 +248,7 @@
     <ClCompile Include="ImageCaptureCollection.cpp" />
     <ClCompile Include="ImageSourceCollection.cpp" />
     <ClCompile Include="ImageIatReference.cpp" />
+    <ClCompile Include="MinidumpIat.cpp" />
     <ClCompile Include="ImageAuthorizedChanges.cpp" />
     <ClCompile Include="ImageApprovalCollection.cpp" />
     <ClCompile Include="ImageScopeApprovalCollection.cpp" />
@@ -525,6 +526,7 @@
     <ClInclude Include="ImageCaptureCollection.h" />
     <ClInclude Include="ImageSourceCollection.h" />
     <ClInclude Include="ImageIatReference.h" />
+    <ClInclude Include="MinidumpIat.h" />
     <ClInclude Include="ImageAuthorizedChanges.h" />
     <ClInclude Include="ImageApprovalCollection.h" />
     <ClInclude Include="ImageScopeApprovalCollection.h" />

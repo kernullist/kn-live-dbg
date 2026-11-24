@@ -500,6 +500,11 @@ static int RunCommandAuditSelfTest()
     const auto approvalArchive = L"!kmon journal-image-approval x y z " + std::wstring(64, L'a') + L" store 7";
     const auto approvalReplay = L"!kmon replay-image-approval x " + std::wstring(64, L'a');
     const auto sourceReplay = L"!kmon replay-image-source missing-source-report " + std::wstring(64, L'a');
+    const auto dumpIat = L"!kmon dump-image-iat missing-user-dump " + std::wstring(64, L'a') +
+        L" missing-reference " + std::wstring(64, L'b') + L" FixtureTick";
+    check(!IsWriteLikeCommandLine(dumpIat) && run(dumpIat + L" /json").Output.find(L"dump_pin_unavailable") != std::wstring::npos &&
+        !device.IsOpen(), L"user minidump IAT replay opens only offline inputs and preserves its transcript");
+    check(run(dumpIat + L" /bad").Error.find(L"usage") != std::wstring::npos, L"user minidump IAT rejects malformed options");
     const auto sourceArchive = L"!kmon journal-image-source missing-source-report " + std::wstring(64, L'a') + L" store 7";
     check(IsWriteLikeCommandLine(sourceArchive) && run(sourceArchive + L" /json").Output.find(L"kn.image_source_collection.v1") != std::wstring::npos &&
         !device.IsOpen(), L"source archival requires write authorization and uses offline inputs");

@@ -681,6 +681,27 @@ tables and IAT directory must identify one slot. The report names the imported
 symbol as declared in that PE. Delay imports, forwarded exports, the loaded
 slot value and execution require other evidence. [PE format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-address-table)
 
+The offline user-minidump reader can recover the loaded slot when one AMD64
+dump contains the importing image headers, RSDS identity, the export's jump
+instruction, the import descriptor and all eight bytes of the slot. The reader
+matches the reference PE to one module row by image size, COFF timestamp,
+checksum and RSDS GUID/age. It checks the captured PE identity, export, import,
+IAT and debug directories, and the original instruction against that reference.
+Each retained byte of a separate lookup cell must match the PE. The reader
+reports how many of its eight bytes the
+dump retained. When the lookup is missing or shares the IAT cell, the pinned
+PE supplies the declaration.
+
+The original memory descriptors supply file offsets for every instruction
+and slot byte. A complete slot yields a SHA-256 of its eight bytes. A pointer
+inside a listed image extent yields the corresponding module row and basename.
+A null or unlisted destination keeps the slot observation. This evidence
+describes the contents of one file. The dump timestamp and optional process
+creation time have one-second resolution. Authentication, read ordering,
+actual execution and module lifetime require separate evidence.
+[Memory64 lists](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory64_list) and
+[module records](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_module)
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a

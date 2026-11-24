@@ -380,7 +380,7 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v1", "kn.benchmark_original_recovery.v1",
                     "kn.process_image_source.v1", "kn.image_source_replay.v1", "kn.image_source_collection.v1", "kn.image_source_session.v1",
-                    "kn.image_iat_reference.v1",
+                    "kn.image_iat_reference.v1", "kn.minidump_iat_observation.v1",
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
                     "kn.image_approval_provision.v1",
@@ -388,6 +388,8 @@ RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
                     '"iat_slot_rva"', '"import_lookup_rva"', '"instruction_reread"',
+                    '"slot_value_sha256"', '"slot_file_spans"', '"instruction_file_spans"', '"module_list_index"',
+                    '"expected_dump_sha256"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
                     '"truth_ref_sha256"', '"valid_key_ids"', '"signed_hashes"', '"native_policy_sha256"',
                     '"policy_target"', '"source_approval_count"', '"publisher_reference_sha256"', '"source_policy_sha256"',
@@ -399,6 +401,8 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("archived_attempts", "archived_claims"), ("report_committed", "capture_status"), ("committed_source_report_path",),
     ("retained_collection_id", "active_copies"), ("report_sha256", "claim_file_sha256"),
     ("iat_slot_rva", "instruction_hex"), ("import_lookup_rva", "import_descriptor_rva"), ("instruction_reread", "byte_receipts"),
+    ("slot_value_sha256",), ("slot_file_spans",), ("instruction_file_spans",), ("module_list_index", "basename", "coff_timestamp"),
+    ("expected_dump_sha256", "expected_reference_sha256", "export"),
     ("requested_pid", "requested_creation_filetime"), ("acquisition_id", "parent_acquisition_id", "requested_filetime"),
     ("pid", "creation_filetime", "win32_status"), ("capture_status", "original_claim_matched"),
     ("archive_requires_efs", "journal_head_sha256"), ("original_windows_verification",), ("current_windows_verification",),
@@ -607,6 +611,9 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         return findings
     if data.startswith((b"PAGEDU64", b"PAGEDUMP")) and (len(data) == 8 or b"\0" in data[8:256]):
         add("private-crash-dump")
+        return findings
+    if data.startswith(b"MDMP") and (b"MDMP\x93\xa7".startswith(data) or data[4:6] == b"\x93\xa7" or b"\0" in data[4:32]):
+        add("private-user-minidump")
         return findings
     if data.startswith(b"CPER") and ((len(data) <= 10 and bytes.fromhex("1002ffffffff").startswith(data[4:])) or
                                      b"\0" in data[4:128] or data[6:10] == b"\xff" * 4):

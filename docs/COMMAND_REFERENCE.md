@@ -1048,6 +1048,31 @@ value, execution and mapping lifetime remain unverified. A reproduced claim
 can return `iat_reference.status=unavailable` with a reason. A source without
 a reproduced image claim returns `iat_reference=null`.
 
+### Read a loaded import slot from a user minidump
+
+Supply one saved AMD64 user-mode minidump, the importing PE, the SHA-256
+recorded for each file and the case-sensitive export name. Both files must
+be resident local files. The reader accepts up to 8 GiB per dump and 64 MiB
+per PE, with up to 256 streams, 4,096 modules and 262,144 memory descriptors.
+The export in the reference PE must begin with a supported RIP-relative jump
+to an ordinary import slot. The reader requires a matching RSDS build identity
+and the complete captured instruction, descriptor and eight-byte slot.
+
+```powershell
+$slot = & $exe --offline '!kmon' dump-image-iat $dump $dumpPin $reference $pePin $exportName /json | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $slot.reason }
+$slot | Select-Object import_module, import_name, import_ordinal, owner_status, target_module
+```
+
+The three import fields describe the ordinary import declared by the reference
+PE. The target module identifies the module-list entry containing the value
+saved in that cell. Windows can resolve an import into a different DLL.
+The report records offsets into the pinned dump for the instruction and
+slot, and a SHA-256 of the eight slot bytes. Keep the report with the private
+dump. A null slot or a value outside the module list yields an observed slot
+with an empty target. Missing bytes, ambiguous records or an identity mismatch
+return exit code 1 and a reason. Invalid arguments return 2.
+
 ### Archive a process image acquisition
 
 Use an initialized private store and a new collection ID. Supply the

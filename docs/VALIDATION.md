@@ -7,6 +7,34 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Loaded import slots in user minidumps
+
+On 2026-11-25 the x64 Release build replayed two Windows user-mode dumps of
+one test child after it exited. Its MSVC-built DLL had two named imports and
+one ordinal import in the ordinary IAT. Before exit, the child compared its
+three slots with the Windows loader's resolved addresses and recorded each
+owning module and slot digest. All six offline observations matched. An
+independent reader recovered the original instruction and slot bytes at the
+reported file offsets and checked the corresponding module-list entries.
+
+The full-memory dump retained all eight bytes of each separate lookup entry.
+The regular dump retained the loaded slots and import descriptors while omitting
+the lookup entries. Edited copies exercised partially retained and contradictory
+lookup bytes, a shared lookup/IAT, a slot split across discontiguous file
+extents, a one-byte gap, a null slot and a destination outside the module list.
+Other controls covered conflicting directories, ambiguous module identity,
+overlapping memory, 64-bit bounds, digest substitution and output hard links.
+The 141-check test uses DbgHelp and an x64 MSVC toolchain. Run
+`python -B tools/test-minidump-iat.py --exe <release-exe>` from an x64 Native
+Tools command prompt. The product reads the two supplied files offline.
+
+Eight archived source reports and 17 named-export requests produced
+byte-identical output with the previous build at `3710f8d`. Publication
+checks rejected four renamed original dumps and the reports and selected
+fields in UTF-8, UTF-16LE and UTF-16BE. These cases establish saved slot
+contents and module extent membership. Read ordering, the exact destination
+function and module lifetime remain open.
+
 ## Retained IAT references on 2026-11-25
 
 The x64 Release reader recovered two export-to-IAT references from a previously

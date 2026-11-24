@@ -92,6 +92,20 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("capture.txt", json.dumps(record).encode(encoding))})
         self.assertFalse(AUDIT.inspect("guide.md", b"Replay the kn.image_iat_reference.v1 record."))
 
+    def test_minidump_iat_observation(self):
+        for header in (b"MDMP", b"MDMP\x93", b"MDMP\x93\xa7", b"MDMP\x93\xa7" + bytes(26), b"MDMP" + bytes(28)):
+            self.assertIn("private-user-minidump", {f["rule"] for f in AUDIT.inspect("copy.dat", header)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"MDMP identifies a user minidump."))
+        records = (dict(schema="kn.minidump_iat_observation.v1"), dict(slot_value_sha256="a" * 64),
+                   dict(slot_file_spans=[]), dict(instruction_file_spans=[]),
+                   dict(module_list_index="2", basename="sample.dll", coff_timestamp="3"),
+                   dict(expected_dump_sha256="a" * 64, expected_reference_sha256="b" * 64, export="Fixture"))
+        for record in records:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = json.dumps(record).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("report.txt", data)})
+        self.assertFalse(AUDIT.inspect("reference.md", b"Read the kn.minidump_iat_observation.v1 report."))
+
     def test_store_file_ranges_and_positions(self):
         samples = [json.dumps(dict(schema="kn.store_file_scan.v1")), json.dumps(dict(next_file_cursor="", file_receipt="held")),
                    json.dumps(dict(file_offset="0", block_sha256="held")), json.dumps(dict(file_namespace_sha256="held", namespace_entries="3")),

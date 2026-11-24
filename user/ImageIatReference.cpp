@@ -134,6 +134,46 @@ namespace
     }
 }
 
+const wchar_t* InspectImageIatDeclaration(const std::wstring& exportName, const executable_image::DiskPeMetadata& pe,
+    const std::vector<uint8_t>& bytes, const ImageIatInstructionCheck& check, ImageIatDeclaration& declaration)
+{
+    declaration = {};
+    const KmonRvaReader read = [&](uint32_t rva, uint32_t length, std::vector<uint8_t>* out)
+    {
+        uint64_t offset = 0;
+        if (!FileBackedRvaRange(pe, rva, length, offset) || offset > bytes.size() || length > bytes.size() - offset)
+            { return false; }
+        out->assign(bytes.data() + offset, bytes.data() + offset + length);
+        return true;
+    };
+    const auto& exports = pe.DataDirectories[IMAGE_DIRECTORY_ENTRY_EXPORT];
+    uint32_t rva = 0;
+    std::string forwarder;
+    const KmonImportSymbol symbol{mcpjson::WideToUtf8(exportName)};
+    if (pe.Machine != IMAGE_FILE_MACHINE_AMD64 || pe.OptionalMagic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        !FileDirectory(pe, exports) || !KmonReadExport(read, pe.SizeOfImage, exports.VirtualAddress, exports.Size,
+            symbol, &rva, &forwarder) || !forwarder.empty() || !UniqueExportName(read, exports.VirtualAddress, symbol.Name))
+        { return L"export_instruction_unavailable"; }
+    const auto* section = FindDiskSectionForRva(pe, rva);
+    std::vector<uint8_t> instruction;
+    if (!section || !section->Executable || !read(rva, 1, &instruction)) { return L"export_instruction_unavailable"; }
+    const size_t prefixBytes = instruction.front() == 0x48 ? 1 : 0;
+    const uint32_t length = static_cast<uint32_t>(prefixBytes + 6);
+    if (!read(rva, length, &instruction) || instruction[prefixBytes] != 0xff || instruction[prefixBytes + 1] != 0x25)
+        { return L"unsupported_export_instruction"; }
+    if (const auto reason = check(rva, instruction)) { return reason; }
+    int32_t displacement = 0;
+    std::memcpy(&displacement, instruction.data() + prefixBytes + 2, sizeof(displacement));
+    const int64_t slot = static_cast<int64_t>(rva) + length + displacement;
+    ImportEntry entry;
+    if (slot <= 0 || slot > UINT32_MAX || !FindImport(pe, read, static_cast<uint32_t>(slot), entry))
+        { return L"declared_import_slot_unavailable"; }
+    declaration = {rva, static_cast<uint32_t>(slot), entry.DescriptorRva, entry.LookupRva,
+        mcpjson::Utf8ToWide(entry.Module), mcpjson::Utf8ToWide(entry.Symbol.Name), entry.Symbol.ByOrdinal,
+        entry.Symbol.Ordinal, std::move(instruction)};
+    return nullptr;
+}
+
 std::wstring ImageIatReferenceJson(const std::wstring& exportName, const DirectImageReplayEvidence& evidence,
     const ImageRecipeReplay& replay, const executable_image::DiskPeMetadata& pe, const ReferenceArtifact& reference,
     const std::wstring& claimFileSha256)
@@ -152,59 +192,37 @@ std::wstring ImageIatReferenceJson(const std::wstring& exportName, const DirectI
     };
     if (replay.CaptureInterrupted || !evidence.ReferenceQualified || !AssessImageProcessMappings(recipe).NativeImageMappingObserved)
         { return gap(L"native_mapping_or_capture_unqualified"); }
-    const auto& bytes = reference.Bytes();
-    const KmonRvaReader read = [&](uint32_t rva, uint32_t length, std::vector<uint8_t>* out)
-    {
-        uint64_t offset = 0;
-        if (!FileBackedRvaRange(pe, rva, length, offset) || offset > bytes.size() || length > bytes.size() - offset)
-            { return false; }
-        out->assign(bytes.data() + offset, bytes.data() + offset + length);
-        return true;
-    };
-    const auto& exports = pe.DataDirectories[IMAGE_DIRECTORY_ENTRY_EXPORT];
-    uint32_t rva = 0;
-    std::string forwarder;
-    const KmonImportSymbol symbol{mcpjson::WideToUtf8(exportName)};
-    if (pe.Machine != IMAGE_FILE_MACHINE_AMD64 || pe.OptionalMagic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
-        !FileDirectory(pe, exports) || !KmonReadExport(read, pe.SizeOfImage, exports.VirtualAddress, exports.Size,
-            symbol, &rva, &forwarder) || !forwarder.empty() || !UniqueExportName(read, exports.VirtualAddress, symbol.Name))
-        { return gap(L"export_instruction_unavailable"); }
-    const auto* section = FindDiskSectionForRva(pe, rva);
-    std::vector<uint8_t> instruction;
-    if (!section || !section->Executable || !read(rva, 1, &instruction)) { return gap(L"export_instruction_unavailable"); }
-    const size_t prefixBytes = instruction.front() == 0x48 ? 1 : 0;
-    const uint32_t length = static_cast<uint32_t>(prefixBytes + 6);
-    if (!read(rva, length, &instruction) || instruction[prefixBytes] != 0xff || instruction[prefixBytes + 1] != 0x25)
-        { return gap(L"unsupported_export_instruction"); }
-    if (!Contains(recipe.Rva, recipe.Length, rva, length) || recipe.ImageBase > UINT64_MAX - rva - length)
-        { return gap(L"instruction_outside_capture"); }
-    const uint64_t address = recipe.ImageBase + rva;
-    const auto& coverage = evidence.Comparison.Coverage;
-    const auto covers = [&](const ObservationRange& range) { return Contains(range.Address, range.Size, address, length); };
-    const auto overlaps = [&](const ObservationRange& range) { return range.Overlaps({rva, length}); };
-    std::vector<uint8_t> observed;
+    std::wstring receipts;
     size_t completeReads = 0;
-    const auto receipts = ByteReceipts(recipe, address, length, completeReads);
-    if (receipts.empty() || coverage.RangesTruncated || std::none_of(coverage.Compared.begin(), coverage.Compared.end(), covers) ||
-        std::any_of(evidence.NormalizationRanges.begin(), evidence.NormalizationRanges.end(), overlaps) ||
-        !ConsistentImageRecipeBytes(recipe, address, length, &observed) || observed != instruction)
-        { return gap(L"instruction_bytes_unqualified"); }
-    int32_t displacement = 0;
-    std::memcpy(&displacement, observed.data() + prefixBytes + 2, sizeof(displacement));
-    const int64_t slot = static_cast<int64_t>(rva) + length + displacement;
-    ImportEntry entry;
-    if (slot <= 0 || slot > UINT32_MAX || !FindImport(pe, read, static_cast<uint32_t>(slot), entry))
-        { return gap(L"declared_import_slot_unavailable"); }
+    const auto check = [&](uint32_t rva, const std::vector<uint8_t>& instruction) -> const wchar_t*
+    {
+        const size_t length = instruction.size();
+        if (!Contains(recipe.Rva, recipe.Length, rva, length) || recipe.ImageBase > UINT64_MAX - rva - length)
+            { return L"instruction_outside_capture"; }
+        const uint64_t address = recipe.ImageBase + rva;
+        const auto& coverage = evidence.Comparison.Coverage;
+        const auto covers = [&](const ObservationRange& range) { return Contains(range.Address, range.Size, address, length); };
+        const auto overlaps = [&](const ObservationRange& range) { return range.Overlaps({rva, length}); };
+        std::vector<uint8_t> observed;
+        receipts = ByteReceipts(recipe, address, length, completeReads);
+        if (receipts.empty() || coverage.RangesTruncated || std::none_of(coverage.Compared.begin(), coverage.Compared.end(), covers) ||
+            std::any_of(evidence.NormalizationRanges.begin(), evidence.NormalizationRanges.end(), overlaps) ||
+            !ConsistentImageRecipeBytes(recipe, address, length, &observed) || observed != instruction)
+            { return L"instruction_bytes_unqualified"; }
+        return nullptr;
+    };
+    ImageIatDeclaration entry;
+    if (const auto reason = InspectImageIatDeclaration(exportName, pe, reference.Bytes(), check, entry)) { return gap(reason); }
     std::wstring hex;
     constexpr wchar_t digits[] = L"0123456789abcdef";
-    for (const auto byte : observed) { hex += digits[byte >> 4]; hex += digits[byte & 15]; }
+    for (const auto byte : entry.Instruction) { hex += digits[byte >> 4]; hex += digits[byte & 15]; }
     return prefix + L",\"status\":\"observed\",\"relation\":\"references\",\"basis\":\"export_instruction_to_declared_iat_slot\"" +
-        L",\"image_base\":" + N(recipe.ImageBase) + L",\"instruction_rva\":" + N(rva) +
-        L",\"instruction_hex\":" + Quote(hex) + L",\"iat_slot_rva\":" + N(slot) +
+        L",\"image_base\":" + N(recipe.ImageBase) + L",\"instruction_rva\":" + N(entry.InstructionRva) +
+        L",\"instruction_hex\":" + Quote(hex) + L",\"iat_slot_rva\":" + N(entry.SlotRva) +
         L",\"import_descriptor_rva\":" + N(entry.DescriptorRva) + L",\"import_lookup_rva\":" + N(entry.LookupRva) +
-        L",\"import_module\":" + Quote(std::wstring(entry.Module.begin(), entry.Module.end())) +
-        L",\"import_name\":" + (entry.Symbol.ByOrdinal ? L"null" : Quote(std::wstring(entry.Symbol.Name.begin(), entry.Symbol.Name.end()))) +
-        L",\"import_ordinal\":" + (entry.Symbol.ByOrdinal ? N(entry.Symbol.Ordinal) : L"null") +
+        L",\"import_module\":" + Quote(entry.Module) +
+        L",\"import_name\":" + (entry.ByOrdinal ? L"null" : Quote(entry.Name)) +
+        L",\"import_ordinal\":" + (entry.ByOrdinal ? N(entry.Ordinal) : L"null") +
         L",\"clock_domain\":\"collector_steady_clock_ms\",\"instruction_reread\":" +
         bounded_observation_json::B(completeReads > 1) + L",\"byte_receipts\":" + receipts + L"}";
 }
