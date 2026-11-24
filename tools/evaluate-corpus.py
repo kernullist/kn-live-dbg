@@ -344,6 +344,7 @@ def retained_command(args, protected):
     from saved_etl_comparison import outputs_safe, write_result
 
     digest(args.plan_sha256, "registered corpus pin")
+    status = 0
     with ExitStack() as inputs:
         stream = None
         if args.write_archive:
@@ -380,17 +381,31 @@ def retained_command(args, protected):
                           assessments_with_originals_per_planned_case=ratio(len(scored), len(cases)),
                           assessments_with_originals_per_submitted=ratio(len(scored), len(assessments)),
                           ground_truth_authenticated=False, outcomes_independently_replayed=False,
-                          target_probed=False, scopes=comparison_scopes(cases, scored))
-        raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2) + "\n").encode("ascii")
-        require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
-        return write_result(raw) if outputs_safe(protected, stream) else 2
+                          target_probed=False)
+            if args.trusted_root_sha256 is not None:
+                import publisher_truth
+                digest(args.trusted_root_sha256, "trusted publisher root")
+                cases, status = publisher_truth.adjudicate(report, stream, originals, cases,
+                                                          args.trusted_root_sha256, args.verification_time,
+                                                          decode_document, ratio)
+            report["scopes"] = comparison_scopes(cases, scored)
+        if args.trusted_root_sha256 is not None:
+            raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
+            require(len(raw) <= 32 * 1024 * 1024, "publisher report exceeds 32 MiB")
+        else:
+            raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2) + "\n").encode("ascii")
+            require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
+        if not outputs_safe(protected, stream):
+            return 2
+        return write_result(raw) or status
 
 
 def main():
     # Check even malformed or repeated selectors before argparse can write usage to an evidence file.
     paired = any(arg.startswith("--sa") and "--saved-etl-comparison".startswith(arg.split("=", 1)[0])
                  for arg in sys.argv[1:])
-    archive_flags = ("--archive-corpus", "--write-archive", "--original", "--get-original", "--destination", "--file-list")
+    archive_flags = ("--archive-corpus", "--write-archive", "--original", "--get-original", "--destination", "--file-list",
+                     "--trusted-root-sha256", "--verification-time")
     archived = any(arg.startswith("--") and any(flag.startswith(arg.split("=", 1)[0]) for flag in archive_flags)
                    for arg in sys.argv[1:])
     protected = sys.argv[1:]
@@ -430,10 +445,15 @@ def main():
     parser.add_argument("--file-list", type=Path, help="operator-selected kn.benchmark_original_files.v1 list of original paths")
     parser.add_argument("--get-original", help="recover one retained original by SHA-256 after checking the entire corpus package")
     parser.add_argument("--destination", type=Path, help="new file to receive the selected original bytes")
+    parser.add_argument("--trusted-root-sha256", help="independent trust anchor for publisher file comparisons")
+    parser.add_argument("--verification-time", help="publisher metadata verification time in UTC, YYYYMMDDTHHMMSSZ")
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     parser.add_argument("--study-sha256", help="independently retained corpus hash for a partitioned ETL campaign")
     args = parser.parse_args()
+    if args.trusted_root_sha256 is not None or args.verification_time is not None:
+        if not (args.archive_corpus and args.trusted_root_sha256 and args.verification_time and args.get_original is None):
+            parser.error("--trusted-root-sha256 and --verification-time require archive replay together")
     if args.study_sha256 is not None and args.etl_reader_campaign is None:
         parser.error("--study-sha256 requires --etl-reader-campaign")
     if args.etl_reader_campaign and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):

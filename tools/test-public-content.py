@@ -647,6 +647,19 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Read the missing_sha256 field in kn.benchmark_retained_report.v1."))
 
+    def test_publisher_reference_and_comparison_exports(self):
+        samples = (dict(schema="kn.benchmark_tuf_reference.v1"), dict(schema="kn.benchmark_target_scope.v1"),
+                   dict(schema="kn.benchmark_publisher_report.v1"), dict(publisher_truth="unknown", truth_reason="scope_missing"),
+                   dict(trusted_root_sha256="a", verification_time_utc="b"), dict(target_path="a", file_bytes=2, missing=[]),
+                   dict(target_path="a", signed_hashes={}), dict(root="a", snapshot="b", timestamp="c", targets="d"),
+                   dict(truth_ref_sha256="a", failed_role="root"), dict(truth_ref_sha256="a", metadata_links={}),
+                   dict(valid_key_ids=2, threshold=2, expires="2030"))
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                data = ("record\n" + json.dumps({"records": [sample]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("unsorted.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Use kn.benchmark_tuf_reference.v1 for retained metadata."))
+
     def test_window_message_wait_exports(self):
         for row in (dict(schema="kn.wait_message_fixture.v1"), dict(receiver_tid=17, receiver_created="20"),
                     dict(send_return_tick=200, handler_entry_tick=100, handler_leave_tick=200)):

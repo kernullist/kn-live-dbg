@@ -2,8 +2,13 @@
 
 `tools/evaluate-corpus.py` supports imported case-level declarations, replay
 of Windows module-observation workloads, and a paired reading of a saved ETL. An imported
-report records the hashes supplied by its author. A [retained corpus](#retain-and-recover-imported-originals)
-also checks the bytes behind those hashes and can recover individual originals. The workload adapter reads
+report records the hashes supplied by its author. A retained corpus checks
+the bytes behind those hashes and can recover individual originals. For
+whole-file cases it can also check the registered label against signed
+release metadata. [Original retention](#retain-and-recover-imported-originals)
+[Publisher file comparison](#verify-a-file-against-a-publishers-release)
+
+The workload adapter reads
 the retained files, checks controller and observer records against each other,
 and calculates metrics for the two measured populations. The evidence layers
 are `synthetic`, `owned_fixture`, `authorized_sample` and `independent_comparison`.
@@ -576,6 +581,95 @@ themselves. Empty originals are valid. The package holds up to 16,386 distinct
 originals and 8 GiB overall. Each JSON input retains its 8 MiB limit. The
 writer's 8 GiB read budget includes duplicate input files. Archive entries
 contain no filesystem paths. [Windows acquisition checks](VALIDATION.md#retained-corpus-originals-on-2026-11-24)
+
+## Verify a file against a publisher's release
+
+For a case with task `publisher-target-bytes-match` and unit `case`, the
+evaluator can decide whether the complete retained bytes match a named file in
+a publisher's signed TUF targets list. Register the candidate, its acquisition
+scope and the publisher reference in the existing corpus before assessment.
+Keep the plan pin, the package receipt and a trusted root digest obtained
+independently of the corpus. Install the optional verifier into the Python
+environment used for this command with
+`python -m pip install -r tools/requirements-publisher-truth.txt`.
+
+The truth reference is a UTF-8 `kn.benchmark_tuf_reference.v1` document. Its
+four role fields each hold the Base64 encoding of one original metadata file.
+Several cases can share a reference. The per-case hole map uses
+`kn.benchmark_target_scope.v1`. Record the exact, case-sensitive target name,
+the acquisition's declared file size in bytes and its sorted, nonoverlapping
+missing intervals as pairs of zero-based offsets with an exclusive end.
+
+This PowerShell example writes both inputs for a complete capture to a new
+private working directory. Set `$metadata` to the directory containing the
+four original JSON files, `$work` to the empty working directory,
+`$targetName` to the signed name and `$capturedSize` to the whole-file size
+recorded during acquisition. Use the recorded missing intervals for a capture
+with gaps.
+
+```powershell
+@'
+import base64, json, sys
+from pathlib import Path
+metadata, work = map(Path, sys.argv[1:3])
+reference = dict(schema="kn.benchmark_tuf_reference.v1")
+for role in ("root", "timestamp", "snapshot", "targets"):
+    reference[role] = base64.b64encode((metadata / (role + ".json")).read_bytes()).decode("ascii")
+scope = dict(schema="kn.benchmark_target_scope.v1", target_path=sys.argv[3], file_bytes=int(sys.argv[4]), missing=[])
+for name, document in (("publisher.json", reference), ("scope.json", scope)):
+    with (work / name).open("xb") as out:
+        out.write(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+'@ | python -B - $metadata $work $targetName $capturedSize
+if ($LASTEXITCODE -ne 0) { throw 'Could not prepare publisher inputs' }
+```
+
+Register the SHA-256 of `publisher.json` as `truth_ref_sha256`, that of
+`scope.json` as `holes_sha256` and the candidate's SHA-256 as
+`artifact_sha256`. Supply these files to the corpus writer alongside any
+assessment evidence, tool and configuration. To replay, set `$archive`,
+`$pin` and `$plan` as in the retention example above. Set `$trustedRoot` to
+the root metadata supplied by your independent trust source. Choose the UTC
+instant for expiry checks explicitly. The date below is the instant used for
+the Sigstore study.
+
+```powershell
+$anchor = (Get-FileHash -Algorithm SHA256 -LiteralPath $trustedRoot).Hash.ToLowerInvariant()
+$json = python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan --trusted-root-sha256 $anchor --verification-time 20261124T000000Z
+$status = $LASTEXITCODE
+if ($status -eq 2) { throw 'Publisher evaluation failed' }
+$report = $json | ConvertFrom-Json
+$report.adjudicated_per_planned_case
+$report.coverage.cases | Select-Object case_id, declared_truth, publisher_truth, truth_reason
+```
+
+The verifier checks the exact root bytes against the independent pin, verifies
+the signatures and thresholds for all four roles, and checks expiry at the
+selected instant. The timestamp binds the snapshot version and the snapshot
+binds the targets version. Any supplied length and SHA-256 or SHA-512 digests
+must also match. The report records the actual link fields and the number of
+valid key IDs for each role. A version-only link remains visible. Replay uses
+one pinned root and direct top-level targets. Root rotation, delegated target
+lookup, the newest available version and proof of historical publication are
+outside this check. [TUF specification](https://github.com/theupdateframework/specification/blob/master/tuf-spec.md)
+
+A positive file matches the signed length and every signed digest. A complete
+file that differs is negative. Missing originals, unsupported digests,
+incomplete acquisition scopes and unlisted targets produce unknown truth.
+The acquisition size and hole map come from the registered case. The
+publisher authenticates the target descriptor. Each decoded role and each
+hole map may occupy up to 1 MiB. The reference envelope may occupy up to
+8 MiB.
+
+`kn.benchmark_publisher_report.v1` keeps every planned case, its registered
+truth and imported outcome. The scoped and per-family metrics use the
+publisher-derived truths and assessments backed by retained originals.
+A missing assessment for a known positive stays in end-to-end recall. The
+compact JSON report has a 32 MiB limit and escapes non-ASCII target names.
+Exit 0 returns the report, including partial file observations. Exit 1
+returns a report with at least one retained reference rejected. Exit 2
+indicates invalid arguments, a missing verifier dependency, an archive
+integrity failure or an I/O failure. The ordinary replay command continues
+to score the submitted labels. [Sigstore file study](VALIDATION.md#publisher-file-comparisons-on-2026-11-24)
 
 ## Imported report semantics
 

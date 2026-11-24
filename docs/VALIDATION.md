@@ -7,6 +7,60 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Publisher file comparisons on 2026-11-24
+
+Ten development cases compared retained bytes against two direct targets in
+the Sigstore public TUF repository, `trusted_root.json` and
+`signing_config.json`. The corpus pin was recorded before running Windows
+`fc.exe /b`. For that separate byte comparison, the first reference file
+came from the released Sigstore 4.6.0 Python wheel and the second from the
+publisher's content-addressed CDN target. The package retained 19 of 20
+referenced originals. One candidate was deliberately withheld.
+[Publisher revision](https://github.com/sigstore/root-signing/tree/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4)
+[Sigstore 4.6.0 release files](https://pypi.org/project/sigstore/4.6.0/#files)
+
+The production trust root in the wheel matched the repository's root bytes.
+The CDN and the dated Git revision supplied identical timestamp, snapshot
+and targets metadata. At 00:00 UTC on November 24, root version 16 and
+targets version 14 each had five valid key IDs against a threshold of three.
+Timestamp 842 and snapshot 166 each had one valid key ID against a threshold
+of one. The two metadata links carried version numbers. The signed target
+entries carried file lengths and SHA-256 digests. A second check using
+OpenSSL and a separate canonical JSON encoder reproduced all four signature
+counts from the retained publisher files.
+
+| Observation | Result |
+| --- | ---: |
+| Independently adjudicated file comparisons / planned | 6/10 |
+| Matching files / different complete files / unknown | 4 / 2 / 4 |
+| Registered labels confirmed / contradicted among adjudicated cases | 5 / 1 |
+| Imported assessments with original evidence / planned | 7/10 |
+| Positive findings / independently known positives | 3/4 |
+| Negative findings on independently known different files | 2/2 |
+
+One genuine file was registered as different. The publisher comparison
+corrected that label in scoring and retained it in the case record.
+Another genuine file had no assessment. The two known differences were a
+one-byte change and one published file compared against the other file's
+descriptor. A declared hole, a withheld candidate, an unlisted target and
+a truncated acquisition each left one case unknown. Substituting a different
+trust pin or replaying at the timestamp's exact expiry returned ten cases
+and zero adjudications.
+
+Signed regression fixtures exercised separate role keys, duplicate and
+insufficient signatures, version-only and hash-bound links, wrong lengths
+and hashes, and explicit null link fields. An empty file and contradictory
+SHA-256 and SHA-512 values exercised target comparison. The study used one
+publisher revision and correlated cases in one development group. Detection
+precision on a heldout security corpus, host overhead and game latency remain
+open. [Reproduce the offline check](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release)
+
+A capacity run reported all 4,096 registered families with 512-byte UTF-8
+target names. The preceding evaluator and the current one emitted identical
+bytes for plain import and for the complete and incomplete WCT archives below.
+The documented preparation and replay commands ran under Windows PowerShell
+5.1 and PowerShell 7.6.
+
 ## Retained corpus originals on 2026-11-24
 
 Six sender traversals from five owned Windows workloads exercised the generic

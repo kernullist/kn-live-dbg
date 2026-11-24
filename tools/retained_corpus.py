@@ -157,17 +157,16 @@ def read(stream, package_pin, plan_pin):
     return corpus, results, retained
 
 
-def restore(stream, destination, pin, extent):
+def visit_original(stream, pin, extent, *consumers):
     offset, length = extent
+    stream.seek(offset)
+    digest = hashlib.sha256()
+    copy_exact(stream, length, digest.update, *consumers)
+    check(digest.hexdigest() == pin, "selected original changed during recovery")
 
-    def write(out):
-        stream.seek(offset)
-        digest = hashlib.sha256()
 
-        copy_exact(stream, length, out.write, digest.update)
-        check(digest.hexdigest() == pin, "selected original changed during recovery")
-
-    publish_new(local_path(destination), write)
+def restore(stream, destination, pin, extent):
+    publish_new(local_path(destination), lambda out: visit_original(stream, pin, extent, out.write))
 
 
 def evidence(cases, assessments, tool, retained, allowed):
