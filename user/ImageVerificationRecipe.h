@@ -86,6 +86,9 @@ struct DirectImageReplayEvidence
     std::vector<ObservationRange> NormalizationRanges; // RVA spans with fixups or exclusions.
     bool ReferenceQualified = false;
 };
+// Returns the retained bytes only if every overlapping observation agrees.
+bool ConsistentImageRecipeBytes(const ImageVerificationRecipe& recipe, uint64_t address, size_t length,
+    std::vector<uint8_t>* bytes);
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error,
     DirectImageReplayEvidence* evidence = nullptr);
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay);

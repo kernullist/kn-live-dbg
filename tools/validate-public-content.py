@@ -126,14 +126,17 @@ ACTIVITY_WAITS_SCHEMAS = ("kn.etl_activity_waits.v1", "kn.etl_activity_waits_rec
                           DISK_REQUEST_SCHEMA, "kn.traceprocessor_interrupt_window.v1", "kn.traceprocessor_ready_contexts.v1", "kn.etl_switches.v6")
 LOADER_WINDOW_SCHEMA = "kn.image_loader_window.v1"
 LOADER_REPLAY_SCHEMA = "kn.image_loader_window_replay.v1"
+LOADER_SCHEMAS = (LOADER_WINDOW_SCHEMA, LOADER_REPLAY_SCHEMA, "kn.image_observation_pair.v1")
 LOADER_WINDOW_FIELDS = (frozenset(("capture_start_qpc", "capture_end_qpc")), frozenset(("read_windows", "matching_markers")),
                         frozenset(("strictly_inside_reads", "image")), frozenset(("recorded_loader_interval",)),
                         frozenset(("loader_marker_status", "loader_marker_submitted")),
                         frozenset(("read", "address", "start_qpc", "end_qpc")), frozenset(("previous_image", "next_image")),
                         frozenset(("collector_generation", "target_generation")),
                         frozenset(("read_window_in_attested_etl",)), frozenset(("expected_etl_sha256", "expected_recipe_sha256")),
-                        frozenset(("claim_publication_sha256", "replayed_page_sha256")))
-TRACE_QUERY_SCHEMAS = (LOADER_WINDOW_SCHEMA, LOADER_REPLAY_SCHEMA, *ACTIVITY_WAITS_SCHEMAS, "kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
+                        frozenset(("claim_publication_sha256", "replayed_page_sha256")),
+                        frozenset(("supporting_reads", "observed_bytes_sha256")), frozenset(("read_start_qpc", "read_end_qpc")),
+                        frozenset(("earlier_read_end_qpc", "later_read_start_qpc")), frozenset(("observed_bytes_equal", "differing_byte_count")))
+TRACE_QUERY_SCHEMAS = (*LOADER_SCHEMAS, *ACTIVITY_WAITS_SCHEMAS, "kn.etl_switches.v5", "kn.etl_switches.v4", DISK_IO_SCHEMA, *FAULT_QUERY_SCHEMAS, "kn.execution_trace_query.v2", "kn.v8_profile_query.v1", "kn.etl_page_replay.v1", "kn.etl_page_replay.v2", "kn.etl_capture_statement.v1", *ETL_ROTATION_SCHEMAS, *HANDOFF_SCHEMAS)
 V8_RAW_RECORD = re.compile(r"(?m)^(?:v8-version,\d+,\d+,\d+,\d+,[^\r\n]*\r?\nv8-platform,|"
                            r"tick,0x[0-9a-fA-F]+,\d+,[01],0x|code-creation,[A-Za-z]+,-?\d+,\d+,0x|"
                            r"code-(?:move|delete|source-info|disassemble),0x[0-9a-fA-F]+(?:,|$))")
@@ -524,8 +527,8 @@ def detached_evidence_line(text: str) -> int | None:
         if value:
             return text.count("\n", 0, value.start()) + 1
     patterns = [(EVIDENCE_OBJECT_START, DETACHED_FIELD_SETS, DETACHED_SCHEMAS)]
-    if LOADER_WINDOW_SCHEMA in text or LOADER_REPLAY_SCHEMA in text or any(tag in text for tag in LOADER_WINDOW_MARKERS):
-        patterns.append((NESTED_EVIDENCE_OBJECT_START, LOADER_WINDOW_FIELDS, (LOADER_WINDOW_SCHEMA, LOADER_REPLAY_SCHEMA)))
+    if any(schema in text for schema in LOADER_SCHEMAS) or any(tag in text for tag in LOADER_WINDOW_MARKERS):
+        patterns.append((NESTED_EVIDENCE_OBJECT_START, LOADER_WINDOW_FIELDS, LOADER_SCHEMAS))
     if any(tag in text for tag in STORE_RETENTION_MARKERS):
         patterns.append((NESTED_EVIDENCE_OBJECT_START, STORE_RETENTION_FIELDS, ()))
     if any(tag in text for tag in DISCLOSURE_MARKERS):

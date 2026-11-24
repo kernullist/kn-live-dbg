@@ -163,7 +163,9 @@ class PublicContentTests(unittest.TestCase):
                      dict(read="1", address="12", start_qpc="5", end_qpc="6"), dict(previous_image={}, next_image={}),
                      dict(collector_generation={}, target_generation={}), dict(schema="kn.image_loader_window_replay.v1"),
                      dict(read_window_in_attested_etl=False), dict(expected_etl_sha256="x", expected_recipe_sha256="y"),
-                     dict(claim_publication_sha256="a", replayed_page_sha256="b")):
+                     dict(claim_publication_sha256="a", replayed_page_sha256="b"), dict(schema="kn.image_observation_pair.v1"),
+                     dict(supporting_reads=["1"], observed_bytes_sha256="sample"), dict(read_start_qpc="2", read_end_qpc="3"),
+                     dict(earlier_read_end_qpc="3", later_read_start_qpc="7"), dict(observed_bytes_equal=False, differing_byte_count="1")):
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 raw = ("result " + json.dumps(item)).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", raw)})

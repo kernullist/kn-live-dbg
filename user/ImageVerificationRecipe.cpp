@@ -229,55 +229,6 @@ namespace
         return bytes->size() == read.Length;
     }
 
-    bool ReanalysisRead(const ImageVerificationRecipe& recipe, uint64_t address, size_t length, std::vector<uint8_t>* bytes)
-    {
-        if (length == 0 || length > 4096 || address > UINT64_MAX - length)
-        {
-            return false;
-        }
-        std::vector<uint8_t> values(length), present(length, 0);
-        for (const auto& read : recipe.Reads)
-        {
-            if (read.Address >= address + length || read.Address + read.Length <= address)
-            {
-                continue;
-            }
-            if (read.Result.CancellationObserved || read.Result.Spans.empty())
-            {
-                return false;
-            }
-            for (const auto& span : read.Result.Spans)
-            {
-                const auto begin = (std::max)(address, span.Address);
-                const auto end = (std::min)(address + length, span.Address + span.RequestedBytes);
-                if (begin >= end)
-                {
-                    continue;
-                }
-                if (span.State != ObservationReadState::Complete)
-                {
-                    return false;
-                }
-                for (uint64_t current = begin; current < end; ++current)
-                {
-                    const size_t index = static_cast<size_t>(current - address);
-                    const uint8_t value = span.Bytes[static_cast<size_t>(current - span.Address)];
-                    if (present[index] != 0 && values[index] != value)
-                    {
-                        return false;
-                    }
-                    values[index] = value;
-                    present[index] = 1;
-                }
-            }
-        }
-        if (std::find(present.begin(), present.end(), 0) != present.end())
-        {
-            return false;
-        }
-        *bytes = std::move(values);
-        return true;
-    }
     ImageRecipeReplay EvaluateDirectImageRecipe(const ImageVerificationRecipe& p, const std::wstring& json,
         ReferenceArtifact& artifact, const executable_image::DiskPeMetadata& metadata,
         bool currentReanalysis, std::wstring* error, DirectImageReplayEvidence* evidence = nullptr)
@@ -300,7 +251,7 @@ namespace
             bytes->clear();
             if (currentReanalysis)
             {
-                return ReanalysisRead(p, address, length, bytes);
+                return ConsistentImageRecipeBytes(p, address, length, bytes);
             }
             if (cursor == p.Reads.size() || p.Reads[cursor].Address != address || p.Reads[cursor].Length != length)
             {
@@ -355,6 +306,58 @@ namespace
         return result;
     }
 
+}
+
+bool ConsistentImageRecipeBytes(const ImageVerificationRecipe& recipe, uint64_t address, size_t length, std::vector<uint8_t>* bytes)
+{
+    if (!bytes || length == 0 || length > 4096 || address > UINT64_MAX - length)
+    {
+        return false;
+    }
+    std::vector<uint8_t> values(length), present(length, 0);
+    for (const auto& read : recipe.Reads)
+    {
+        if (read.Address > UINT64_MAX - read.Length) { return false; }
+        if (read.Address >= address + length || read.Address + read.Length <= address)
+        {
+            continue;
+        }
+        if (read.Result.CancellationObserved || read.Result.Spans.empty())
+        {
+            return false;
+        }
+        for (const auto& span : read.Result.Spans)
+        {
+            if (span.Address > UINT64_MAX - span.RequestedBytes) { return false; }
+            const auto begin = (std::max)(address, span.Address);
+            const auto end = (std::min)(address + length, span.Address + span.RequestedBytes);
+            if (begin >= end)
+            {
+                continue;
+            }
+            if (span.State != ObservationReadState::Complete || span.Bytes.size() != span.RequestedBytes)
+            {
+                return false;
+            }
+            for (uint64_t current = begin; current < end; ++current)
+            {
+                const size_t index = static_cast<size_t>(current - address);
+                const uint8_t value = span.Bytes[static_cast<size_t>(current - span.Address)];
+                if (present[index] != 0 && values[index] != value)
+                {
+                    return false;
+                }
+                values[index] = value;
+                present[index] = 1;
+            }
+        }
+    }
+    if (std::find(present.begin(), present.end(), 0) != present.end())
+    {
+        return false;
+    }
+    *bytes = std::move(values);
+    return true;
 }
 
 std::wstring ImageComparisonResultJson(const ExecutablePageResult& result, bool qualified)

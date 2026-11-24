@@ -12,6 +12,7 @@ import shutil
 import struct
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -27,24 +28,52 @@ def sha(path):
         return hashlib.file_digest(source, "sha256").hexdigest()
 
 
+def process_birth(kernel, handle):
+    times = [wintypes.FILETIME() for _ in range(4)]
+    assert kernel.GetProcessTimes(wintypes.HANDLE(handle), *(ctypes.byref(value) for value in times))
+    return times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+
+
 def child(path):
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     kernel.LoadLibraryW.argtypes, kernel.LoadLibraryW.restype = [wintypes.LPCWSTR], wintypes.HMODULE
     kernel.FreeLibrary.argtypes = [wintypes.HMODULE]
-    times = [wintypes.FILETIME() for _ in range(4)]
-    assert kernel.GetProcessTimes(wintypes.HANDLE(-1), *(ctypes.byref(value) for value in times))
-    birth = times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+    class MemoryInfo(ctypes.Structure):
+        _fields_ = [("base", ctypes.c_void_p), ("allocation", ctypes.c_void_p), ("allocation_protect", wintypes.DWORD),
+                    ("partition", wintypes.WORD), ("size", ctypes.c_size_t), ("state", wintypes.DWORD),
+                    ("protect", wintypes.DWORD), ("type", wintypes.DWORD)]
+    kernel.VirtualQuery.argtypes = [ctypes.c_void_p, ctypes.POINTER(MemoryInfo), ctypes.c_size_t]
+    kernel.VirtualQuery.restype = ctypes.c_size_t
+    def counter():
+        tick = ctypes.c_int64()
+        assert kernel.QueryPerformanceCounter(ctypes.byref(tick))
+        return tick.value
+    birth = process_birth(kernel, -1)
     for _ in range(2):
+        content = path.read_bytes()
+        pe = struct.unpack_from("<I", content, 0x3c)[0]
+        rva = struct.unpack_from("<I", content, pe + 24 + 20)[0]  # BaseOfCode in the owned DLL
         base = kernel.LoadLibraryW(str(path))
         assert base, ctypes.get_last_error()
         try:
-            print(json.dumps({"pid": os.getpid(), "birth": birth, "base": base}), flush=True)
+            region = MemoryInfo()
+            address = base + rva
+            assert kernel.VirtualQuery(address, ctypes.byref(region), ctypes.sizeof(region)) == ctypes.sizeof(region)
+            assert region.allocation == base and region.type == 0x1000000 and region.state == 0x1000
+            assert rva and address + 64 <= region.base + region.size
+            observed = ctypes.string_at(address, 64)
+            print(json.dumps({"pid": os.getpid(), "birth": birth, "base": base, "rva": rva, "range_hex": observed.hex()}), flush=True)
             command = sys.stdin.readline().strip()
         finally:
             assert kernel.FreeLibrary(base)
         if command == "release":
             return
         assert command == "reload"
+        start = counter()
+        assert kernel.VirtualQuery(address, ctypes.byref(region), ctypes.sizeof(region)) == ctypes.sizeof(region)
+        assert region.state == 0x10000 and region.allocation is None  # MEM_FREE at the comparison address
+        print(json.dumps({"free_start": start, "free_end": counter()}), flush=True)
+        assert sys.stdin.readline().strip() == "load"
 
 
 def run(args, code=0, cwd=None):
@@ -64,7 +93,7 @@ def managed_capture_name(case):
     return f"image-captures/capture-1-{digest}.kncapture"
 
 
-def sign_recordings(root, sessions, openssl, private):
+def sign_recordings(root, sessions, openssl, private, scope):
     signing = runpy.run_path(str(Path(__file__).with_name("test-etl-capture-statement.py")))
     for role in ("capture_controller", "archive_witness"):
         # This directory inherits the ACL of the initialized private store.
@@ -79,7 +108,7 @@ def sign_recordings(root, sessions, openssl, private):
                 context = None
                 if role == "capture_controller":
                     context = dict(session_id=session, se_system_profile_privilege_enabled=None,
-                                   system_trace_enable_flags=0 if private else None)
+                                   system_trace_enable_flags=0 if private else None, **scope)
                 claims = signing["statement"](trace, context)
                 with (root / f"{trace.stem}-{role}.knetlstatement").open("xb") as out:
                     out.write(signer.token(claims) + b"\r\n")
@@ -91,7 +120,7 @@ def sign_recordings(root, sessions, openssl, private):
             work.rmdir()
 
 
-def study(exe, root, capture_only, private_capturer, openssl):
+def study(exe, root, capture_only, private_capturer, openssl, versions=None, boot_reader=None):
     # The native init-store sets the ACL before the session records any image or process names.
     assert not root.exists()
     assert json.loads(run([exe, "--offline", "!kmon", "init-store", root, "/acl-only", "/json"]))["root_acl_verified"]
@@ -105,14 +134,20 @@ def study(exe, root, capture_only, private_capturer, openssl):
     copied = None
     cases = []
     sessions = {}
+    observations = []
+    scope = {}
+    boot_reader = boot_reader or private_capturer
+    def boot_id():
+        raw = bytes.fromhex(run([boot_reader, "--boot-id"]).decode("ascii").strip())
+        value = uuid.UUID(bytes_le=raw)
+        assert value.int
+        return str(value)
+    if openssl and boot_reader:
+        scope = {"target_id": str(uuid.uuid4()), "boot_id": boot_id()}
     try:
-        with (system / "version.dll").open("rb") as source, dll.open("xb") as dest:
+        with (versions[0] if versions else system / "version.dll").open("rb") as source, dll.open("xb") as dest:
             copied = os.fstat(dest.fileno())
             shutil.copyfileobj(source, dest)
-        content = dll.read_bytes()
-        pe = struct.unpack_from("<I", content, 0x3c)[0]
-        rva = struct.unpack_from("<I", content, pe + 24 + 20)[0]  # PE32+ BaseOfCode
-        assert rva > 0
         if not private_capturer:
             providers = root / "providers.txt"
             with providers.open("x", encoding="ascii") as out:
@@ -131,11 +166,16 @@ def study(exe, root, capture_only, private_capturer, openssl):
                 ready.put(None)
             threading.Thread(target=read_lines, daemon=True).start()
             try:
+                birth = process_birth(ctypes.WinDLL("kernel32", use_last_error=True), int(target._handle))
                 for index in range(2):
                     line = ready.get(timeout=30)
                     assert line is not None, "owned DLL did not load"
                     actor = json.loads(line)
-                    assert actor["pid"] == target.pid
+                    assert actor["pid"] == target.pid and actor["birth"] == birth
+                    observed = bytes.fromhex(actor.pop("range_hex"))
+                    assert len(observed) == 64
+                    observations.append(observed)
+                    actor["range_sha256"] = hashlib.sha256(observed).hexdigest()
                     case = root / ("capture-" + str(index))
                     local_etl = root / ("marker-" + str(index) + ".etl") if private_capturer else etl
                     program = [private_capturer, "--private", local_etl] if private_capturer else [exe, "--verify-process-image"]
@@ -145,12 +185,23 @@ def study(exe, root, capture_only, private_capturer, openssl):
                         if private_capturer:
                             program = [private_capturer, "--private-session", "{" + session_id + "}", local_etl]
                     args = [*program, actor["pid"], actor["birth"], dll, hex(actor["base"]),
-                            hex(rva), "64", case, "--allow-residency", "--trace-loader"]
+                            hex(actor["rva"]), "64", case, "--allow-residency", "--trace-loader"]
                     capture = json.loads(run(args))
                     assert capture["original_claim_recorded"] and capture["loader_marker_submitted"]
                     cases.append((case, capture["recipe_sha256"], actor, local_etl))
                     target.stdin.write("reload\n" if index == 0 else "release\n")
                     target.stdin.flush()
+                    if index == 0:
+                        free = json.loads(ready.get(timeout=30))
+                        assert 0 < free["free_start"] <= free["free_end"]
+                        if versions:
+                            with dll.open("r+b") as dest, versions[1].open("rb") as source:
+                                if not os.path.samestat(copied, os.fstat(dest.fileno())):
+                                    raise RuntimeError("The disposable DLL name changed owner")
+                                shutil.copyfileobj(source, dest)
+                                dest.truncate()
+                        target.stdin.write("load\n")
+                        target.stdin.flush()
                 assert target.wait(timeout=20) == 0
             finally:
                 if target.poll() is None:
@@ -166,13 +217,18 @@ def study(exe, root, capture_only, private_capturer, openssl):
                     raise RuntimeError("The disposable DLL name changed owner")
                 dll.unlink()
     plan = {"private": bool(private_capturer), "cases": [(str(p), pin, actor, str(log), sha(log)) for p, pin, actor, log in cases],
-            "managed_capture": managed_capture_name(cases[0][0])}
+            "managed_capture": managed_capture_name(cases[0][0]), "unmapped": free,
+            "differing_offsets": [i for i, (a, b) in enumerate(zip(*observations)) if a != b]}
+    assert bool(plan["differing_offsets"]) == bool(versions)
     if openssl:
+        if scope:
+            assert scope["boot_id"] == boot_id()
+            plan["controller_scope"] = scope
         plan["sessions"] = {trace.name: session for trace, session in sessions.items()}
     with (root / "trial.json").open("x", encoding="utf-8") as out:
         json.dump(plan, out)
     if openssl:
-        sign_recordings(root, sessions, openssl, bool(private_capturer))
+        sign_recordings(root, sessions, openssl, bool(private_capturer), scope)
     for index, row in enumerate(plan["cases"]):
         data = run(loader_command(exe, row), (0, 1))
         retain_original_report(root / f"result-{index}.json", data)
@@ -367,6 +423,94 @@ def check_replay(args, data, pin, root, trial, code):
     return [*base, *statement_options(root, trace, "capture_controller")]
 
 
+def check_pair(exe, root, trial, reports, managed_path):
+    point = (root / "capture_controller.hex").read_text(encoding="ascii")
+    command = [exe, "--etl-image-lifetime", "--compare", point]
+    lanes = []
+    for i, (case, pin, actor, name, trace_pin) in enumerate(trial["cases"]):
+        statement = root / f"{Path(name).stem}-capture_controller.knetlstatement"
+        lanes.append(["--observation", name, trace_pin, case, pin, sha(root / f"result-{i}.json"), statement])
+    left, right = lanes
+    if "controller_scope" not in trial:
+        unknown = json.loads(run([*command, *left, *right], 1))
+        assert unknown["issue"] == "controller_target_or_boot_missing" and unknown["edge"] is None
+        return
+    data = run([*command, *left, *right])
+    pair = json.loads(data)
+    assert pair["schema"] == "kn.image_observation_pair.v1" and pair["status"] == "supported" and pair["issue"] is None
+    assert not any(pair[k] for k in ("continuous_mapping_proven", "execution_observed", "writer_observed"))
+    for i, side in enumerate(("left", "right")):
+        endpoint = pair[side]
+        actor = trial["cases"][i][2]
+        source = endpoint["replay"]
+        observed = endpoint["range"]
+        assert source["replayed_page_sha256"] == lanes[i][5] and source["read_window_in_attested_etl"]
+        assert source["source_issue"] == reports[i]["issue"] and source["capture_statement"]["capture_controller_statement_authenticated"]
+        assert all(source["capture_statement"]["claims"][k] == v for k, v in trial["controller_scope"].items())
+        address = actor["base"] + actor["rva"]
+        assert observed["issue"] is None and observed["observed_bytes_sha256"] == actor["range_sha256"]
+        assert int(observed["address"]) == address and int(observed["length"]) == 64
+        assert int(observed["target_pid"]) == actor["pid"] and int(observed["target_creation_filetime"]) == actor["birth"]
+        overlapping = [r for r in reports[i]["read_windows"] if int(r["address"]) < address + 64 and address < int(r["address"]) + int(r["length"])]
+        assert observed["supporting_reads"] == [r["read"] for r in overlapping]
+        assert observed["read_start_qpc"] == overlapping[0]["start_qpc"] and observed["read_end_qpc"] == overlapping[-1]["end_qpc"]
+    edge = pair["edge"]
+    difference = len(trial["differing_offsets"])
+    assert edge["kind"] == "temporal_candidate" and edge["order"] == "left_before_right" and edge["collector_generations_differ"]
+    assert int(edge["differing_byte_count"]) == difference and edge["observed_bytes_equal"] == (difference == 0)
+    runs = [(int(span["offset"]), int(span["length"])) for span in edge["differing_ranges"]]
+    assert all(length > 0 for start, length in runs)
+    assert all(start + length < following for (start, length), (following, _) in zip(runs, runs[1:]))
+    offsets = [p for start, length in runs for p in range(start, start + length)]
+    assert offsets == trial["differing_offsets"]
+    assert edge["same_retained_reference"] == (reports[0]["reference_sha256"] == reports[1]["reference_sha256"])
+    end, begin = int(edge["earlier_read_end_qpc"]), int(edge["later_read_start_qpc"])
+    assert begin - end == int(edge["between_read_ticks"])
+    assert end < trial["unmapped"]["free_start"] <= trial["unmapped"]["free_end"] < begin
+    reverse = json.loads(run([*command, *right, *left]))
+    assert reverse["left"] == pair["right"] and reverse["right"] == pair["left"]
+    assert reverse["edge"] == dict(edge, order="right_before_left")
+    managed = left.copy()
+    managed[3] = managed_path
+    assert run([*command, *managed, *right]) == data
+    duplicate = json.loads(run([*command, *left, *left], 1))
+    assert duplicate["issue"] == "same_original_observation" and duplicate["edge"] is None
+    stale = left.copy()
+    stale[5] = "0" * 64
+    bad = json.loads(run([*command, *stale, *right], 1))
+    assert bad["edge"] is None and bad["left"]["replay"]["status"] == "page_mismatch" and bad["right"] == pair["right"]
+    witness = (root / "archive_witness.hex").read_text(encoding="ascii")
+    archive = right.copy()
+    archive[6] = root / f"{Path(right[1]).stem}-archive_witness.knetlstatement"
+    bad = json.loads(run([*command[:-1], witness, *left, *archive], 1))
+    assert bad["edge"] is None and bad["right"]["replay"]["capture_statement"]["status"] == "signer_role_mismatch"
+    assert not run([*command, *left, *right[:-1]], 2)
+    # A rejected first endpoint must still protect the second endpoint from redirected output.
+    with tempfile.TemporaryDirectory(dir=root, prefix="pair-output-") as temporary:
+        folder = Path(temporary)
+        case = folder / "case"
+        case.mkdir()
+        copied = right.copy()
+        copied[1], copied[3], copied[6] = folder / "record.etl", case, folder / "scope.knetlstatement"
+        shutil.copyfile(right[1], copied[1])
+        shutil.copyfile(right[6], copied[6])
+        claim = case / "recipe.knverify"
+        blob = case / (reports[1]["reference_sha256"] + ".knblob")
+        for dest in (claim, blob):
+            shutil.copyfile(Path(right[3]) / dest.name, dest)
+        for source in (copied[1], copied[6], claim, blob):
+            alias = folder / "output"
+            before = sha(source)
+            os.link(source, alias)
+            try:
+                with alias.open("ab", buffering=0) as out:
+                    p = subprocess.run([*command, *stale, *copied], stdout=out, stderr=subprocess.PIPE, timeout=90)
+                assert p.returncode == 2 and sha(source) == before
+            finally:
+                alias.unlink()
+    print("Compared two recorded read ranges, independently observed an unmapped gap and checked", difference, "differing bytes.")
+
+
 def verify(exe, root, private_capturer):
     trial = json.loads((root / "trial.json").read_bytes())
     managed_path = root / managed_capture_name(trial["cases"][0][0])
@@ -437,6 +581,8 @@ def verify(exe, root, private_capturer):
         assert rejected["status"] == "capture_statement_rejected" and rejected["page_bytes_match"]
         assert rejected["capture_statement"]["status"] == "etl_identity_mismatch" and not rejected["read_window_in_attested_etl"]
     assert reports[0]["collector_generation"] != reports[1]["collector_generation"]
+    if trial.get("sessions"):
+        check_pair(exe, root, trial, reports, managed_path)
     print("Checked two captures after target exit and source removal. Tracing mode:", "private" if trial["private"] else "system")
 
 
@@ -446,6 +592,8 @@ if __name__ == "__main__":
     options.add_argument("--exe", type=Path)
     options.add_argument("--root", type=Path)
     options.add_argument("--private-capturer", type=Path, help="test helper that records its real marker in an in-process session")
+    options.add_argument("--versions", nargs=2, type=Path, help="two test revisions installed between the loads")
+    options.add_argument("--boot-reader", type=Path, help="native fixture reading the local boot identity")
     options.add_argument("--capture-only", action="store_true")
     options.add_argument("--openssl", type=Path, help="issue controller and archive statements for newly recorded trials")
     options.add_argument("--verify-existing", action="store_true")
@@ -457,6 +605,6 @@ if __name__ == "__main__":
             verify(args.exe.resolve(), args.root.resolve(), args.private_capturer)
         else:
             study(args.exe.resolve(), args.root.resolve(), args.capture_only, args.private_capturer,
-                  args.openssl.resolve(strict=True) if args.openssl else None)
+                  args.openssl.resolve(strict=True) if args.openssl else None, args.versions, args.boot_reader)
     else:
         options.error("supply --exe and an owned trial root")

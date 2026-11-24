@@ -1,6 +1,7 @@
 #include "EtlProfile.h"
 #include "ArtifactOutput.h"
 #include "BoundedObservationJson.h"
+#include "ContentHash.h"
 #include "EtlCaptureSettings.h"
 #include "ImageLoaderWindow.h"
 #include "ImageProcessMappings.h"
@@ -326,7 +327,7 @@ namespace
 
     struct Inputs
     {
-        std::wstring TracePin, RecipePin, ExpectedPage, StatementPath;
+        std::wstring TracePath, CapturePath, TracePin, RecipePin, ExpectedPage, StatementPath;
         etl_profile::StatementAuthority Authority;
     };
 
@@ -357,25 +358,105 @@ namespace
         }
     };
 
-    int Read(const std::vector<std::wstring>& args, const Inputs& inputs)
+    struct RangeObservation
+    {
+        Identity Collector, Target;
+        AddressSpaceDescriptor Space;
+        uint64_t Base = 0, Address = 0;
+        uint32_t Rva = 0;
+        int64_t Frequency = 0;
+        image_loader::Interval Support;
+        std::vector<size_t> Reads;
+        std::vector<uint8_t> Bytes;
+        std::wstring Digest;
+        const wchar_t* Issue = L"verified_read_window_required";
+
+        std::wstring Json() const
+        {
+            if (Issue) { return L"{\"issue\":" + Quote(Issue) + L"}"; }
+            std::wstring ordinals = L"[";
+            for (const auto ordinal : Reads)
+            {
+                if (ordinals.size() > 1) { ordinals += L","; }
+                ordinals += N(ordinal);
+            }
+            return L"{\"issue\":null,\"collector_pid\":" + N(Collector.Pid) + L",\"collector_creation_filetime\":" + N(Collector.Birth) +
+                L",\"target_pid\":" + N(Target.Pid) + L",\"target_creation_filetime\":" + N(Target.Birth) + L",\"image_base\":" + N(Base) +
+                L",\"rva\":" + N(Rva) + L",\"address\":" + N(Address) + L",\"length\":" + N(Bytes.size()) +
+                L",\"observed_bytes_sha256\":" + Quote(Digest) + L",\"supporting_reads\":" + ordinals +
+                L"],\"read_start_qpc\":" + Q(Support.Start) + L",\"read_end_qpc\":" + Q(Support.End) +
+                L",\"qpc_frequency\":" + Q(Frequency) + L"}";
+        }
+    };
+
+    void ObserveRange(const DirectImageReplayEvidence& original, const Scan& scan, const Outcome& out,
+        const std::wstring& issue, RangeObservation& range)
+    {
+        const auto& p = original.Recipe;
+        // Incomplete process/image sequences may contain a reuse or clock conflict.
+        const bool markerOnly = scan.Images.empty() && (issue == L"loader_boundaries_unavailable" ||
+            (issue == L"process_generation_unavailable" && scan.Processes.empty()));
+        if (!out.Qualified && !markerOnly) { range.Issue = L"loader_evidence_unqualified"; return; }
+        if (!original.ReferenceQualified || !AssessImageProcessMappings(p).NativeImageMappingObserved)
+            { range.Issue = L"native_image_mapping_unqualified"; return; }
+        if (!p.Length || p.ImageBase > UINT64_MAX - p.Rva || p.ImageBase + p.Rva > UINT64_MAX - p.Length)
+            { range.Issue = L"image_range_unavailable"; return; }
+        const auto address = p.ImageBase + p.Rva;
+        if (original.Comparison.Observed.size() != p.Length ||
+            !ConsistentImageRecipeBytes(p, address, p.Length, &range.Bytes) || range.Bytes != original.Comparison.Observed)
+            { range.Issue = L"original_range_bytes_unavailable_or_conflicting"; return; }
+        bool fullRead = false;
+        for (size_t i = 0; i < p.Reads.size(); ++i)
+        {
+            const auto& read = p.Reads[i];
+            if (read.Address >= address + p.Length || read.Address + read.Length <= address) { continue; }
+            if (!read.Result.IdentityRevalidated || read.Result.OperationDeadlineExceeded ||
+                read.Result.State != ObservationReadState::Complete)
+                { range.Issue = L"original_range_read_unqualified"; return; }
+            fullRead = fullRead || (read.Address <= address && read.Address + read.Length >= address + p.Length);
+            if (range.Reads.empty()) { range.Support.Start = scan.Window.Reads[i].Start; }
+            range.Reads.push_back(i + 1);
+            range.Support.End = scan.Window.Reads[i].End;
+        }
+        if (!fullRead) { range.Issue = L"original_full_range_read_missing"; return; }
+        range.Digest = ContentHash::Bytes(range.Bytes);
+        if (range.Digest.empty()) { range.Issue = L"observed_bytes_hash_unavailable"; return; }
+        range.Base = p.ImageBase;
+        range.Rva = p.Rva;
+        range.Address = address;
+        range.Target = scan.Target;
+        range.Collector = scan.Collector;
+        range.Frequency = scan.Window.Frequency;
+        range.Space = p.ReadSet.Reads.front().Source.AddressSpace;
+        range.Issue = nullptr;
+    }
+
+    struct Evaluation
+    {
+        WindowReplay Replay;
+        std::wstring Json;
+        DistinctArtifactInput TraceGuard, ClaimGuard, ReferenceGuard, StatementGuard;
+        RangeObservation Range;
+    };
+
+    int Read(const Inputs& inputs, Evaluation& result, bool compare = false)
     {
         const auto sink = GetStdHandle(STD_OUTPUT_HANDLE);
         const bool disk = GetFileType(sink) == FILE_TYPE_DISK;
-        const std::filesystem::path capture(args[4]);
+        const std::filesystem::path capture(inputs.CapturePath);
         std::error_code ec;
         const bool directory = std::filesystem::is_directory(capture, ec);
         const bool managed = _wcsicmp(capture.extension().c_str(), L".kncapture") == 0;
         if (!directory && !managed) { return 2; }
-        DistinctArtifactInput traceGuard, rootGuard, referenceGuard, statementGuard;
-        if (disk && (!traceGuard.Hold(sink, args[0]) ||
-            !statementGuard.Hold(sink, inputs.StatementPath) ||
-            !rootGuard.Hold(sink, (directory ? capture / L"recipe.knverify" : capture).wstring()))) { return 2; }
-        WindowReplay receipt{inputs};
+        if (disk && (!result.TraceGuard.Hold(sink, inputs.TracePath) ||
+            !result.StatementGuard.Hold(sink, inputs.StatementPath) ||
+            !result.ClaimGuard.Hold(sink, (directory ? capture / L"recipe.knverify" : capture).wstring()))) { return 2; }
+        auto& receipt = result.Replay;
         const auto fail = [&](const wchar_t* reason) {
-            const auto json = !inputs.ExpectedPage.empty() ? receipt.Json(reason) :
+            result.Json = !inputs.ExpectedPage.empty() ? receipt.Json(reason) :
                 L"{\"schema\":\"kn.image_loader_window.v1\",\"status\":\"unavailable\",\"issue\":" +
                 Quote(reason) + L",\"recorded_loader_interval\":false}";
-            return WriteCapabilityJson(json) ? 1 : 2;
+            return 1;
         };
         DirectImageReplayEvidence original;
         std::wstring error;
@@ -383,7 +464,7 @@ namespace
         if (replay.Status != L"replayed" || replay.OriginalClaimStatus != L"reproduced")
             { return disk ? 2 : fail(L"original_claim_unavailable"); }
         const auto references = directory ? capture : capture.parent_path().parent_path() / L"image-references";
-        if (disk && !referenceGuard.Hold(sink, (references / (original.Recipe.ReferenceSha256 + L".knblob")).wstring())) { return 2; }
+        if (disk && !result.ReferenceGuard.Hold(sink, (references / (original.Recipe.ReferenceSha256 + L".knblob")).wstring())) { return 2; }
         receipt.Recipe = replay.RecipeSha256;
         receipt.Publication = replay.ClaimPublicationSha256;
         receipt.Claim = replay.RecordedClaimSha256;
@@ -392,7 +473,7 @@ namespace
         Scan scan{original.Recipe, inputs.RecipePin};
         if (!Identities(scan)) { return fail(L"native_process_recipe_required"); }
         etl_profile::SavedEtlInput source;
-        if (!source.Open(args[0])) { return fail(L"trace_unavailable_or_pin_mismatch"); }
+        if (!source.Open(inputs.TracePath)) { return fail(L"trace_unavailable_or_pin_mismatch"); }
         receipt.Trace = source.File.Sha256;
         if (receipt.Trace != inputs.TracePin) { return fail(L"trace_unavailable_or_pin_mismatch"); }
         TRACE_LOGFILE_HEADER h{};
@@ -441,7 +522,7 @@ namespace
             L",\"loader_transitions\":" + changes + L"],\"recorded_loader_interval\":" + (out.Qualified ? L"true" : L"false") +
             L",\"continuous_mapping_proven\":false,\"collector_authenticated\":false,\"execution_observed\":false,\"current_state_known\":false}";
         const bool measured = out.Qualified || changed;
-        if (inputs.ExpectedPage.empty()) { return WriteCapabilityJson(json) ? (measured ? 0 : 1) : 2; }
+        if (inputs.ExpectedPage.empty()) { result.Json = json; return measured ? 0 : 1; }
         const auto digest = etl_profile::ReportFileSha256(json);
         if (digest.empty()) { return fail(L"page_hash_unavailable"); }
         if (!inputs.StatementPath.empty())
@@ -457,12 +538,101 @@ namespace
         const bool match = digest == inputs.ExpectedPage;
         const bool accepted = inputs.StatementPath.empty() || receipt.Statement.Bound();
         const auto disposition = !match ? L"page_mismatch" : accepted ? L"matched" : L"capture_statement_rejected";
-        return WriteCapabilityJson(receipt.Json(disposition)) ? (match && accepted && measured ? 0 : 1) : 2;
+        if (compare && match && receipt.Statement.Bound() && receipt.Statement.CaptureController && out.ReadWindowValidated)
+            { ObserveRange(original, scan, out, issue, result.Range); }
+        result.Json = receipt.Json(disposition);
+        return match && accepted && measured ? 0 : 1;
+    }
+
+    struct PairDecision
+    {
+        const wchar_t* Status;
+        const wchar_t* Issue;
+        bool LeftFirst = false;
+    };
+
+    PairDecision Relate(const Evaluation& left, const Evaluation& right)
+    {
+        const auto& a = left.Range;
+        const auto& b = right.Range;
+        if (a.Issue || b.Issue) { return {L"unfulfilled", L"endpoint_unqualified"}; }
+        const auto& x = left.Replay.Statement;
+        const auto& y = right.Replay.Statement;
+        if (x.TargetJson == L"null" || y.TargetJson == L"null" || x.BootJson == L"null" || y.BootJson == L"null")
+            { return {L"unfulfilled", L"controller_target_or_boot_missing"}; }
+        if (x.TargetJson != y.TargetJson || x.BootJson != y.BootJson)
+            { return {L"contradicted", L"controller_targets_or_boots_differ"}; }
+        if (left.Replay.Trace == right.Replay.Trace && x.SessionJson != y.SessionJson)
+            { return {L"contradicted", L"recording_session_conflict"}; }
+        if (left.Replay.Recipe == right.Replay.Recipe) { return {L"unfulfilled", L"same_original_observation"}; }
+        if (a.Target.Pid != b.Target.Pid || a.Target.Birth != b.Target.Birth)
+            { return {L"contradicted", L"process_generations_differ"}; }
+        if (!SameAddressContract(a.Space, b.Space))
+            { return {L"contradicted", L"address_space_shapes_differ"}; }
+        if (a.Base != b.Base || a.Rva != b.Rva || a.Bytes.size() != b.Bytes.size())
+            { return {L"contradicted", L"image_ranges_differ"}; }
+        if (a.Frequency != b.Frequency) { return {L"contradicted", L"qpc_frequencies_differ"}; }
+        if (ClockBefore(a.Support.End, b.Support.Start)) { return {L"supported", nullptr, true}; }
+        if (ClockBefore(b.Support.End, a.Support.Start)) { return {L"supported", nullptr, false}; }
+        return {L"unfulfilled", L"read_order_unresolved"};
+    }
+
+    int Compare(const std::vector<std::wstring>& args)
+    {
+        // Each observation supplies an ETL, ETL pin, capture, recipe pin, report pin and statement.
+        etl_profile::StatementAuthority key;
+        if (args.size() != 16 || !etl_profile::ParseStatementAuthority(L"capture_controller", args[1], key)) { return 2; }
+        const auto parse = [&](size_t i, Inputs& in) {
+            if (args[i] != L"--observation" || args[i + 1].empty() || args[i + 3].empty() || args[i + 6].empty() ||
+                !etl_profile::NormalizeDigest(args[i + 2], in.TracePin) || !etl_profile::NormalizeDigest(args[i + 4], in.RecipePin) ||
+                !etl_profile::NormalizeDigest(args[i + 5], in.ExpectedPage)) { return false; }
+            in.TracePath = args[i + 1];
+            in.CapturePath = args[i + 3];
+            in.StatementPath = args[i + 6];
+            in.Authority = key;
+            return true;
+        };
+        Inputs first, second;
+        if (!parse(2, first) || !parse(9, second)) { return 2; }
+        Evaluation left{{first}}, right{{second}};
+        if (Read(first, left, true) == 2 || Read(second, right, true) == 2) { return 2; }
+        const auto decision = Relate(left, right);
+        std::wstring edge = L"null";
+        if (!decision.Issue)
+        {
+            const auto& a = left.Range;
+            const auto& b = right.Range;
+            size_t differences = 0;
+            std::wstring ranges = L"[";
+            for (size_t i = 0; i < a.Bytes.size();)
+            {
+                if (a.Bytes[i] == b.Bytes[i]) { ++i; continue; }
+                const auto start = i++;
+                while (i < a.Bytes.size() && a.Bytes[i] != b.Bytes[i]) { ++i; }
+                if (differences) { ranges += L","; }
+                differences += i - start;
+                ranges += L"{\"offset\":" + N(start) + L",\"length\":" + N(i - start) + L"}";
+            }
+            const auto end = decision.LeftFirst ? a.Support.End : b.Support.End;
+            const auto begin = decision.LeftFirst ? b.Support.Start : a.Support.Start;
+            edge = L"{\"kind\":\"temporal_candidate\",\"order\":" + Quote(decision.LeftFirst ? L"left_before_right" : L"right_before_left") +
+                L",\"earlier_read_end_qpc\":" + Q(end) + L",\"later_read_start_qpc\":" + Q(begin) + L",\"between_read_ticks\":" + Q(begin - end) +
+                L",\"observed_bytes_equal\":" + (differences ? L"false" : L"true") + L",\"differing_byte_count\":" + N(differences) +
+                L",\"differing_ranges\":" + ranges + L"],\"same_retained_reference\":" + (left.Replay.Reference == right.Replay.Reference ? L"true" : L"false") +
+                L",\"collector_generations_differ\":" + (a.Collector.Pid != b.Collector.Pid || a.Collector.Birth != b.Collector.Birth ? L"true" : L"false") + L"}";
+        }
+        const auto render = [](const Evaluation& e) { return L"{\"replay\":" + e.Json + L",\"range\":" + e.Range.Json() + L"}"; };
+        const auto json = L"{\"schema\":\"kn.image_observation_pair.v1\",\"status\":" + Quote(decision.Status) +
+            L",\"issue\":" + (decision.Issue ? Quote(decision.Issue) : std::wstring(L"null")) +
+            L",\"left\":" + render(left) + L",\"right\":" + render(right) + L",\"edge\":" + edge +
+            L",\"continuous_mapping_proven\":false,\"execution_observed\":false,\"writer_observed\":false}";
+        return WriteCapabilityJson(json) ? (decision.Issue ? 1 : 0) : 2;
     }
 }
 
 int RunEtlImageLifetime(const std::vector<std::wstring>& args)
 {
+    if (!args.empty() && args.front() == L"--compare") { return Compare(args); }
     Inputs inputs;
     if (args.size() < 7 || args.size() > 13 || args[1] != L"--sha256" || args[3] != L"--capture" || args[5] != L"--recipe-sha256" ||
         !etl_profile::NormalizeDigest(args[2], inputs.TracePin) || !etl_profile::NormalizeDigest(args[6], inputs.RecipePin)) { return 2; }
@@ -479,5 +649,9 @@ int RunEtlImageLifetime(const std::vector<std::wstring>& args)
         else { return 2; }
     }
     if (!inputs.StatementPath.empty() && inputs.ExpectedPage.empty()) { return 2; }
-    return Read(args, inputs);
+    inputs.TracePath = args[0];
+    inputs.CapturePath = args[4];
+    Evaluation result{{inputs}};
+    const int code = Read(inputs, result);
+    return code == 2 || !WriteCapabilityJson(result.Json) ? 2 : code;
 }

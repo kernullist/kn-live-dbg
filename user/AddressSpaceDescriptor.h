@@ -69,3 +69,10 @@ struct AddressSpaceDescriptor
         return Range(address, bytes, false);
     }
 };
+
+inline bool SameAddressContract(const AddressSpaceDescriptor& a, const AddressSpaceDescriptor& b)
+{
+    return a.VirtualAddressBits == b.VirtualAddressBits && a.PointerBytes == b.PointerBytes &&
+        a.PhysicalAddressBits == b.PhysicalAddressBits && a.UserMaximum == b.UserMaximum &&
+        a.KernelMinimum == b.KernelMinimum && a.LegacyAssumed == b.LegacyAssumed;
+}

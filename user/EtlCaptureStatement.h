@@ -19,6 +19,7 @@ namespace etl_profile
     {
         const wchar_t* Status = L"not_checked";
         std::wstring FileSha256, ClaimedEtlSha256, Claims;
+        std::wstring SessionJson = L"null", TargetJson = L"null", BootJson = L"null";
         std::optional<bool> SignatureValid, RoleMatches, EtlMatches;
         std::optional<uint64_t> ClaimedBytes;
         bool CaptureController = false;

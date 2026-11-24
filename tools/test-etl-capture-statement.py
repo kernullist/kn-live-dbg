@@ -78,6 +78,7 @@ def statement(etl, capture=None):
                etl_bytes=str(etl.stat().st_size), **dict.fromkeys(CONTEXT))
     if capture:
         obj.update(role="capture_controller", session_id=capture["session_id"],
+                   target_id=capture.get("target_id"), boot_id=capture.get("boot_id"),
                    se_system_profile_privilege_enabled=capture["se_system_profile_privilege_enabled"],
                    system_trace_enable_flags=capture["system_trace_enable_flags"],
                    sampled_profile_stack_requested=False, context_switch_stack_requested=False)

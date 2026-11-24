@@ -524,6 +524,12 @@ The receipt identifies the replayed recipe, original claim, claim publication,
 retained PE and exact report bytes. A matched report with missing process
 boundaries still exits 1. [Verify a retained loader report](TRACE_IMPORT.md#verify-a-retained-loader-report)
 
+`KnLiveDbg.exe --etl-image-lifetime --compare <trusted-controller-point>` takes two
+`--observation <etl> <etl-sha256> <case> <recipe-sha256> <report-sha256> <controller-statement>`
+groups. Exit 0 returns the ordered raw byte comparison for the same process
+generation and image range. Exit 1 returns both endpoint results and the
+reason a relation could not be established. [Inputs, examples and timing limits](TRACE_IMPORT.md#compare-two-retained-native-image-observations)
+
 `KnLiveDbg.exe --offline !kmon journal-image <case-directory> <private-store> <collection-id> /json`
 archives an existing direct recipe/claim publication and its exact reference into
 a store initialized by `init-store`. The collection ID is a canonical decimal

@@ -1,6 +1,7 @@
 // The saved-file controls below feed constructed boundary records to the evaluator in memory.
 // Only the collector's real marker is written to the private ETL.
 #include "../user/EtlImageLifetime.cpp"
+#include "../user/ObservationWindows.h"
 #include "../user/ProcessImageCapture.h"
 #include <objbase.h>
 #include <iostream>
@@ -9,6 +10,54 @@
 namespace
 {
     void Require(bool condition, const char* message) { if (!condition) { throw std::runtime_error(message); } }
+    void PairControls()
+    {
+        Inputs first, second;
+        Evaluation a{{first}}, b{{second}};
+        for (auto* e : {&a, &b})
+        {
+            e->Range.Issue = nullptr;
+            e->Range.Target = {23, 100};
+            e->Range.Bytes = {1};
+            e->Range.Frequency = 10000000;
+            e->Replay.Statement.TargetJson = L"\"target\"";
+            e->Replay.Statement.BootJson = L"\"boot\"";
+        }
+        a.Replay.Recipe = L"first";
+        b.Replay.Recipe = L"second";
+        a.Range.Support = {10, 20};
+        b.Range.Support = {22, 30};
+        Require(!Relate(a, b).Issue && Relate(a, b).LeftFirst && !Relate(b, a).Issue && !Relate(b, a).LeftFirst,
+            "two-tick order in either direction");
+        const auto expect = [&](const wchar_t* issue) {
+            const auto d = Relate(a, b);
+            Require(d.Issue && std::wstring_view(d.Issue) == issue, "pair decision");
+        };
+        for (auto tick : {19, 20, 21}) { b.Range.Support.Start = tick; expect(L"read_order_unresolved"); }
+        b.Range.Support.Start = 22;
+        ++b.Range.Frequency; expect(L"qpc_frequencies_differ"); --b.Range.Frequency;
+        ++b.Range.Rva; expect(L"image_ranges_differ"); --b.Range.Rva;
+        b.Range.Space.PointerBytes = 4; expect(L"address_space_shapes_differ"); b.Range.Space.PointerBytes = 8;
+        ++b.Range.Target.Birth; expect(L"process_generations_differ"); --b.Range.Target.Birth;
+        b.Replay.Recipe = a.Replay.Recipe; expect(L"same_original_observation"); b.Replay.Recipe = L"second";
+        b.Replay.Statement.SessionJson = L"\"other\""; expect(L"recording_session_conflict"); b.Replay.Trace = L"other";
+        b.Replay.Statement.BootJson = L"\"new-boot\""; expect(L"controller_targets_or_boots_differ");
+        b.Replay.Statement.BootJson = L"null"; expect(L"controller_target_or_boot_missing");
+        b.Range.Issue = L"source_unavailable"; expect(L"endpoint_unqualified");
+
+        ImageVerificationRecipe recipe;
+        ImageRecipeRead read{100, 2};
+        read.Result.State = ObservationReadState::Complete;
+        read.Result.Spans.push_back({100, 2, ObservationReadState::Complete, {1, 2}});
+        recipe.Reads = {read, read};
+        std::vector<uint8_t> bytes;
+        Require(ConsistentImageRecipeBytes(recipe, 100, 2, &bytes) && bytes == read.Result.Spans.front().Bytes,
+            "matching original range bytes");
+        recipe.Reads.back().Result.Spans.front().Bytes[1] = 3;
+        Require(!ConsistentImageRecipeBytes(recipe, 100, 2, &bytes), "overlapping read contradiction");
+        recipe.Reads.back().Result.Spans.front().Bytes.resize(1);
+        Require(!ConsistentImageRecipeBytes(recipe, 100, 2, &bytes), "short retained span");
+    }
     struct Properties
     {
         EVENT_TRACE_PROPERTIES Value{};
@@ -186,6 +235,14 @@ int wmain(int argc, wchar_t** argv)
 {
     try
     {
+        if (argc == 2 && std::wstring(argv[1]) == L"--pair-controls") { PairControls(); return 0; }
+        if (argc == 2 && std::wstring(argv[1]) == L"--boot-id")
+        {
+            const auto& boot = ObservationBootId();
+            if (boot.size() != 32) { return 1; }
+            std::wcout << boot << L'\n';
+            return 0;
+        }
         if (argc > 3 && std::wstring(argv[1]) == L"--private") { return PrivateCapture(argv[2], nullptr, {argv + 3, argv + argc}); }
         if (argc > 4 && std::wstring(argv[1]) == L"--private-session") { return PrivateCapture(argv[3], argv[2], {argv + 4, argv + argc}); }
         if (argc == 5 && std::wstring(argv[1]) == L"--controls") { Controls(argv[2], argv[3], argv[4]); return 0; }

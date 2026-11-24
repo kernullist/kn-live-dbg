@@ -35,12 +35,6 @@ namespace
         }
         return result + L"]";
     }
-    bool SameAddressContract(const AddressSpaceDescriptor& a, const AddressSpaceDescriptor& b)
-    {
-        return a.VirtualAddressBits == b.VirtualAddressBits && a.PointerBytes == b.PointerBytes &&
-            a.PhysicalAddressBits == b.PhysicalAddressBits && a.UserMaximum == b.UserMaximum &&
-            a.KernelMinimum == b.KernelMinimum && a.LegacyAssumed == b.LegacyAssumed;
-    }
     struct Decision
     {
         std::wstring Status, Order = L"unestablished";

@@ -105,6 +105,9 @@ namespace etl_profile
             }
             out.ClaimedEtlSha256 = digest;
             out.ClaimedBytes = size;
+            out.SessionJson = session;
+            out.TargetJson = target;
+            out.BootJson = boot;
             out.CaptureController = controller;
             out.Claims = L"{\"role\":" + Quote(controller ? L"capture_controller" : L"archive_witness") +
                 L",\"session_id\":" + session + L",\"target_id\":" + target + L",\"boot_id\":" + boot +

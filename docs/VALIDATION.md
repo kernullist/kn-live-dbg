@@ -7,6 +7,31 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Cross-collector native image comparison on 2026-11-24
+
+Two standard-user x64 Release trials each recorded two independent collectors
+reading 64 bytes at the same address in one process. The target also read its
+own bytes. Between the captures it unloaded the DLL and used `VirtualQuery`
+to confirm `MEM_FREE` at that address before loading the DLL again. Reloading
+the same Windows `version.dll` produced zero differences. Loading a second
+build of the test DLL at the original path produced 48 differing bytes in
+three runs of 1, 19 and 28 bytes. Every reported offset matched the target's
+independent reads. Reversing the inputs reversed the reported order. A
+managed copy of the first capture reproduced the direct result.
+
+All four original loader reports still returned `process_generation_unavailable`.
+The controller signatures bound the target and boot across each pair, and
+the gap between its supporting reads contained the independently observed
+unload. Execution, writer identity and a kernel-provider load/unload interval
+remain unverified. Ten earlier reports and eight signed receipts replayed
+byte for byte. The two older signed pairs lacked target and boot claims and
+returned a null edge. The temporal facts suite passed 147 checks and the
+command suite passed 3,088.
+
+Use `tools/validate-image-loader-window.ps1` with matching x64 Release objects
+and `-OpenSsl <openssl.exe>` to repeat both trials.
+[Comparison command and evidence requirements](TRACE_IMPORT.md#compare-two-retained-native-image-observations)
+
 ## Signed replay of retained loader reports on 2026-11-24
 
 Two standard-user trials each recorded the same DLL loading twice at one

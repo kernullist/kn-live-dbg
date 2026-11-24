@@ -79,6 +79,49 @@ matching unavailable observation exits 1. A stale report returns
 `capture_statement_rejected` and the signature, role or file mismatch.
 If the ETL or original claim could not be replayed, `page_bytes_match` is null.
 
+### Compare two retained native image observations
+
+Use a capture-controller key authorized for both recordings. Each controller
+statement must bind the ETL bytes and identify the target and its boot in
+that controller's namespace. An archive witness can establish custody of a
+single recording. A comparison across recordings requires the controller's
+target correspondence.
+
+For each observation, supply the SHA-256 digests of the original report,
+recipe and ETL. Use the report digest saved at collection or computed from
+the retained report as shown above. Each case can be a direct directory or
+a managed `.kncapture`.
+
+```powershell
+$controllerPoint = (Get-Content -Raw -LiteralPath $approvedPointFile).Trim()
+$leftInput = @('--observation', $leftEtl, $leftEtlPin, $leftCase, $leftRecipePin, $leftReportPin, $leftStatement)
+$rightInput = @('--observation', $rightEtl, $rightEtlPin, $rightCase, $rightRecipePin, $rightReportPin, $rightStatement)
+& $exe --etl-image-lifetime --compare $controllerPoint @leftInput @rightInput
+```
+
+The reader replays both original claims and verifies each report, signature
+and timing marker before comparing the observed bytes. It requires the same
+process creation time and PID, address-space contract, image base, RVA and
+length. Each endpoint must have a qualified native image mapping, a complete
+read of the range and agreement among overlapping reads. An observed loader
+transition during a capture withholds the comparison. A private recording
+with only the collector marker can qualify an endpoint from its original
+mapping observations.
+
+The `kn.image_observation_pair.v1` result preserves both replay receipts,
+the read ordinals and each raw byte digest. A supported `temporal_candidate`
+edge gives the order, the gap in QPC ticks and every differing run as an
+offset and length within the requested range. The two references can differ.
+Overlapping intervals and a separation of one tick leave ordering unresolved.
+Equal bytes at the same address can occur across an unload and reload.
+Mapping continuity, execution and writer identity remain unestablished.
+[Windows QPC guidance](https://learn.microsoft.com/en-us/windows/win32/sysinfo/acquiring-high-resolution-time-stamps)
+
+Exit 0 means the endpoint comparison succeeded. Either original loader report
+can still have unavailable kernel process boundaries. Exit 1 covers a missing
+prerequisite or a contradiction and returns a null edge with both source
+results. Exit 2 covers invalid arguments and unsafe output destinations.
+
 ## Saved Windows CPU samples
 
 `KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N]`

@@ -4256,9 +4256,20 @@ path spellings and arrival order do not define identity. Relation IDs also bind
 the query interpretation. These are consistency checks, not authorization.
 
 The report is private `kn.temporal_facts.v1`, including renamed JSON. Broader
-temporal graph storage, cross-collector receipts, image-sweep/object adapters,
+temporal graph storage, source correspondence for other bundle families, image-sweep/object adapters,
 mapping-lifetime change claims, clock calibration and execution/I/O relations
 remain separate P07 requirements.
+
+For native process image reads, the offline reader can relate two original
+publications from different collectors. A common capture controller signs the
+target and boot for each recording. The reader checks both original image
+claims, read markers, raw bytes and QPC windows, then applies the same
+address-space contract used by local temporal facts. A supported image edge
+compares the specified range at the two endpoints and retains the gap between
+the supporting reads. The edge can identify differing byte runs even when
+the DLL at that address has been replaced. Mapping continuity, code execution
+and writer identity during the gap each require independent evidence.
+[Cross-collector image comparison](TRACE_IMPORT.md#compare-two-retained-native-image-observations)
 
 ## Retained fact graph
 
