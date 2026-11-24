@@ -507,6 +507,14 @@ published before a delivery failure remains available for replay. These checks
 cover writes made by the executable. A shell that truncates the destination
 before launch, or writes pipeline output itself, controls that file separately.
 
+In a console, Ctrl+C or Ctrl+Break requests a cooperative stop. If a read or
+mapping query observes the stop and the case is published, the command returns
+exit 1 with `status=interrupted` and `original_claim_recorded=true`. The case
+retains completed reads, the cancelled observations and the original verdict
+for the requested range. `replay-image` reports `capture_interrupted=true`
+when it reproduces that case, including from a managed archive. A signal
+received after the final observation leaves the completed verdict intact.
+
 V3 also retains `VirtualQueryEx` calls before and after each read and a final
 query of each distinct read range. `result.mapping` separates consistent
 observations, unavailable queries and `inconsistent_capture`; conflicts or

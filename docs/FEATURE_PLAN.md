@@ -67,6 +67,10 @@ Gate 3 adds P11/P12 only where actual execution evidence is needed. Gate 4
 combines P09/P15/P16 with operational transport, retention and measured workloads.
 Every meaningful step is reviewed, corrected, validated and committed separately.
 
+The Gate 1 [interruption trial](VALIDATION.md#interrupted-native-image-captures-on-2026-11-24)
+follows a cooperative stop through the original reads, the final mapping
+checks and post-exit replay of the published case.
+
 Implementation, integration, validation and deployment readiness are independent
 states. A package stays open when its required adapter, raw evidence, compatible
 environment or independent truth is missing. Preserve T01-T30 failure, negative,

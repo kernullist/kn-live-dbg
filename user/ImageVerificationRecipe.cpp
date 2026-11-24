@@ -10,6 +10,7 @@
 #include "ImageSweepManifest.h"
 #include "ImageProcessMappings.h"
 #include "ImageLoaderWindow.h"
+#include <algorithm>
 #include <filesystem>
 #include <set>
 
@@ -227,6 +228,20 @@ namespace
             bytes->insert(bytes->end(), span.Bytes.begin(), span.Bytes.end());
         }
         return bytes->size() == read.Length;
+    }
+
+    bool ObservedCancellation(const ImageVerificationRecipe& recipe)
+    {
+        for (const auto& read : recipe.Reads)
+        {
+            if (read.Result.CancellationObserved || read.Result.State == ObservationReadState::Cancelled) { return true; }
+        }
+        for (const auto& pair : recipe.Mappings.Reads)
+        {
+            if (pair.Before.Status == L"cancelled" || pair.After.Status == L"cancelled") { return true; }
+        }
+        return std::any_of(recipe.Mappings.Final.begin(), recipe.Mappings.Final.end(),
+            [](const auto& observation) { return observation.Status == L"cancelled"; });
     }
 
     ImageRecipeReplay EvaluateDirectImageRecipe(const ImageVerificationRecipe& p, const std::wstring& json,
@@ -515,7 +530,12 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         }
     }
     if (loader) { loader->Capture.End = image_loader::Counter(); }
-    if (operation != nullptr) { p.ReadSet = operation->Snapshot(); }
+    if (operation != nullptr)
+    {
+        // A signal arriving after the final observation did not interrupt acquisition.
+        if (ObservedCancellation(p)) { operation->Cancel(); }
+        p.ReadSet = operation->Snapshot();
+    }
     p.RecordedResult = ResultWithMappings(p, &comparison, &qualified);
     if (exhausted || sourceChanged || !retained.Unchanged() || !original.Unchanged())
     {
@@ -658,6 +678,10 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
                 if (error) { *error = L"the recorded claim policy or assessment could not be reproduced"; }
             }
         }
+    }
+    if (result.Status == L"replayed" || result.Status == L"reanalyzed")
+    {
+        result.CaptureInterrupted = p.ReadSet.Cancelled && ObservedCancellation(p);
     }
     if (evidence && !currentReanalysis && result.Status == L"replayed") { *evidence = std::move(evaluated); }
     return result;

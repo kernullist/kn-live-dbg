@@ -3481,6 +3481,15 @@ account for paths created during capture. Malformed commands check the stream
 used for usage text. Restricted mode suppresses the disk diagnostic before it
 opens any named file. [Windows hard-link enumeration](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findnextfilenamew)
 
+The one-shot collector registers a console interrupt handler before opening
+the target. The handler sets a stop flag. Reads and mapping checks record when
+they observe cancellation, including a final mapping check after the last
+successful read. Such a recording marks `read_set.cancelled` and can still
+reproduce its original scoped claim. `recording_complete` accounts for read
+receipts. A cancelled query can leave the requested bytes unverified even
+when every receipt is present. Forced process termination still depends on
+whether the final case root was published. [Windows console control handlers](https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler)
+
 The live CLI requests `PROCESS_VM_READ | PROCESS_QUERY_INFORMATION` and returns before driver,
 service, symbol or monitor initialization. It uses the Win32 user-address ceiling
 with an explicitly assumed legacy LA48 shape; it does not infer CR4.LA57. The

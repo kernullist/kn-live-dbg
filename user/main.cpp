@@ -820,6 +820,13 @@ static void PreserveAiSessionSettings(AiPlanState& target, const AiPlanState& so
 
 static bool WriteUtf8TextFile(const std::wstring& path, const std::wstring& text, std::wstring* error);
 
+static BOOL WINAPI ImageCaptureInterruptHandler(DWORD controlType)
+{
+    if (controlType != CTRL_C_EVENT && controlType != CTRL_BREAK_EVENT) { return FALSE; }
+    g_StopRequested.store(true);
+    return TRUE;
+}
+
 static BOOL WINAPI ConsoleHandler(DWORD controlType)
 {
     BOOL handled = FALSE;
@@ -23750,7 +23757,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
             replay.Status = L"replay_failed";
             replay.Mode = current ? L"current_reanalysis" : L"original_policy";
         }
-        std::wcout << ImageRecipeReplayJson(replay) << L"\n";
+        std::wcout << ImageRecipeReplayJson(replay, true) << L"\n";
         return replay.Status == L"replayed" || replay.Status == L"reanalyzed" ? 0 : 1;
     }
     if (action == L"dump-read")
@@ -54325,6 +54332,13 @@ int wmain(int argc, wchar_t** argv)
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--verify-process-image")
     {
+        // This one-shot route runs before the interactive handler. Let the
+        // collector finish publishing its original observations on interruption.
+        if (!SetConsoleCtrlHandler(ImageCaptureInterruptHandler, TRUE))
+        {
+            DWORD member = 0;
+            if (GetConsoleProcessList(&member, 1)) { return 1; }
+        }
         return RunProcessImageCaptureCommand(std::vector<std::wstring>(argv + 2, argv + argc), &g_StopRequested);
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--offline")

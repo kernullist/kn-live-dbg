@@ -59,7 +59,8 @@ def main():
         check(report["result"] == recipe["payload"]["recorded_result"] or current, "exact original mapping result")
         return report
 
-    names = ("stable", "modified", "modified-conflict", "protect", "final", "free", "remap", "aba", "neighbor", "exited", "cancel", "cross")
+    names = ("stable", "modified", "modified-conflict", "protect", "final", "free", "remap", "aba", "neighbor", "exited",
+             "cancel", "cancel-on-return", "cancel-after-read", "cancel-final", "cancel-late", "cross")
     for name in names:
         case = fixtures / ("mapping-" + name)
         original, current = verify(case), verify(case, True)
@@ -73,6 +74,31 @@ def main():
                   "exited process address-space queries retain native errors")
         if name == "cancel":
             check(mapping["queries"] == "0", "cancelled observation issues no query")
+        interrupted = name in ("cancel", "cancel-on-return", "cancel-after-read", "cancel-final")
+        check(original.get("capture_interrupted", False) == current.get("capture_interrupted", False) == interrupted,
+              "both replay modes distinguish observed cancellation from a late request")
+        if interrupted:
+            payload = unpack_recipe(json.loads((case / "recipe.knverify").read_bytes()))["payload"]
+            reads, mappings = payload["read_set"], payload["mapping_set"]
+            invoked = [row for row in reads["reads"] if row["source_invoked"]]
+            check(reads["cancelled"] and reads["recording_complete"] and int(reads["charged_source_calls"]) == len(invoked),
+                  "interrupted acquisition retains the original attempt and source-call counts")
+            check(original["result"]["ownership"] == "owned_unverified" and int(original["result"]["compared_bytes"]) == 0,
+                  "an interrupted mapping fence withholds a byte verdict")
+            if name == "cancel-on-return":
+                read = invoked[0]["read"]
+                check(len(invoked) == 1 and read["status"] == "complete" and read["cancellation_observed"] and
+                      read["native_status"] == 0 and read["transferred_bytes"] == int(invoked[0]["requested_bytes"]) and
+                      sum(len(bytes.fromhex(s["bytes_hex"])) for s in read["spans"]) == read["transferred_bytes"],
+                      "bytes returned by the native call survive a stop observed while returning to the recorder")
+            if name == "cancel-after-read":
+                check(len(invoked) == 1 and invoked[0]["read"]["status"] == "complete" and
+                      mappings["reads"][0]["after"]["status"] == "cancelled",
+                      "first completed native read survives interruption before its mapping recheck")
+            if name == "cancel-final":
+                check(len(invoked) == len(reads["reads"]) and all(row["read"]["status"] == "complete" for row in invoked) and
+                      all(q["status"] == "cancelled" for q in mappings["final"]),
+                      "completed native reads survive interruption of final mapping queries")
 
     with tempfile.TemporaryDirectory(prefix="mapping-controls-", dir=fixtures) as temporary:
         root = Path(temporary).resolve()
@@ -81,6 +107,10 @@ def main():
         shutil.copytree(fixtures / "mapping-stable", case)
         original_publication = json.loads((case / "recipe.knverify").read_bytes())
         baseline = unpack_recipe(original_publication)
+        flag_only = copy.deepcopy(baseline)
+        flag_only["payload"]["read_set"]["cancelled"] = True
+        (case / "recipe.knverify").write_bytes(seal(flag_only))
+        check("capture_interrupted" not in verify(case), "an operation flag alone cannot label a completed acquisition interrupted")
         for mutation in ("old_policy", "missing_mapping_requirement", "wrong_mapping_pointer"):
             publication = copy.deepcopy(original_publication)
             report = publication["payload"]["recorded_claim"]
@@ -185,6 +215,8 @@ def main():
             check(assessed["status"] == "assessed" and assessed["authorized_changed_bytes"] == ("1" if name == "modified" else "0"),
                   "exact policy cannot authorize bytes across mapping failure or conflict")
             check_report(recipe, blob, assessed["replay"])
+            if recipe["payload"]["read_set"]["cancelled"]:
+                check("capture_interrupted" not in assessed["replay"], "historical approval assessments preserve their embedded report format")
             archived = run("archive-approval", source, change, policy, anchor, store, str(index), *([] if args.product else [when]))
             check(archived["closed"] and archived["committed"], "mapping inputs retained with exact original approval")
             approval = store / archived["approval_path"]

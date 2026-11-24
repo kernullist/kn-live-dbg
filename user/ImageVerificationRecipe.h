@@ -67,6 +67,7 @@ struct ImageRecipeReplay
     std::wstring ClaimAssessmentJson;
     std::wstring OriginalClaimStatus = L"not_recorded";
     std::wstring ClaimPublicationSha256, RecordedClaimSha256, RecordedClaimRegistry, RecordedClaimPolicy;
+    bool CaptureInterrupted = false;
 };
 
 std::wstring ImageRecipeJson(const ImageVerificationRecipe& recipe);
@@ -92,3 +93,4 @@ bool ConsistentImageRecipeBytes(const ImageVerificationRecipe& recipe, uint64_t 
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error,
     DirectImageReplayEvidence* evidence = nullptr);
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay);
+std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay, bool includeCaptureOutcome);

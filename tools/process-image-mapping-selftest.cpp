@@ -124,6 +124,23 @@ namespace
     private:
         ProcessObservationSource& Source;
     };
+
+    class CancelOnReadReturn final : public IObservationSource
+    {
+    public:
+        CancelOnReadReturn(ProcessObservationSource& source, std::atomic<bool>& stop) : Source(source), Stop(stop) {}
+        const ObservationSourceCapabilities& Capabilities() const override { return Source.Capabilities(); }
+    protected:
+        ObservationReadResult ReadSpans(const ObservationReadRequest& request) override
+        {
+            auto result = Source.Read(request);
+            Stop.store(true);
+            return result;
+        }
+    private:
+        ProcessObservationSource& Source;
+        std::atomic<bool>& Stop;
+    };
 }
 
 bool TestProcessImageMappings(const std::filesystem::path& root, const std::filesystem::path& image,
@@ -141,9 +158,9 @@ bool TestProcessImageMappings(const std::filesystem::path& root, const std::file
         space.UserMaximum = reinterpret_cast<uint64_t>(info.lpMaximumApplicationAddress);
         ProcessObservationSource source(GetCurrentProcess(), GetCurrentProcessId(), Creation(GetCurrentProcess()), space);
         check(!source.Capabilities().SourceId.empty(), "owned handle source");
-        size_t finalCall = 0;
+        size_t finalCall = 0, lastCall = 0;
         std::vector<std::filesystem::path> retained;
-        for (const std::wstring mode : {L"stable", L"modified", L"modified-conflict", L"protect", L"final", L"free", L"remap", L"aba", L"neighbor", L"exited", L"cancel", L"cross"})
+        for (const std::wstring mode : {L"stable", L"modified", L"modified-conflict", L"protect", L"final", L"free", L"remap", L"aba", L"neighbor", L"exited", L"cancel", L"cancel-on-return", L"cancel-after-read", L"cancel-final", L"cancel-late", L"cross"})
         {
             Memory memory;
             Require(initial.size() == 0x4000, "known bounded fixture");
@@ -167,10 +184,14 @@ bool TestProcessImageMappings(const std::filesystem::path& root, const std::file
             auto& selected = mode == L"exited" ? limitedSource : source;
             Observer observer(selected);
             bool changed = false;
+            std::atomic<bool> cancellation{mode == L"cancel"};
+            CancelOnReadReturn returning(selected, cancellation);
+            IObservationSource& reader = mode == L"cancel-on-return" ? static_cast<IObservationSource&>(returning) : selected;
             // Mutation runs synchronously at an observed query boundary. No sleep
             // or assumed actor scheduling establishes these orderings.
             observer.After = [&](size_t call)
             {
+                if (mode == L"cancel-late" && call == lastCall) { cancellation.store(true); }
                 if (call != 1) { return; }
                 if (mode == L"protect" || mode == L"modified-conflict") { memory.Protect(0, PAGE_READONLY); changed = true; }
                 if (mode == L"neighbor") { memory.Protect(0x4000, PAGE_READONLY); changed = true; }
@@ -178,7 +199,9 @@ bool TestProcessImageMappings(const std::filesystem::path& root, const std::file
             };
             observer.Before = [&](size_t call)
             {
+                if (mode == L"cancel-after-read" && call == 2) { cancellation.store(true); }
                 if (call != finalCall) { return; }
+                if (mode == L"cancel-final") { cancellation.store(true); }
                 if (mode == L"final") { memory.Protect(0x2000, PAGE_READONLY); changed = true; }
                 if (mode == L"free") { memory.Release(); changed = true; }
             };
@@ -189,9 +212,8 @@ bool TestProcessImageMappings(const std::filesystem::path& root, const std::file
             options.MappingObserver = &observer;
             ImageVerificationRecipe recipe;
             std::wstring error;
-            const std::atomic<bool> cancellation{mode == L"cancel"};
             const auto directory = root / (L"mapping-" + mode);
-            if (!CaptureObservedImageRecipe(reference.wstring(), selected, base, mode == L"cross" ? 0x1ffc : 0x2000,
+            if (!CaptureObservedImageRecipe(reference.wstring(), reader, base, mode == L"cross" ? 0x1ffc : 0x2000,
                 mode == L"cross" ? 8 : 4096, directory.wstring(),
                 options, &recipe, &error, &cancellation))
                 { std::wcerr << L"mapping capture " << mode << L": " << error << L"\n"; return false; }
@@ -199,11 +221,14 @@ bool TestProcessImageMappings(const std::filesystem::path& root, const std::file
             check(recipe.FormatVersion == 3 && !ImageRecipeJson(recipe).empty(), "v3 bounded original mapping capture");
             const auto assessment = AssessImageProcessMappings(recipe);
             const bool conflict = mode == L"protect" || mode == L"modified-conflict" || mode == L"final" || mode == L"free" || mode == L"remap";
-            const bool unavailable = mode == L"exited" || mode == L"cancel";
+            const bool interrupted = mode == L"cancel" || mode == L"cancel-on-return" || mode == L"cancel-after-read" || mode == L"cancel-final";
+            const bool unavailable = mode == L"exited" || interrupted;
             check(assessment.Status == (conflict ? L"inconsistent_capture" : unavailable ? L"unavailable" : L"consistent_observations"),
                 "observed mapping transition selects expected status");
             check(!assessment.NativeImageMappingObserved, "private or mapped buffers are never native image observations");
-            if (mode == L"stable") { finalCall = 2 * recipe.Reads.size() + 1; }
+            if (mode == L"stable") { finalCall = 2 * recipe.Reads.size() + 1; lastCall = observer.Calls; }
+            check(recipe.ReadSet.Cancelled == interrupted, "only a recorded interruption marks the acquisition");
+            if (mode == L"cancel-late") { check(cancellation.load(), "stop requested after the last completed observation"); }
             if (conflict || mode == L"aba" || mode == L"neighbor") { check(changed, "mutation actually completed"); }
             if (mode == L"exited")
             {

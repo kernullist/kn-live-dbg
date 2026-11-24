@@ -364,8 +364,15 @@ bool ParseImageRecipe(const std::wstring& json, ImageVerificationRecipe* recipe,
 
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay)
 {
+    // This representation is embedded byte-for-byte in historical approval assessments.
+    return ImageRecipeReplayJson(replay, false);
+}
+
+std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay, bool includeCaptureOutcome)
+{
     return L"{\"schema\":" + mcpjson::Quote(replay.Schema) + L",\"status\":" + mcpjson::Quote(replay.Status) +
         L",\"mode\":" + mcpjson::Quote(replay.Mode) +
+        (includeCaptureOutcome && replay.CaptureInterrupted ? L",\"capture_interrupted\":true" : L"") +
         (replay.Schema == L"kn.image_sweep_replay.v1" ? L",\"manifest_sha256\":" + mcpjson::Quote(replay.ManifestSha256) :
             L",\"recipe_sha256\":" + mcpjson::Quote(replay.RecipeSha256)) +
         L",\"recorded_policy\":" + mcpjson::Quote(replay.RecordedPolicy) + L",\"current_policy\":" + mcpjson::Quote(replay.CurrentPolicy) +

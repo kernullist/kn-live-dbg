@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 
 from image_claim_oracle import check_report, check_original_claim, unpack_recipe
 
@@ -80,6 +81,91 @@ def child(image, mode):
     finally:
         if not kernel.VirtualFree(base, 0, 0x8000):
             raise ctypes.WinError(ctypes.get_last_error())
+
+
+def signal_capture(event, program, command):
+    """Send the signal only inside a fresh console owned by this test."""
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    handler_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    handler = handler_type(lambda kind: kind in (0, 1))
+    kernel.SetConsoleCtrlHandler.argtypes = [handler_type, wintypes.BOOL]
+    kernel.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
+    kernel.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]
+
+    def members():
+        ids = (wintypes.DWORD * 8)()
+        count = kernel.GetConsoleProcessList(ids, len(ids))
+        if not 0 < count <= len(ids):
+            raise RuntimeError("could not enumerate the isolated console")
+        return set(ids[:count])
+
+    if event not in (0, 1) or len(command) != 9 or command[0] != "--verify-process-image":
+        raise ValueError("invalid capture control trial")
+    case = Path(command[7])
+    if case.exists() or members() != {os.getpid()}:
+        raise RuntimeError("control trial requires a new case and its own console")
+    if not kernel.SetConsoleCtrlHandler(handler, True):
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        with subprocess.Popen([program, *command], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as capture:
+            try:
+                deadline = time.monotonic() + 30
+                while not case.is_dir():
+                    if capture.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("capture did not create its new case")
+                    time.sleep(0.001)
+                # The capture creates the directory after opening the target and reference.
+                if members() != {os.getpid(), capture.pid}:
+                    raise RuntimeError("unexpected console membership at interruption")
+                if not kernel.GenerateConsoleCtrlEvent(event, 0):
+                    raise ctypes.WinError(ctypes.get_last_error())
+                out, err = capture.communicate(timeout=45)
+                print(json.dumps({"code": capture.returncode, "stdout": out.decode("utf-8"), "stderr": err.decode("utf-8")}))
+            finally:
+                if capture.poll() is None:
+                    capture.kill()
+                    capture.wait(timeout=10)
+    finally:
+        kernel.SetConsoleCtrlHandler(handler, False)
+
+
+def run_console_capture(exe, command, event):
+    start = subprocess.STARTUPINFO()
+    start.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    start.wShowWindow = subprocess.SW_HIDE
+    output = subprocess.check_output([sys.executable, "-B", str(Path(__file__).resolve()), "--signal-capture",
+                                      str(event), str(exe), *map(str, command)], timeout=100,
+                                     creationflags=subprocess.CREATE_NEW_CONSOLE, startupinfo=start)
+    return json.loads(output)
+
+
+def capture_interruptions(exe, command, root, check):
+    # The overlay leaves the mapped PE unchanged and gives the controller time
+    # to observe creation of the case during publication of the reference copy.
+    reference = root / "signal-reference.exe"
+    shutil.copyfile(command[3], reference)
+    with reference.open("ab") as overlay:
+        overlay.truncate(32 * 1024 * 1024)
+    retained = []
+    for event, name in ((0, "ctrl-c"), (1, "ctrl-break")):
+        case = root / name
+        args = command.copy()
+        args[3], args[7] = reference, case
+        diagnostic = run_console_capture(exe, args, event)
+        check(diagnostic["code"] == 1 and not diagnostic["stderr"], f"{name} exits with an interrupted acquisition")
+        result = json.loads(diagnostic["stdout"])
+        check(result["status"] == "interrupted" and result["original_claim_recorded"] and
+              result["result"]["ownership"] == "owned_unverified", "observed stop publishes an incomplete comparison")
+        payload = unpack_recipe(json.loads((case / "recipe.knverify").read_bytes()))["payload"]
+        reads = payload["read_set"]
+        invoked = [r for r in reads["reads"] if r["source_invoked"]]
+        check(reads["operation_id"] == result["operation_id"] and reads["cancelled"] and reads["recording_complete"] and
+              int(reads["charged_source_calls"]) == len(invoked) and
+              int(reads["charged_requested_bytes"]) == sum(int(r["requested_bytes"]) for r in invoked),
+              "interrupted recording retains exactly its actual source work")
+        retained.append((case, result["result"], payload["reference_sha256"]))
+    reference.unlink()
+    return retained
 
 
 def check_capture_streams(exe, command, root, check):
@@ -281,8 +367,10 @@ def main():
                 check(run(command, 1)["status"] == "failed" and manifest.read_bytes() == original,
                       "an existing case is never replaced")
                 undelivered = None
+                interrupted = []
                 if mode == "clean":
                     check_capture_streams(exe, command, root, check)
+                    interrupted = capture_interruptions(exe, command, root, check)
                     undelivered = root / "stdout-failed"
                     output_command = command.copy()
                     output_command[7] = undelivered
@@ -304,6 +392,22 @@ def main():
                       "post-exit replay survives original reference replacement and removal")
                 if undelivered is not None:
                     check(replay(undelivered)["status"] == "replayed", "case survives failed stdout delivery and target exit")
+                for case, recorded, digest in interrupted:
+                    original_stop = replay(case)
+                    current_stop = replay(case, current=True)
+                    check(original_stop["capture_interrupted"] and current_stop["capture_interrupted"] and
+                          original_stop["result"] == original_stop["recorded_result"] == recorded,
+                          "interruption and original scope replay after target exit and reference removal")
+                    if case.name == "ctrl-break":
+                        store = root / "signal-archive"
+                        run(["--offline", "!kmon", "init-store", store, "/acl-only", "/json"])
+                        archived = run(["--offline", "!kmon", "journal-image", case, store, "1", "/json"])
+                        check(archived["closed"] and archived["indexed"], "interrupted case has a closed journal")
+                        (case / "recipe.knverify").unlink()
+                        (case / (digest + ".knblob")).unlink()
+                        case.rmdir()
+                        archived_report = run(["--offline", "!kmon", "replay-image", store / archived["capture_path"], "/json"])
+                        check(archived_report == original_stop, "managed replay reproduces the interrupted case after direct case removal")
                 current = replay(directory, current=True)
                 check(current["status"] == "reanalyzed" and current["result"] == exact["result"], "current policy uses only retained inputs")
                 check(not exact["execution_observed"] and not exact["collector_authenticated"], "read evidence does not prove execution or collector trust")
@@ -347,5 +451,7 @@ def main():
 if __name__ == "__main__":
     if len(sys.argv) == 4 and sys.argv[1] == "--child":
         child(sys.argv[2], sys.argv[3])
+    elif len(sys.argv) == 13 and sys.argv[1] == "--signal-capture":
+        signal_capture(int(sys.argv[2]), sys.argv[3], sys.argv[4:])
     else:
         main()

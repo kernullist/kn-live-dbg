@@ -329,7 +329,7 @@ int wmain(int argc, wchar_t** argv)
     if ((argc == 3 || (argc == 4 && std::wstring(argv[3]) == L"/current")) && std::wstring(argv[1]) == L"--report")
     {
         const auto replay = ReplayImageRecipe(argv[2], argc == 4, nullptr);
-        std::cout << mcpjson::WideToUtf8(ImageRecipeReplayJson(replay)) << "\n";
+        std::cout << mcpjson::WideToUtf8(ImageRecipeReplayJson(replay, true)) << "\n";
         return replay.Status == L"replayed" || replay.Status == L"reanalyzed" ? 0 : 1;
     }
     if (argc == 3 && std::wstring(argv[1]) == L"--replay")

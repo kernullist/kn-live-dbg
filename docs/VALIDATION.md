@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Interrupted native image captures on 2026-11-24
+
+At `515ec42`, sending Ctrl+C or Ctrl+Break after the collector created the
+new case directory terminated it with Windows status `0xc000013a`. Neither
+run returned a report or published `recipe.knverify`. Each trial used a
+separate console containing only the test controller and its collector.
+
+The x64 Release collector read a 64-byte range from Windows `edgehtml.dll`
+loaded by an owned child. In the uninterrupted capture, all seven source
+reads ran and the selected bytes matched the child's own read. In the two
+interrupt trials the first attempted read recorded cancellation before calling
+the source. Ctrl+C and Ctrl+Break each returned exit 1, published the original
+claim and left the range unverified. After the child exited and the disposable
+reference and direct cases were removed, the journal reproduced all six
+original-policy and current-policy reports byte for byte from three records
+sharing one reference.
+
+The native mapping harness stopped acquisition before a read, while a
+completed read returned to the recorder, before its mapping recheck and at
+the final mapping queries. The recorder retained the bytes and native
+status returned by completed calls. The missing mapping observations left
+the requested range unverified. A stop after the last completed observation
+preserved the original result. The independent mapping and archive checks
+passed 653 assertions across 16 cases. They also covered a saved operation
+with only its cancellation flag changed and the embedded report format
+used for existing approvals.
+
+The product passed 241 live capture checks, 653 mapping and archive checks,
+3,088 command checks and 90 restricted-launch checks. Six historical replay
+reports also matched the previous binary byte for byte. Run
+`tools/validate-image-recipe.ps1` to generate the fixtures, then pass that
+directory with `--fixtures` and the Release CLI with `--exe` to
+`tools/test-live-image-recipe.py` and `tools/test-process-image-mappings.py`
+(add `--product` for the latter). A cooperative stop can finish an in-flight
+native call. Recovery after forced termination requires a published case.
+[Direct image capture and replay](ARCHITECTURE.md#exact-image-reference-replay)
+
 ## Live image capture output and original evidence on 2026-11-24
 
 At `3f71da0`, a failed capture appended 372 bytes to a disposable copy of

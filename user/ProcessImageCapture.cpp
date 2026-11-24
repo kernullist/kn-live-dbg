@@ -194,7 +194,9 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
     {
         error = L"image capture could not materialize bounded artifacts";
     }
-    const auto json = L"{\"schema\":\"kn.image_capture.v3\",\"status\":" + mcpjson::Quote(captured ? L"recorded" : L"failed") +
+    const bool interrupted = captured && recipe.ReadSet.Cancelled;
+    const auto status = !captured ? L"failed" : interrupted ? L"interrupted" : L"recorded";
+    const auto json = L"{\"schema\":\"kn.image_capture.v3\",\"status\":" + mcpjson::Quote(status) +
         L",\"reference_sha256\":" + mcpjson::Quote(recipe.ReferenceSha256) + L",\"source_id\":" + mcpjson::Quote(recipe.SourceId) +
         L",\"operation_id\":" + mcpjson::Quote(recipe.ReadSet.OperationId) + L",\"target_id\":" + mcpjson::Quote(recipe.ReadSet.TargetId) +
         L",\"policy\":" + mcpjson::Quote(recipe.Policy) + L",\"consistency\":" + mcpjson::Quote(recipe.SourceConsistency) +
@@ -208,5 +210,5 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
     // A previously absent name can have acquired an identity during the operation.
     if (!ProtectCaptureOutput(sink, args, true, leases)) { return 2; }
     if (!WriteCapabilityJson(json)) { return 3; }
-    return captured && (!traceLoader || markerStatus == ERROR_SUCCESS) ? 0 : 1;
+    return captured && !interrupted && (!traceLoader || markerStatus == ERROR_SUCCESS) ? 0 : 1;
 }
