@@ -13,8 +13,10 @@ class ProcessObservationSource final : public IObservationSource, public IProces
 public:
     ProcessObservationSource(HANDLE process, uint32_t pid, uint64_t creation,
         const AddressSpaceDescriptor& addressSpace, ProcessHandleJournal& journal = ControllerProcessHandles(),
-        uint64_t parentAcquisition = 0) : Process(journal, ProcessHandleSite::ObservationSource, pid, creation), Pid(pid), Creation(creation)
+        uint64_t parentAcquisition = 0, ProcessHandleIdentity* collectorIdentity = nullptr)
+        : Process(journal, ProcessHandleSite::ObservationSource, pid, creation), Pid(pid), Creation(creation)
     {
+        if (collectorIdentity) { *collectorIdentity = {}; }
         Caps.AddressSpace = addressSpace;
         Caps.Consistency = L"handle_bound_single_read";
         Caps.UserOnly = true;
@@ -31,11 +33,15 @@ public:
                 break;
             }
             FILETIME created{}, exited{}, kernel{}, user{};
-            if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+            const auto collectorPid = GetCurrentProcessId();
+            const bool timed = GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user) != FALSE;
+            const auto status = timed ? ERROR_SUCCESS : GetLastError();
+            if (collectorIdentity) { *collectorIdentity = {collectorPid, status, timed ? TimeValue(created) : 0}; }
+            if (!timed || !TimeValue(created))
             {
                 break;
             }
-            Caps.SourceId = L"process_handle:" + std::to_wstring(GetCurrentProcessId()) + L":" +
+            Caps.SourceId = L"process_handle:" + std::to_wstring(collectorPid) + L":" +
                 std::to_wstring(TimeValue(created)) + L":" + std::to_wstring(Pid) + L":" +
                 std::to_wstring(Creation) + L":" + std::to_wstring(addressSpace.VirtualAddressBits) + L":" +
                 std::to_wstring(addressSpace.UserMaximum) + L":" + (addressSpace.LegacyAssumed ? L"assumed" : L"declared");

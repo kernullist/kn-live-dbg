@@ -10,7 +10,7 @@ enum class ProcessHandleSite
     SelfProbe, IdentityLookup, ObservationSource, TiImageLookup, KmonUserInventory, HuntPublicDetails, HuntPackageIdentity,
     LayoutCollection, LayoutVerification, ImageSweep, ReferenceVerification, PageCapture, DiagnosticIdentity,
     WatchMaintenance, WatchPromotion, LoggingIdentity, LoggingControl,
-    HandleSnapshotBefore, HandleSnapshotAfter, HandleGraphOwner
+    HandleSnapshotBefore, HandleSnapshotAfter, HandleGraphOwner, DirectImageCapture
 };
 enum class ProcessHandleCall { Open, Duplicate, Close };
 
@@ -75,7 +75,7 @@ public:
         ReleaseSRWLockExclusive(&Lock);
     }
 
-    ProcessHandleSnapshot Snapshot() const
+    ProcessHandleSnapshot Snapshot(bool includeControllerIdentity = true) const
     {
         ProcessHandleSnapshot snapshot;
         decltype(Rows) retained;
@@ -89,8 +89,11 @@ public:
         if (count)
         {
             snapshot.Actions.assign(retained.begin(), retained.begin() + count);
-            snapshot.ControllerPid = GetCurrentProcessId();
-            snapshot.ControllerCreateTime = ReadProcessHandleIdentity(GetCurrentProcess()).Created;
+            if (includeControllerIdentity)
+            {
+                snapshot.ControllerPid = GetCurrentProcessId();
+                snapshot.ControllerCreateTime = ReadProcessHandleIdentity(GetCurrentProcess()).Created;
+            }
         }
         return snapshot;
     }

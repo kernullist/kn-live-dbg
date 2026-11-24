@@ -390,6 +390,7 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
     uint32_t rva, uint32_t length, const std::wstring& newDirectory, ImageVerificationRecipe* recipe,
     std::wstring* error, const std::atomic<bool>* cancellation, const ImageRecipeCaptureOptions* options)
 {
+    if (options && options->PublishedRecipeSha256) { options->PublishedRecipeSha256->clear(); }
     if (error != nullptr)
     {
         *error = L"image capture requires a bounded source, an exact reference and a new local directory";
@@ -544,7 +545,7 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
     const auto json = ImageRecipeJson(p);
     // Re-evaluate only the retained reads before publishing the final root.
     // This performs no extra target read and binds the same observation digest.
-    const auto replay = json.empty() ? ImageRecipeReplay{} : EvaluateDirectImageRecipe(p, json, retained, metadata, false, error);
+    auto replay = json.empty() ? ImageRecipeReplay{} : EvaluateDirectImageRecipe(p, json, retained, metadata, false, error);
     const auto publication = replay.Status == L"replayed" ? ImageClaimPublicationJson(json, replay.ClaimAssessmentJson) : L"";
     if (publication.empty() || !retained.Unchanged() || !original.Unchanged() ||
         !SaveObservationJson((directory / L"recipe.knverify").wstring(), publication, error))
@@ -552,6 +553,7 @@ static bool CaptureImageRecipeImpl(const std::wstring& image, IObservationSource
         return false;
     }
     *recipe = std::move(p);
+    if (options && options->PublishedRecipeSha256) { options->PublishedRecipeSha256->swap(replay.RecipeSha256); }
     if (error != nullptr)
     {
         error->clear();

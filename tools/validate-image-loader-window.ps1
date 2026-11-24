@@ -13,7 +13,7 @@ $environment = Get-MsvcValidationEnvironment
 $trial = Join-Path $repo ('.build\image-loader-window\' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $trial | Out-Null
 $fixture = Join-Path $trial 'loader-window-selftest.exe'
-$units = @('ProcessImageCapture','ImageVerificationRecipe','ImageRecipeReadSet','ImageRecipeJson','ImageProcessMappings',
+$units = @('ProcessImageCapture','ProcessImageSourceReceipt','ImageVerificationRecipe','ImageRecipeReadSet','ImageRecipeJson','ImageProcessMappings',
     'ReferenceArtifact','ImageClaimPublication','ImageScopeClaimPublication','ImageSliceRecipe','ImageScopeClaims',
     'ImageSweepManifest','ImageSweepReplay','ObservationReadRoutingJson','ImageProof','ExecutableImage',
     'ExecutableImageVerifier','AnalystSnapshot','EtlProfile','EtlCaptureStatement','CommandRegistry')

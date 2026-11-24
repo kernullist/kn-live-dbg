@@ -69,6 +69,17 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("export.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Resume a kn.store_catalog_scan.v1 window with its cursor."))
 
+    def test_process_image_source_receipts(self):
+        samples = (dict(schema="kn.process_image_source.v1"), dict(schema="kn.image_source_replay.v1"),
+                   dict(requested_pid="1", requested_creation_filetime="3"),
+                   dict(acquisition_id="2", parent_acquisition_id="1", requested_filetime="3"),
+                   dict(pid="1", creation_filetime="3", win32_status="0"), dict(capture_status="failed", original_claim_matched=False))
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = json.dumps(sample).encode(encoding)
+                self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("capture.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Replay a saved kn.process_image_source.v1 receipt."))
+
     def test_store_file_ranges_and_positions(self):
         samples = [json.dumps(dict(schema="kn.store_file_scan.v1")), json.dumps(dict(next_file_cursor="", file_receipt="held")),
                    json.dumps(dict(file_offset="0", block_sha256="held")), json.dumps(dict(file_namespace_sha256="held", namespace_entries="3")),

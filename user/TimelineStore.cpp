@@ -3181,6 +3181,7 @@ static const wchar_t* ProcessHandleSiteName(ProcessHandleSite site)
     case ProcessHandleSite::HandleSnapshotBefore: return L"handle_snapshot_before";
     case ProcessHandleSite::HandleSnapshotAfter: return L"handle_snapshot_after";
     case ProcessHandleSite::HandleGraphOwner: return L"handle_graph_owner";
+    case ProcessHandleSite::DirectImageCapture: return L"direct_image_capture";
     }
     return L"unknown";
 }

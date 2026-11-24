@@ -50,6 +50,7 @@ struct ImageRecipeCaptureOptions
     IProcessMappingObserver* MappingObserver = nullptr;
     ObservationOperationBudget Budget{ImageRecipeReadBudget, ImageRecipeMaxReads, ImageRecipeMaxReads, 65536, 5000};
     image_loader::Window* LoaderWindow = nullptr;
+    std::wstring* PublishedRecipeSha256 = nullptr;
 };
 
 struct ImageRecipeReplay

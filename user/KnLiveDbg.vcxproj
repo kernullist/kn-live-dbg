@@ -259,6 +259,7 @@
     <ClCompile Include="ObservationReadRoutingJson.cpp" />
     <ClCompile Include="KmonImageReadSelfTest.cpp" />
     <ClCompile Include="ProcessImageCapture.cpp" />
+    <ClCompile Include="ProcessImageSourceReceipt.cpp" />
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
     <ClCompile Include="RebootEvent.cpp" />
     <ClCompile Include="EtlProfile.cpp" />
@@ -484,6 +485,7 @@
     <ClInclude Include="ObservationReadSetParser.h" />
     <ClInclude Include="BoundedObservationJson.h" />
     <ClInclude Include="ProcessImageCapture.h" />
+    <ClInclude Include="ProcessImageSourceReceipt.h" />
     <ClInclude Include="CrashDumpDiagnosis.h" />
     <ClInclude Include="RebootEvent.h" />
     <ClInclude Include="ArtifactOutput.h" />

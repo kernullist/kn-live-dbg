@@ -1,6 +1,7 @@
 #include "ProcessImageCapture.h"
 #include "ArtifactOutput.h"
 #include "ProcessObservationSource.h"
+#include "ProcessImageSourceReceipt.h"
 #include "ImageVerificationRecipe.h"
 #include "ImageLoaderWindow.h"
 #include "RuntimeCapabilities.h"
@@ -118,6 +119,56 @@ namespace
         }
         return true;
     }
+
+    bool ProtectSourceReplayOutput(HANDLE sink, const std::vector<std::wstring>& args, bool valid,
+        const std::wstring& imageCase, std::vector<DistinctArtifactInput>& leases)
+    {
+        if (GetFileType(sink) != FILE_TYPE_DISK) { return true; }
+        if (args.size() > 6) { return false; }
+        const auto hold = [&](const std::wstring& name)
+        {
+            auto& lease = leases.emplace_back();
+            return lease.Hold(sink, name, true) && OutsideCaptureDirectory(sink, lease.PinnedHandle());
+        };
+        for (size_t i = 2; i < args.size(); ++i)
+        {
+            if (valid && i != 2 && !(i == 4 && !imageCase.empty())) { continue; }
+            if (!hold(args[i])) { return false; }
+            std::filesystem::path path;
+            if ((!valid || i == 4) && symbol_artifacts::LocalRoot(args[i], &path) &&
+                _wcsicmp(path.extension().c_str(), L".kncapture") == 0 &&
+                !hold((path.parent_path().parent_path() / L"image-references").wstring())) { return false; }
+        }
+        return true;
+    }
+}
+
+int RunReplayImageSourceCommand(const std::vector<std::wstring>& args, bool directJsonOutput)
+{
+    const bool json = !args.empty() && _wcsicmp(args.back().c_str(), L"/json") == 0;
+    const auto fields = args.size() - (json ? 1 : 0);
+    const bool valid = (fields == 4 || fields == 5) && !args[2].empty() && args[3].size() == 64 &&
+        args[3].find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos &&
+        (fields != 5 || (!args[4].empty() && args[4][0] != L'/'));
+    const auto imageCase = valid && fields == 5 ? args[4] : L"";
+    const auto sink = GetStdHandle(valid ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE);
+    std::vector<DistinctArtifactInput> leases;
+    if (!ProtectSourceReplayOutput(sink, args, valid, imageCase, leases)) { return 2; }
+    if (!valid)
+    {
+        std::wcerr << L"usage: !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/json]\n";
+        return 2;
+    }
+    auto digest = args[3];
+    std::transform(digest.begin(), digest.end(), digest.begin(), towlower);
+    std::wstring output;
+    bool reproduced = false;
+    try { reproduced = ReplayProcessImageSource(args[2], digest, imageCase, output); }
+    catch (const std::exception&) { output = L"{\"schema\":\"kn.image_source_replay.v1\",\"status\":\"replay_failed\"}"; }
+    if (!ProtectSourceReplayOutput(sink, args, true, imageCase, leases)) { return 2; }
+    if (directJsonOutput) { if (!WriteCapabilityJson(output)) { return 3; } }
+    else { std::wcout << output << L"\n"; }
+    return reproduced ? 0 : 1;
 }
 
 int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation)
@@ -141,17 +192,20 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
     ImageVerificationRecipe recipe;
     bool captured = false;
     uint32_t openStatus = ERROR_SUCCESS;
+    ProcessHandleJournal sourceHandles;
+    ProcessImageSourceReceipt initialization;
+    initialization.RequestedPid = static_cast<DWORD>(pid);
+    initialization.RequestedCreation = creation;
     image_loader::Window window;
     image_loader::Registration registration;
     ULONG markerStatus = ERROR_NOT_READY;
     std::wstring recipeDigest;
     try
     {
-        std::unique_ptr<void, CloseHandleDeleter> process(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION,
-            FALSE, static_cast<DWORD>(pid)));
-        if (process == nullptr)
+        ObservedProcessHandle process(sourceHandles, ProcessHandleSite::DirectImageCapture, initialization.RequestedPid, creation);
+        if (!process.Open(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION))
         {
-            openStatus = GetLastError();
+            openStatus = process.Acquisition().Status;
             error = L"could not open the requested process";
         }
         else
@@ -162,7 +216,10 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
             // explicit legacy LA48 assumption in the retained source contract.
             AddressSpaceDescriptor space;
             space.UserMaximum = reinterpret_cast<uint64_t>(info.lpMaximumApplicationAddress);
-            ProcessObservationSource source(process.get(), static_cast<uint32_t>(pid), creation, space);
+            initialization.UserMaximum = space.UserMaximum;
+            ProcessObservationSource source(process.get(), initialization.RequestedPid, creation, space, sourceHandles,
+                process.Acquisition().AcquisitionId, &initialization.CollectorQuery);
+            initialization.SourceId = source.Capabilities().SourceId;
             if (source.Capabilities().SourceId.empty())
             {
                 error = L"process handle identity or supported address shape did not match";
@@ -179,12 +236,12 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
                 options.AddressSpaceId = options.TargetId + L":user";
                 options.AllowResidencyChanges = true;
                 options.MappingObserver = &source;
+                options.PublishedRecipeSha256 = &recipeDigest;
                 if (traceLoader) { options.LoaderWindow = &window; }
                 captured = CaptureObservedImageRecipe(args[2], source, base, static_cast<uint32_t>(rva),
                     static_cast<uint32_t>(length), args[6], options, &recipe, &error, cancellation);
                 if (traceLoader && captured)
                 {
-                    mcpjson::GetString(ImageRecipeJson(recipe), L"recipe_sha256", &recipeDigest);
                     markerStatus = registration.Publish(window, recipeDigest, recipe.Reads.size());
                 }
             }
@@ -195,6 +252,9 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
         error = L"image capture could not materialize bounded artifacts";
     }
     const bool interrupted = captured && recipe.ReadSet.Cancelled;
+    // Retain the source constructor's own collector query. A later snapshot
+    // must not perform a substitute identity query after initialization failed.
+    initialization.Actions = sourceHandles.Snapshot(false).Actions;
     const auto status = !captured ? L"failed" : interrupted ? L"interrupted" : L"recorded";
     const auto json = L"{\"schema\":\"kn.image_capture.v3\",\"status\":" + mcpjson::Quote(status) +
         L",\"reference_sha256\":" + mcpjson::Quote(recipe.ReferenceSha256) + L",\"source_id\":" + mcpjson::Quote(recipe.SourceId) +
@@ -204,9 +264,10 @@ int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const s
         L",\"collector_authenticated\":false,\"execution_observed\":false,\"residency_consent\":true,\"open_status\":" +
         std::to_wstring(openStatus) + L",\"error\":" + mcpjson::Quote(error) + L",\"result\":" +
         (captured ? recipe.RecordedResult : L"null") +
+        L",\"source_initialization\":" + ProcessImageSourceReceiptJson(initialization) +
+        L",\"recipe_sha256\":" + mcpjson::Quote(recipeDigest) +
         (traceLoader ? L",\"loader_marker_status\":" + std::to_wstring(markerStatus) +
-            L",\"loader_marker_submitted\":" + (captured && markerStatus == ERROR_SUCCESS ? L"true" : L"false") +
-            L",\"recipe_sha256\":" + mcpjson::Quote(recipeDigest) : L"") + L"}";
+            L",\"loader_marker_submitted\":" + (captured && markerStatus == ERROR_SUCCESS ? L"true" : L"false") : L"") + L"}";
     // A previously absent name can have acquired an identity during the operation.
     if (!ProtectCaptureOutput(sink, args, true, leases)) { return 2; }
     if (!WriteCapabilityJson(json)) { return 3; }

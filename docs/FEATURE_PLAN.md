@@ -71,6 +71,11 @@ The Gate 1 [interruption trial](VALIDATION.md#interrupted-native-image-captures-
 follows a cooperative stop through the original reads, the final mapping
 checks and post-exit replay of the published case.
 
+The direct process-image collector also preserves the
+[source acquisition and failure receipts](COMMAND_REFERENCE.md#replay-a-process-image-source-receipt)
+needed to distinguish a denied open, a mismatched process generation and
+a reference failure after a successful open.
+
 Implementation, integration, validation and deployment readiness are independent
 states. A package stays open when its required adapter, raw evidence, compatible
 environment or independent truth is missing. Preserve T01-T30 failure, negative,

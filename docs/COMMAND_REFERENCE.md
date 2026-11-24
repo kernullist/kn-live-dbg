@@ -513,7 +513,8 @@ exit 1 with `status=interrupted` and `original_claim_recorded=true`. The case
 retains completed reads, the cancelled observations and the original verdict
 for the requested range. `replay-image` reports `capture_interrupted=true`
 when it reproduces that case, including from a managed archive. A signal
-received after the final observation leaves the completed verdict intact.
+received after the final observation leaves the completed verdict intact. Capture
+stdout also includes the original handle actions. [Replay a process image source receipt](#replay-a-process-image-source-receipt)
 
 V3 also retains `VirtualQueryEx` calls before and after each read and a final
 query of each distinct read range. `result.mapping` separates consistent
@@ -995,6 +996,33 @@ lists label `providerTypeId` separately from opaque layout IDs and show the inde
 hash and unchecked runtime-invariant status. MCP `symbol.search` adds size
 availability, index hashes and a coverage note; incomplete results set `truncated`.
 See [index scope and limits](ARCHITECTURE.md#live-symbol-and-type-index-broker).
+
+### Replay a process image source receipt
+
+Save the capture command's UTF-8 stdout as a separate file, including on
+exit 1. Its `source_initialization` object records the requested PID and
+creation FILETIME, each process handle acquisition and close, their Win32
+results and the identities returned by the acquired handles. A failed
+`OpenProcess` has one attempt. A generation mismatch retains the creation
+time observed on the duplicate. A later reference failure can therefore
+have a ready source and an unsuccessful image capture. Read counts for a
+ready source come from the published read set.
+
+Supply the SHA-256 of the saved report. For a published image also supply
+its direct directory or managed `.kncapture` file. The command checks the
+recorded handle sequence and reproduces the original image claim before
+matching the source, operation, recipe digest and result.
+
+```powershell
+$pin = (Get-FileHash -LiteralPath $report -Algorithm SHA256).Hash
+& $exe --offline '!kmon' replay-image-source $report $pin $case /json
+```
+
+Omit `$case` for a failed capture. Exit 0 then means the acquisition
+receipt reproduced, and `capture_status` still reports `failed`. A
+published capture with a missing or mismatched case returns exit 1.
+Older capture reports return `source_receipt_missing`. Keep the report and
+its pin alongside an archived case to retain the source history.
 
 ## Trace an I/O request through completion
 

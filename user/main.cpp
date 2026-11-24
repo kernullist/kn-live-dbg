@@ -23132,6 +23132,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
+    std::wcout << L"  !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
     std::wcout << L"  !kmon replay-image-approval <assessment.knapprovalcase|assessment.knscopeapproval> <policy-sha256> [/current] [/json]\n";
@@ -23524,7 +23525,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
 {
     if (args.size() < 2 || ToLower(args[0]) != L"!kmon")
     {
-        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcerr << L"usage: KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image-source|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         return 2;
     }
     const auto action = ToLower(args[1]);
@@ -23722,6 +23723,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         else { std::wcout << json << L"\n"; } // Preserve interactive/MCP transcript capture.
         return replay.SummaryMatched ? 0 : 1;
     }
+    if (action == L"replay-image-source") { return RunReplayImageSourceCommand(args, directJsonOutput); }
     if (action == L"replay-image")
     {
         bool current = false, json = false, valid = args.size() >= 3 && args.size() <= 5 && !args[2].empty();
@@ -24146,7 +24148,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         return result.Gaps.empty() ? 0 : 1;
     }
 
-    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, journal-image, journal-image-approval, assess-image, replay-image-approval, replay-image, replay-irp, inventory, evidence, relate, graph, replay, or why\n";
+    std::wcerr << L"usage: --offline permits only !kmon trace, dump-read, verify-image, journal-image, journal-image-approval, assess-image, replay-image-approval, replay-image-source, replay-image, replay-irp, inventory, evidence, relate, graph, replay, or why\n";
     return 2;
 }
 
@@ -24979,7 +24981,7 @@ static void HandleKmonCommand(
             break;
         }
 
-        if (action == L"dump-read" || action == L"verify-image" || action == L"journal-image" || action == L"assess-image" || action == L"journal-image-approval" || action == L"replay-image-approval" || action == L"replay-image" || action == L"replay-irp" ||
+        if (action == L"dump-read" || action == L"verify-image" || action == L"journal-image" || action == L"assess-image" || action == L"journal-image-approval" || action == L"replay-image-approval" || action == L"replay-image-source" || action == L"replay-image" || action == L"replay-irp" ||
             action == L"inventory" || action == L"journal" || action == L"store" || action == L"evidence" || action == L"graph" || action == L"replay" || action == L"why")
         {
             RunKmonOfflineCommand(args);
@@ -54236,7 +54238,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::OwnedRead) << L"   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU sample, context switch, disk I/O and hard page fault records\n";
-        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|verify-image|journal-image|journal-image-approval|assess-image|replay-image-approval|replay-image-source|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
         std::wcout << L"  KnLiveDbg.exe --etl-rotation-set <inventory.jws> --sha256 <digest> --authority <capture_controller|archive_witness> <trusted-p256-point> [--member <ordinal> <local.etl>]...   verify ordered ETL files\n";

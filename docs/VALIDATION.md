@@ -7,6 +7,47 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Native process image source receipts on 2026-11-25
+
+At `cb35c1d`, a normal capture and a request with the wrong creation
+FILETIME both returned Win32 open status 0. The mismatched request failed
+before creating a case. A nonexistent PID returned 87. The previous
+capture reports omitted the action sequence and the generation observed
+on the opened process. The control used a child that loaded a disposable
+copy of Windows `version.dll`.
+
+The x64 Release collector recorded the same target before and after the
+test denied `PROCESS_VM_READ` on that process. Before denial the 64
+selected bytes matched the child's own read from a committed image mapping.
+After denial the original open returned 5, with zero acquisitions.
+The nonexistent PID returned 87. An independent Win32 open reproduced both
+errors. On a request for the wrong creation FILETIME, both acquired handles
+reported the child's actual generation and both closed. Removing the
+reference from a request left a ready source and a failed image capture.
+
+After target exit and reference removal, offline replay returned the recorded
+handle actions. Two captures of the same bytes both succeeded. Pairing the
+first report with the second case failed the operation match. The managed
+case reproduced the direct result after the direct files were removed. The
+source suite passed 127 checks. The parent independently verified each
+collector's creation time. Replay rejected a report with a zero collector
+creation time even when its source ID and external digest agreed with the
+edit. Redirecting output to hard links of the protected inputs preserved
+their contents and modification times.
+
+The live suite passed 247 checks, including source replay for Ctrl+C and
+Ctrl+Break. The mapping suite passed 653 checks across 16 cases, command
+regression passed 3,091 and restricted launch passed 90. Six original-policy
+and current-policy reports from three earlier cases remained byte-identical.
+Run the owned DLL trial from the repository root. Its optional `--root`
+retains the reports and journal in a new private directory.
+
+```powershell
+python -B tools/test-image-source-receipts.py --exe x64/Release/KnLiveDbg.exe
+```
+
+[Replay a process image source receipt](COMMAND_REFERENCE.md#replay-a-process-image-source-receipt)
+
 ## Interrupted native image captures on 2026-11-24
 
 At `515ec42`, sending Ctrl+C or Ctrl+Break after the collector created the

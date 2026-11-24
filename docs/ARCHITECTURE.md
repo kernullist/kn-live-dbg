@@ -295,7 +295,7 @@ completion, approved reference provenance, atomic mapping lifetime and execution
 are not established. `/current` explicitly returns unavailable for slice recipes;
 existing v1/v2 single-range recipe behavior is unchanged.
 
-Cross-bundle graph associations, image-collector initialization receipts, other KMON reader paths,
+Cross-bundle graph associations, KMON slice initialization receipts, other KMON reader paths,
 crash recovery/global retention, reference caching and native lifecycle validation
 remain open. These slices do not complete VS1.
 
@@ -3480,6 +3480,21 @@ outside it. The check runs before acquisition and again before delivery to
 account for paths created during capture. Malformed commands check the stream
 used for usage text. Restricted mode suppresses the disk diagnostic before it
 opens any named file. [Windows hard-link enumeration](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-findnextfilenamew)
+
+The direct process-image command uses one handle journal for its original
+open, the observation source's same-access duplicate and their closes.
+The acquisition rows carry Win32 call results and handle-bound PID and
+creation time. Sequence numbers order calls across UTC clock adjustments.
+The FILETIME values bracket each handle call. The identity check follows
+acquisition. Close rows refer to the original acquisition. The collector
+queries its own creation time only after the duplicate matches the requested
+process generation. The saved capture report retains these facts when an
+open fails, a generation differs or the source opens but the reference
+fails. A published capture also carries the digest of the inner recipe
+used to publish its original claim. Offline source replay checks this
+digest against the reproduced case. The capture report requires separate
+retention. The caller's file digest identifies the report bytes. Producer
+authentication requires a separate trust source. [Windows handle duplication](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
 
 The one-shot collector registers a console interrupt handler before opening
 the target. The handler sets a stop flag. Reads and mapping checks record when

@@ -163,7 +163,10 @@ def capture_interruptions(exe, command, root, check):
               int(reads["charged_source_calls"]) == len(invoked) and
               int(reads["charged_requested_bytes"]) == sum(int(r["requested_bytes"]) for r in invoked),
               "interrupted recording retains exactly its actual source work")
-        retained.append((case, result["result"], payload["reference_sha256"]))
+        report_file = root / (name + "-capture.json")
+        encoded = diagnostic["stdout"].encode("utf-8")
+        report_file.write_bytes(encoded)
+        retained.append((case, result["result"], payload["reference_sha256"], report_file, hashlib.sha256(encoded).hexdigest()))
     reference.unlink()
     return retained
 
@@ -392,12 +395,15 @@ def main():
                       "post-exit replay survives original reference replacement and removal")
                 if undelivered is not None:
                     check(replay(undelivered)["status"] == "replayed", "case survives failed stdout delivery and target exit")
-                for case, recorded, digest in interrupted:
+                for case, recorded, digest, capture_file, capture_pin in interrupted:
                     original_stop = replay(case)
                     current_stop = replay(case, current=True)
                     check(original_stop["capture_interrupted"] and current_stop["capture_interrupted"] and
                           original_stop["result"] == original_stop["recorded_result"] == recorded,
                           "interruption and original scope replay after target exit and reference removal")
+                    source = run(["--offline", "!kmon", "replay-image-source", capture_file, capture_pin, case, "/json"])
+                    check(source["original_claim_matched"] and source["capture_status"] == "interrupted" and
+                          source["source_initialization"]["status"] == "ready", "source opened before the interrupted observation")
                     if case.name == "ctrl-break":
                         store = root / "signal-archive"
                         run(["--offline", "!kmon", "init-store", store, "/acl-only", "/json"])
@@ -408,6 +414,9 @@ def main():
                         case.rmdir()
                         archived_report = run(["--offline", "!kmon", "replay-image", store / archived["capture_path"], "/json"])
                         check(archived_report == original_stop, "managed replay reproduces the interrupted case after direct case removal")
+                        managed_source = run(["--offline", "!kmon", "replay-image-source", capture_file, capture_pin,
+                                              store / archived["capture_path"], "/json"])
+                        check(managed_source == source, "original source actions and interrupted claim bind to the archived case")
                 current = replay(directory, current=True)
                 check(current["status"] == "reanalyzed" and current["result"] == exact["result"], "current policy uses only retained inputs")
                 check(not exact["execution_observed"] and not exact["collector_authenticated"], "read evidence does not prove execution or collector trust")
