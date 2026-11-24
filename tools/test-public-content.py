@@ -146,7 +146,7 @@ class PublicContentTests(unittest.TestCase):
 
     def test_saved_etl_comparison_archives_and_excerpts(self):
         self.assertEqual(AUDIT.path_rule(".knbench-etl-abc/summary.txt"), "local-state-directory")
-        for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17)):
+        for item in (b"KNETLBC1", b"KNETLBC1" + bytes(17), b"KNCORP1\0", b"KNCORP1\0" + bytes(12)):
             self.assertIn("private-benchmark-package", {f["rule"] for f in AUDIT.inspect("renamed.bin", item)})
         for row in (dict(schema="kn.etl_reader_archive.v1"), dict(schema="kn.etl_reader_comparison.v1"),
                     dict(schema="kn.etl_reader_evaluation.v1"), dict(schema="kn.etl_reader_comparison.v2"),
@@ -635,6 +635,17 @@ class PublicContentTests(unittest.TestCase):
                 self.assertTrue(AUDIT.inspect("transcript.txt", text.encode(encoding)))
                 self.assertTrue(AUDIT.inspect("renamed.log", ("banner\n" + json.dumps([obj])[:-1]).encode(encoding)))
         self.assertFalse(AUDIT.inspect("manual.md", b"Use kn.wait_investigation.v1 to check evidence_ids."))
+
+    def test_retained_corpus_private_records(self):
+        for row in (dict(schema="kn.benchmark_retention.v1"), dict(schema="kn.benchmark_retained_report.v1"),
+                    dict(schema="kn.benchmark_original_recovery.v1"), dict(package_sha256="a", original_sha256="b", original_bytes=0),
+                    dict(schema="kn.benchmark_original_files.v1"), dict(original_files=["sample.bin"]),
+                    dict(case_id="sample", original_status={"artifact_sha256": "missing"}),
+                    dict(missing_sha256=["f" * 64]), dict(package_sha256="a", results_sha256="b", corpus_sha256="c")):
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                data = ("record\n" + json.dumps({"nested": [row]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Read the missing_sha256 field in kn.benchmark_retained_report.v1."))
 
     def test_window_message_wait_exports(self):
         for row in (dict(schema="kn.wait_message_fixture.v1"), dict(receiver_tid=17, receiver_created="20"),

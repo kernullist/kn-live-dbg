@@ -7,6 +7,44 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Retained corpus originals on 2026-11-24
+
+Six sender traversals from five owned Windows workloads exercised the generic
+corpus packer and evaluator. The fixture's window procedure and sender recorded
+entry, reply, timeout and return separately from WCT. Those observations
+placed three query windows inside a synchronous wait and three after the
+sender had returned. All six belonged to one development group on one host.
+The plan and its exact byte hash were recorded before running the assessment.
+[Windows message-wait controls](#synchronous-window-message-waits-on-2026-11-24)
+
+| Retained inputs | Assessments with originals / planned | Positive findings / registered positives | Abstentions | Missing from scored results |
+| --- | --- | --- | --- | --- |
+| All 20 distinct originals | 6/6 | 3/3 | 3 | 0 |
+| 18 originals after omitting one truth reference and another case's assessment evidence | 4/6 | 1/3 | 3 | 2 |
+
+The complete package held six native receipts, five fixture records, the
+hole map, six investigation outputs, the tested collector executable and
+the replay policy source. A separate reader compared every member with its
+input. After all target processes exited, the recovery command returned each
+of the six native receipts and offline investigation reproduced all six
+saved outputs byte for byte. On the three negative controls the replayer
+abstained. The three observations supply no true-negative verdict.
+
+Regression checks covered missing tool and configuration inputs, empty and
+shared originals, concurrent publication to one filename, output aliases,
+wrong plan and package pins, and altered or truncated packages. Recovery
+also rejected damage after the selected member and preserved an occupied
+destination. A separately encoded boundary package held 4,096 synthetic
+cases and 16,386 distinct originals. A 620-entry file list recreated the
+20-object Windows package with the same SHA-256. The existing import,
+module and ETL evaluation paths returned byte-identical output on ten inputs
+compared with `475ebf0`. Terminating a writer after 70,977 bytes reached its
+temporary file left that file available for inspection. The destination was
+absent, the source hash matched and a retry published successfully.
+These checks cover byte retention and replay of the owned workload.
+Other imported assessments retain the trust level of their original labels.
+[Retain and recover originals](BENCHMARK_CORPUS.md#retain-and-recover-imported-originals)
+
 ## Synchronous window-message waits on 2026-11-24
 
 The x64 Release collector with SHA-256 prefix `46924bf4a363` captured two

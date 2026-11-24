@@ -2,7 +2,8 @@
 
 `tools/evaluate-corpus.py` supports imported case-level declarations, replay
 of Windows module-observation workloads, and a paired reading of a saved ETL. An imported
-report records the hashes supplied by its author. The workload adapter reads
+report records the hashes supplied by its author. A [retained corpus](#retain-and-recover-imported-originals)
+also checks the bytes behind those hashes and can recover individual originals. The workload adapter reads
 the retained files, checks controller and observer records against each other,
 and calculates metrics for the two measured populations. The evidence layers
 are `synthetic`, `owned_fixture`, `authorized_sample` and `independent_comparison`.
@@ -502,6 +503,79 @@ and duplicate assessments fail. Keep repeated runs in separate result files;
 the evaluator does not choose the best repeat or merge them into independent
 samples. Findings from another scope or another tool policy require a separately
 adjudicated assessment, not automatic conversion into false positives.
+
+## Retain and recover imported originals
+
+Keep the SHA-256 of the corpus plan before scoring. Give the evaluator the
+two original JSON files, that pin, a new package filename and one `--original`
+argument per available file. It hashes each supplied file and accepts bytes
+referenced by a case, an assessment or the tool configuration. A shared file
+occupies one entry. Omit an unavailable file to keep its absence in the report.
+For a long list, pass `--file-list <file>` with a UTF-8 JSON object containing
+`schema` set to `kn.benchmark_original_files.v1` and an `original_files`
+array of local paths. Relative entries resolve from the list's directory.
+The operator selects this input explicitly. Keep it private with the originals.
+The publication receipt gives the SHA-256 of the completed package. Store the
+two pins separately from the package.
+
+This example starts with the 14-case synthetic corpus from the test suite and
+retains the first case's source bytes. Run it in PowerShell from the checkout.
+
+```powershell
+$dir = Join-Path (Join-Path $PWD.Path '.build') ('retained-corpus-' + [guid]::NewGuid().ToString('N'))
+python -B tools/test-corpus-evaluator.py --example-directory $dir
+if ($LASTEXITCODE -ne 0) { throw 'Example corpus creation failed' }
+$corpus = Join-Path $dir 'corpus.json'
+$results = Join-Path $dir 'results.json'
+$archive = Join-Path $dir 'example.knbench'
+$source = Join-Path $dir 'case-source.bin'
+[IO.File]::WriteAllBytes($source, [Text.Encoding]::ASCII.GetBytes('case-0'))
+$plan = (Get-FileHash -Algorithm SHA256 -LiteralPath $corpus).Hash.ToLowerInvariant()
+$saved = python -B tools/evaluate-corpus.py --corpus $corpus --results $results --plan-sha256 $plan --write-archive $archive --original $source | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Corpus publication failed' }
+$pin = $saved.package_sha256
+$report = python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw 'Corpus replay failed' }
+$report.coverage.case_originals.artifact_sha256
+$key = (Get-Content -LiteralPath $corpus -Raw | ConvertFrom-Json).cases[0].artifact_sha256
+$copy = Join-Path $dir 'recovered.bin'
+python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan --get-original $key --destination $copy
+if ($LASTEXITCODE -ne 0 -or (Get-FileHash -Algorithm SHA256 -LiteralPath $copy).Hash -ne $key) { throw 'Original recovery failed' }
+```
+
+In this example one of 14 artifact references has verified bytes. The tool
+binary, configuration and assessment evidence are absent, so zero assessments
+qualify and all seven registered positives remain in the recall denominator.
+For a fully retained case, supply its artifact and hole map, its declared truth
+reference, the assessment's evidence, and the tool binary and configuration.
+An unknown truth can have a null reference. An assessment without an evidence
+reference remains visible with its declared outcome and cannot earn a score.
+
+Replay streams every stored original, checks its SHA-256 and verifies both
+package and plan pins. The results must bind the exact corpus bytes. The
+`kn.benchmark_retained_report.v1` report shows the original outcome and the
+status of each role for each case. `coverage.missing_sha256` identifies the
+missing distinct files. The scoped and per-family metrics use assessments with
+all required originals. Every registered case contributes to the planned count.
+Observable-scope rates use the observed subset. The report retains the
+submitted labels and timings. Attribution of authorship, independent truth
+adjudication and another execution of the tool require separate evidence.
+
+Recovery verifies the entire package before writing the requested bytes to a
+new file. A missing digest, inconsistent member, trailing bytes or wrong pin
+returns exit 2. Existing destinations keep their contents. Keep packages,
+reports, recovery receipts and recovered files in private storage.
+If the writer process terminates before publication, a private
+`.knbench-*.tmp` file can remain beside the requested destination.
+
+The binary format starts with the eight bytes `KNCORP1\0` and three unsigned
+little-endian 32-bit integers giving corpus length, results length and original
+count. The two unchanged UTF-8 documents follow. Each original contains a
+32-byte SHA-256, an unsigned little-endian 64-bit byte count and the bytes
+themselves. Empty originals are valid. The package holds up to 16,386 distinct
+originals and 8 GiB overall. Each JSON input retains its 8 MiB limit. The
+writer's 8 GiB read budget includes duplicate input files. Archive entries
+contain no filesystem paths. [Windows acquisition checks](VALIDATION.md#retained-corpus-originals-on-2026-11-24)
 
 ## Imported report semantics
 

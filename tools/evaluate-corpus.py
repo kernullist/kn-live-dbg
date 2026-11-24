@@ -1,11 +1,14 @@
 """Evaluate imported declarations or replay a pinned acquisition offline."""
 import argparse
 from collections import Counter, defaultdict
+from contextlib import ExitStack
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 import sys
 
 
@@ -15,6 +18,7 @@ MAX_JSON_DEPTH = 128
 JSON_DELIMITERS = re.compile(rb'\\.|"|[\[\]{}]')
 LAYERS = {"synthetic", "owned_fixture", "authorized_sample", "independent_comparison"}
 OUTCOMES = ("positive", "negative", "abstain", "unavailable", "error", "missing")
+SCOPE_FIELDS = ("layer", "partition", "task", "unit")
 
 
 class InvalidCorpus(ValueError):
@@ -147,6 +151,7 @@ def validate_results(results, corpus_hash, cases):
         elapsed = row["elapsed_us"]
         require(elapsed is None or type(elapsed) is int and 0 <= elapsed <= (1 << 64) - 1, "invalid elapsed_us")
         by_id[row["case_id"]] = row
+    require(len({tuple(c[k] for k in SCOPE_FIELDS) for c in cases.values()}) <= 512, "too many comparison scopes")
     return by_id
 
 
@@ -205,25 +210,28 @@ def summarize(cases, assessments):
     }
 
 
-def evaluate(corpus, corpus_hash, results, results_hash):
-    cases = validate_corpus(corpus)
-    assessments = validate_results(results, corpus_hash, cases)
+def comparison_scopes(cases, assessments):
     cohorts = defaultdict(list)
     families = defaultdict(list)
     for case in cases.values():
-        key = tuple(case[field] for field in ("layer", "partition", "task", "unit"))
+        key = tuple(case[field] for field in SCOPE_FIELDS)
         cohorts[key].append(case)
         families[key + (case["family"],)].append(case)
-    require(len(cohorts) <= 512, "too many comparison scopes")
     scopes = []
     for key, selected in sorted(cohorts.items()):
-        scope = dict(zip(("layer", "partition", "task", "unit"), key))
+        scope = dict(zip(SCOPE_FIELDS, key))
         scope["metrics"] = summarize(selected, assessments)
         scope["families"] = [
             {"family": family, "metrics": summarize(families[key + (family,)], assessments)}
             for family in sorted({case["family"] for case in selected})
         ]
         scopes.append(scope)
+    return scopes
+
+
+def evaluate(corpus, corpus_hash, results, results_hash):
+    cases = validate_corpus(corpus)
+    assessments = validate_results(results, corpus_hash, cases)
     return {
         "schema": "kn.benchmark_report.v1", "corpus_id": corpus["corpus_id"],
         "cohort_id": corpus["cohort_id"], "run_id": results["run_id"],
@@ -232,7 +240,7 @@ def evaluate(corpus, corpus_hash, results, results_hash):
         "assessment_basis": "imported_declarations", "artifacts_opened": False,
         "ground_truth_authenticated": False, "target_probed": False,
         "overall_ranking": None, "independent_detection_validation": False,
-        "scopes": scopes,
+        "scopes": comparison_scopes(cases, assessments),
     }
 
 
@@ -331,14 +339,78 @@ def evaluate_campaign(path, snapshot_pin, plan_pin):
     return report
 
 
+def retained_command(args, protected):
+    import retained_corpus as archive
+    from saved_etl_comparison import outputs_safe, write_result
+
+    digest(args.plan_sha256, "registered corpus pin")
+    with ExitStack() as inputs:
+        stream = None
+        if args.write_archive:
+            corpus_raw = archive.document_bytes(args.corpus)
+            results_raw = archive.document_bytes(args.results)
+        else:
+            digest(args.sha256, "package pin")
+            stream = inputs.enter_context(archive.regular_file(args.archive_corpus))
+            corpus_raw, results_raw, originals = archive.read(stream, args.sha256, args.plan_sha256)
+        corpus_pin = hashlib.sha256(corpus_raw).hexdigest()
+        require(corpus_pin == args.plan_sha256, "registered corpus SHA-256 mismatch")
+        corpus, results = decode_document(corpus_raw), decode_document(results_raw)
+        cases = validate_corpus(corpus)
+        assessments = validate_results(results, corpus_pin, cases)
+        tool = results["tool"]
+        allowed = archive.references(cases, assessments, tool)
+        if not args.write_archive:
+            require(originals.keys() <= allowed, "unreferenced object in retained corpus")
+        if args.write_archive:
+            report = archive.seal(args.write_archive, corpus_raw, results_raw, args.original, allowed)
+        elif args.get_original is not None:
+            digest(args.get_original, "original pin")
+            require(args.get_original in originals, "requested original was not retained")
+            extent = originals[args.get_original]
+            archive.restore(stream, args.destination, args.get_original, extent)
+            report = dict(schema="kn.benchmark_original_recovery.v1", package_sha256=args.sha256, corpus_sha256=corpus_pin,
+                          original_sha256=args.get_original, original_bytes=extent[1])
+        else:
+            scored, coverage = archive.evidence(cases, assessments, tool, originals.keys(), allowed)
+            report = dict(schema="kn.benchmark_retained_report.v1", corpus_id=corpus["corpus_id"], cohort_id=corpus["cohort_id"],
+                          run_id=results["run_id"], environment=corpus["environment"], tool=tool, package_sha256=args.sha256,
+                          corpus_sha256=corpus_pin, results_sha256=hashlib.sha256(results_raw).hexdigest(),
+                          assessment_basis="imported_assessments_with_verified_original_bytes", coverage=coverage,
+                          assessments_with_originals_per_planned_case=ratio(len(scored), len(cases)),
+                          assessments_with_originals_per_submitted=ratio(len(scored), len(assessments)),
+                          ground_truth_authenticated=False, outcomes_independently_replayed=False,
+                          target_probed=False, scopes=comparison_scopes(cases, scored))
+        raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, indent=2) + "\n").encode("ascii")
+        require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
+        return write_result(raw) if outputs_safe(protected, stream) else 2
+
+
 def main():
     # Check even malformed or repeated selectors before argparse can write usage to an evidence file.
     paired = any(arg.startswith("--sa") and "--saved-etl-comparison".startswith(arg.split("=", 1)[0])
                  for arg in sys.argv[1:])
-    if paired:
+    archive_flags = ("--archive-corpus", "--write-archive", "--original", "--get-original", "--destination", "--file-list")
+    archived = any(arg.startswith("--") and any(flag.startswith(arg.split("=", 1)[0]) for flag in archive_flags)
+                   for arg in sys.argv[1:])
+    protected = sys.argv[1:]
+    extra_files = []
+    if paired or archived:
         from saved_etl_comparison import outputs_safe
-        if not outputs_safe(sys.argv[1:]):
+        if not outputs_safe(protected):
             return 2
+    if archived:
+        from retained_corpus import listed_originals
+        try:
+            extra_files = listed_originals(protected, decode_document)
+        except (OSError, ValueError, RecursionError):
+            if sys.stderr is not None and not stat.S_ISREG(os.fstat(sys.stderr.fileno()).st_mode):
+                print("corpus evaluation failed: invalid or unreadable original file list", file=sys.stderr)
+            return 2
+        if extra_files:
+            if not outputs_safe(extra_files):
+                return 2
+            protected = [*protected, *extra_files]
     cohort = any(arg.startswith("--e") and "--etl-reader-campaign".startswith(arg.split("=", 1)[0]) for arg in sys.argv[1:])
     if cohort:
         import saved_etl_campaign
@@ -347,11 +419,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--corpus", type=Path)
+    source.add_argument("--archive-corpus", type=Path, help="replay imported cases with their retained original bytes")
     source.add_argument("--owned-module-run", type=Path, help="private acquisition package from the native workload")
     source.add_argument("--owned-module-campaign", type=Path, help="frozen private campaign snapshot beside its packages")
     source.add_argument("--saved-etl-comparison", type=Path, help="private acquisition from capture-etl-comparison.py")
     source.add_argument("--etl-reader-campaign", type=Path, help="pinned registered ETL snapshot beside its original packages")
     parser.add_argument("--results", type=Path)
+    parser.add_argument("--write-archive", type=Path, help="retain imported documents and selected originals in a new private package")
+    parser.add_argument("--original", type=Path, action="append", default=[], help="original file to include, repeatable with --write-archive")
+    parser.add_argument("--file-list", type=Path, help="operator-selected kn.benchmark_original_files.v1 list of original paths")
+    parser.add_argument("--get-original", help="recover one retained original by SHA-256 after checking the entire corpus package")
+    parser.add_argument("--destination", type=Path, help="new file to receive the selected original bytes")
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     parser.add_argument("--study-sha256", help="independently retained corpus hash for a partitioned ETL campaign")
@@ -362,16 +440,25 @@ def main():
         parser.error("--etl-reader-campaign requires --sha256 and --plan-sha256")
     if args.saved_etl_comparison and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
         parser.error("--saved-etl-comparison requires only --sha256")
-    if args.corpus and (args.results is None or args.sha256 is not None or args.plan_sha256 is not None):
+    if args.write_archive and not (args.corpus and args.results and args.plan_sha256):
+        parser.error("--write-archive requires --corpus, --results and the registered --plan-sha256")
+    if (args.original or args.file_list is not None) and not args.write_archive:
+        parser.error("--original and --file-list require --write-archive")
+    if (args.get_original is not None or args.destination is not None) and not (args.archive_corpus and args.get_original and args.destination):
+        parser.error("--get-original and --destination belong together with --archive-corpus")
+    if args.archive_corpus and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):
+        parser.error("--archive-corpus requires --sha256 and --plan-sha256")
+    if args.corpus and (args.results is None or args.sha256 is not None or (args.plan_sha256 is not None and not args.write_archive)):
         parser.error("--corpus requires only --results")
     if args.owned_module_run and (args.sha256 is None or args.results is not None or args.plan_sha256 is not None):
         parser.error("--owned-module-run requires only --sha256")
     if args.owned_module_campaign and (args.sha256 is None or args.plan_sha256 is None or args.results is not None):
         parser.error("--owned-module-campaign requires --sha256 and --plan-sha256")
     try:
+        if args.write_archive or args.archive_corpus:
+            args.original.extend(extra_files)
+            return retained_command(args, protected)
         if args.saved_etl_comparison:
-            import os
-            import stat
             from saved_etl_comparison import local_path, replay, write_result
             path = local_path(args.saved_etl_comparison)
             flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NONBLOCK", 0)
@@ -399,8 +486,13 @@ def main():
         raw = (json.dumps(report, ensure_ascii=False, allow_nan=False, indent=2) + "\n").encode("utf-8")
         require(len(raw) <= 16 * 1024 * 1024, "report exceeds 16 MiB")
     except (OSError, ValueError, TypeError, RecursionError, OverflowError) as exc:
-        if (not paired or outputs_safe(sys.argv[1:])) and (not cohort or saved_etl_campaign.outputs_safe(sys.argv[1:], evaluator=True)):
-            print(f"corpus evaluation failed: {exc}", file=sys.stderr)
+        if archived:
+            from retained_corpus import OutputCollision
+            if isinstance(exc, OutputCollision):
+                return 2
+        if (not (paired or archived) or outputs_safe(protected)) and (not cohort or saved_etl_campaign.outputs_safe(sys.argv[1:], evaluator=True)):
+            reason = f"file I/O error {exc.errno}" if archived and isinstance(exc, OSError) else str(exc)
+            print(f"corpus evaluation failed: {reason}", file=sys.stderr)
         return 2
     if cohort:
         from saved_etl_comparison import write_result
