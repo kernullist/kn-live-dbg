@@ -2226,6 +2226,38 @@ the Windows event record ID and the timestamp from the export. Verifying
 which host and boot produced them requires independent evidence.
 [Event comparison boundaries](ARCHITECTURE.md#saved-whea-event-comparison)
 
+### Compare a reboot event with a saved dump
+
+Add `--reboot-log`, the archive's SHA-256 and an explicit record ID to
+`--crash-diagnose` to request `kn.crash_diagnosis.v3`. The input is a local
+Windows EVTX archive. In the example, PowerShell selects the most recent
+Kernel-Power 41 record in the archive. For a particular investigation,
+use the record ID from that incident's evidence.
+
+```powershell
+$dump = Get-Item -LiteralPath '.\saved-kernel.dmp'
+$log = Get-Item -LiteralPath '.\saved-system.evtx'
+$record = Get-WinEvent -FilterHashtable @{Path=$log.FullName; ProviderName='Microsoft-Windows-Kernel-Power'; Id=41} -MaxEvents 1 -ErrorAction Stop
+$dumpPin = (Get-FileHash -LiteralPath $dump.FullName -Algorithm SHA256).Hash
+$logPin = (Get-FileHash -LiteralPath $log.FullName -Algorithm SHA256).Hash
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $dumpPin --reboot-log $log.FullName --log-sha256 $logPin --record-id $record.RecordId
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+$report.status
+$report.reboot_event | Format-List status, requested_record_id, bugcheck_code_decimal, same_stop_code, same_stop_tuple
+```
+
+Exit 0 describes agreement between the dump header and the debugger.
+Read `reboot_event.status` for the comparison with the archive. A qualified
+nonzero dump stop and all five matching event fields give
+`matching_stop_tuple`. One differing field gives `different_stop_tuple`.
+A version-one event can corroborate or contradict the code alone.
+A zero or unavailable code leaves both comparisons null. The event time
+belongs to the Windows startup that recorded the earlier unclean shutdown.
+The report leaves the cause and host/boot provenance open. WHEA options
+can precede `--reboot-log` when both types of evidence are available.
+[Reboot event evidence boundaries](ARCHITECTURE.md#saved-reboot-event-comparison)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

@@ -15,10 +15,16 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
+CRASH_SCHEMAS = ("kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
+                 "kn.whea_event_comparison.v1", "kn.reboot_event_comparison.v1")
+EVENT_EXPORT_PROVIDER = re.compile(
+    r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:'''
+    r'''(?P<whea>Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})|'''
+    r'''Microsoft-Windows-Kernel-Power|\{331c3b3a-2005-44c2-ac5e-77220c37d6b4\})["']''')
 ETL_COMPARISON_SCHEMAS = ("kn.etl_reader_archive.v1", "kn.etl_reader_comparison.v1", "kn.etl_reader_evaluation.v1",
                           "kn.etl_reader_comparison.v2", "kn.etl_reader_evaluation.v2", "kn.etl_reader_comparison.v3",
                           "kn.etl_reader_evaluation.v3", "kn.etl_reader_plan.v1", "kn.etl_reader_admission.v1",
@@ -71,7 +77,7 @@ PRIVATE_FILE_RULES = (
     ("local-state-directory", re.compile(PRIVATE_DIRECTORY_NAME)),
     ("private-operation-journal", re.compile(r"\.knmcpjournal" + END_OF_NAME + r"|\.knmcpjournal\.tmp\.")),
     ("private-container-or-capture", re.compile(alternatives((
-        ".log.ll", ".etl.zip", ".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm",
+        ".log.ll", ".etl.zip", ".evtx.zip", ".kncampaign-journal", ".kncampaign-wal", ".kncampaign-shm",
         ".kncampaign", ".knruns")) + END_OF_NAME)),
     ("credential-file", re.compile(r"^\.env(?!\.example" + END_OF_NAME + ")|^" + alternatives(PRIVATE_NAMES) + END_OF_NAME)),
     ("private-container-or-capture", re.compile(
@@ -366,6 +372,7 @@ DETACHED_FIELD_SETS = READY_ORIGIN_FIELDS + WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIE
     ("notify_type", "creator", "revision", "record_id"),
     ("bank", "status", "valid", "matches_stop_status"),
     ("provider", "channel", "event_record_id", "system_time_utc"),
+    ("requested_record_id", "log_sha256", "same_stop_tuple"),
     ("valid_bits", "physical_address", "physical_address_mask", "error_type"),
     ("relation", "node_indices", "thread_created", "target_tid", "target_created"),
     ("kind", "round", "evidence", "target_tid", "target_created"),
@@ -529,6 +536,9 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if any(data.startswith(arch + tag) for arch in (b"x64\0", b"ia32\0", b"arm64\0") for tag in (b"C", b"M", b"G")):
         add("private-v8-code-log")
         return findings
+    if data.startswith((b"ElfFile\0", b"ElfChnk\0")):
+        add("private-windows-event-log")
+        return findings
     # ETL's first WMI buffer may contain a 32- or 64-bit system trace header.
     # Check the header buffer type and the Trace/Header record together.
     if (len(data) >= 80 and data[54:56] == b"\x04\x00" and
@@ -567,9 +577,9 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
         for encoding, lane, bom in (("utf-16-le", 1, b"\xff\xfe"), ("utf-16-be", 0, b"\xfe\xff")):
             prefix = data[lane:128:2]
             if (len(prefix) >= 8 and prefix.count(0) * 4 >= len(prefix) * 3 and
-                    any(tag.encode(encoding) in data for tag in ("kn.crash_diagnosis.v", "kn.whea_event_comparison.v1", "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
+                    any(tag.encode(encoding) in data for tag in (*CRASH_SCHEMAS, "kn.pending_io_trace.v1", "kn.etl_profile.v", "kn.etl_switches.v",
                                                                   "kn.wait_", "ey", "ew", "Files Processed:", *IO_TIMING_MARKERS, *STORE_REPORT_MARKERS, *STORE_RETENTION_MARKERS, *DISCLOSURE_MARKERS, *ETL_COMPARISON_MARKERS, *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, '"target_created"', '"begin_qpc"',
-                                                                 "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"virtual"', '"captured_sha256"', '"type_guid"',
+                                                                 "KNDBG_GAME_MANIFEST", "game_reported_registry_slot_v1", "v8-version,", "code-creation,", "tick,0x", "code-move,", "code-delete,", "code-source-info,", "code-disassemble,", "Provider", '"system_time_utc"', '"requested_record_id"', '"virtual"', '"captured_sha256"', '"type_guid"',
                                                                   '"notify_type"', '"matches_stop_status"', '"physical_address_mask"'))):
                 view = bom + data
                 break
@@ -590,12 +600,11 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             offset = capture_jws_offset(text)
             if offset is not None:
                 add("private-evidence-bundle", text.count("\n", 0, offset) + 1)
-        if (not binary or view is not data) and "Provider" in text and ("Microsoft-Windows-WHEA-Logger" in text or
-                "c26c4f3c-3f66-4e99-8f8a-39405cfed220" in text.lower()):
-            # Preserve exported Windows Event XML even after renaming or adding a log banner.
-            if re.search(r'(?im)(?:^|>)[ \t\r\n]*<(?:[\w.-]+:)?(?:Event|Provider)\b', text) and re.search(
-                    r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:Microsoft-Windows-WHEA-Logger|\{c26c4f3c-3f66-4e99-8f8a-39405cfed220\})["']''', text):
-                add("private-whea-event")
+        if (not binary or view is not data) and "Provider" in text and re.search(
+                r'(?im)(?:^|>)[ \t\r\n]*<(?:[\w.-]+:)?(?:Event|Provider)\b', text):
+            provider = EVENT_EXPORT_PROVIDER.search(text)
+            if provider:
+                add("private-whea-event" if provider["whea"] else "private-reboot-event")
         if (not binary or view is not data) and any(m in text for m in (
                 "saved_etl_probe", "kn.etl_capability_probe.v1", "saved_dump_probe", "kn.dump_capability_probe.v1")):
             # Outer scope and detached probe metadata can survive a truncated export.
@@ -620,7 +629,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
                     "kn.irp_capture.v1", "kn.irp_capture.v2", "kn.irp_replay.v1", "kn.irp_capture_session.v1", "kn.irp_retention.v1", "kn.irp_retention_keys.v1", "kn.irp_claim_report.v1", "kn.irp_claim_publication.v1", "kn.routed_reads.v1", "kn.image_reads.v1", "kn.image_reads.v2", "kn.image_reads.v3", "kn.image_read_session.v1",
                     "kn.image_slice.v1", "kn.image_slice.v2", "kn.image_slice_proof.v1", "kn.image_slice_inputs.v1", "kn.image_slice_replay.v1",
                     "kn.image_sweep.v1", "kn.image_sweep_replay.v1", "kn.image_sweep_proof.v1", "kn.image_sweep_graph.v1",
-                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.dump_read.v2", "kn.dump_initialization.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1",
+                    "kn.translation_receipt.v1", "kn.dump_read.v1", "kn.dump_read.v2", "kn.dump_initialization.v1", *CRASH_SCHEMAS,
                     "kn.authorized_image_changes.v1", "kn.image_approval_policy.v1", "kn.image_change_assessment.v1", "kn.image_scope_change_assessment.v1", "kn.image_scope_approval_publication.v1", "kn.image_scope_approval_collection.v1", "kn.image_scope_approval_replay.v1", "kn.image_scope_approval_session.v1", "kn.image_approval_publication.v1", "kn.image_approval_replay.v1", "kn.image_approval_collection.v1", "kn.image_approval_session.v1", "kn.image_recipe.v1", "kn.image_recipe.v2", "kn.image_recipe.v3", "kn.process_image_mappings.v1", "kn.process_image_mapping_assessment.v1", "kn.image_replay.v1", "kn.image_capture.v1", "kn.image_capture.v2", "kn.image_capture.v3", "kn.image_capture_collection.v1", "kn.image_capture_session.v1", "kn.image_proof.v1", "kn.image_claim_report.v1", "kn.image_claim_publication.v1", "kn.image_scope_claim_publication.v1", "kn.capture_scheduling.v1", "kn.reference_scheduling.v1", "kn.reference_scheduler_test.v1", "kn.image_scheduling.v1", "kn.image_scheduler_test.v1", "kn.discovery_scheduling.v1", "kn.discovery_scheduler_test.v1", "kn.discovery_scheduler_fixtures.v1", "kn.user_inventory.v1", "kn.user_module_observation_debt.v1", "kn.owned_module_workload.v1", "kn.user_inventory_test.v1", "kn.user_inventory_fixtures.v1", "kn.user_deep_scheduling.v1", "kn.user_deep_test.v1", "kn.user_deep_fixtures.v1", "kn.analysis_scheduling.v1", "kn.analysis_scheduler_test.v1", "kn.analysis_scheduler_fixtures.v1", "kn.publication_scheduling.v1", "kn.publication_timing.v1", "kn.collection_timing.v1", "kn.publication_picker_test.v1", "kn.publication_writer_test.v1", "kn.layout_collection_scheduling.v1", "kn.layout_verification_scheduling.v1", "kn.layout_scheduler_test.v1", "kn.layout_scheduling_fixture.v1", "kn.image_reference_preparation.v1", "kn.image_preparation_test.v1", "kn.image_preparation_core.v1",
                     "kn.evidence_graph.v1", "kn-live-dbg.hidden-process.v1", "kn.execution_evidence.v1", "kn.irp_observation.v1",
                     "kn.execution_trace.v1", "kn.execution_trace_query.v1", *TRACE_QUERY_SCHEMAS, "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8", "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3", "kn.mcp_operation.v1",
@@ -632,20 +641,20 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             except (ValueError, RecursionError):
                 pass
         # Reports can be logged with a preamble, reordered by a JSON exporter or cut during a write.
-        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or "kn.crash_diagnosis" in text or "kn.whea_event_comparison" in text or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
+        if ((not binary or view is not data) and ("kn.io_lifetime" in text or "kn.pending_io_trace" in text or any(tag in text for tag in CRASH_SCHEMAS) or "kn.etl_profile" in text or "kn.etl_switches" in text or any(tag in text for tag in TRACE_QUERY_SCHEMAS)) and
                 not any(f["rule"] == "private-evidence-bundle" for f in findings)):
-            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing|_port(?:_assessment)?)?\.v1|io_thread_wait(?:(?:s|_capture)(?:_receipt)?|_witness)\.v1|pending_io_trace\.v1|crash_diagnosis\.v[12]|whea_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12345]|etl_(?:operation|fault_file)_records\.v1|traceprocessor_(?:interrupt_window|disk_requests|file_operations)\.v1|owned_etl_handoff\.v[1234]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[1234]|etl_handoff_study(?:_receipt)?\.v5|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
+            marker = re.search(r'(?m)^[ \t]*\{\s*"schema"\s*:\s*"kn\.(?:io_lifetime(?:_assessment|_timing|_port(?:_assessment)?)?\.v1|io_thread_wait(?:(?:s|_capture)(?:_receipt)?|_witness)\.v1|pending_io_trace\.v1|crash_diagnosis\.v[123]|(?:whea|reboot)_event_comparison\.v1|v8_profile_query\.v1|etl_profile\.v[12345678]|etl_switches\.v[123]|etl_disk_io\.v1|etl_hard_faults\.v[123]|etl_activity_markers\.v1|etl_activity_comparison(?:_receipt)?\.v[12]|traceprocessor_activity_(?:rows|markers)\.v1|etl_activity_waits(?:_receipt)?\.v[12345]|etl_(?:operation|fault_file)_records\.v1|traceprocessor_(?:interrupt_window|disk_requests|file_operations)\.v1|owned_etl_handoff\.v[1234]|etl_handoff_markers\.v1|etl_handoff_(?:plan|study)(?:_receipt)?\.v[1234]|etl_handoff_study(?:_receipt)?\.v5|etl_handoff_capture(?:_receipt)?\.v1|execution_trace_query\.v2|etl_page_replay\.v[12]|etl_capture_statement\.v1|etl_rotation_(?:set|inventory)\.v1)"\s*(?:[,}]|$)', text)
             if marker:
                 add("private-evidence-bundle", text.count("\n", 0, marker.start()) + 1)
             else:
                 for number, line in enumerate(text.splitlines(), 1):
-                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.pending_io_trace" in line or "kn.crash_diagnosis" in line or "kn.whea_event_comparison" in line or "kn.etl_profile" in line or "kn.etl_switches" in line or any(tag in line for tag in TRACE_QUERY_SCHEMAS)):
+                    if not line.lstrip().startswith("{") or not ("kn.io_lifetime" in line or "kn.pending_io_trace" in line or any(tag in line for tag in CRASH_SCHEMAS) or "kn.etl_profile" in line or "kn.etl_switches" in line or any(tag in line for tag in TRACE_QUERY_SCHEMAS)):
                         continue
                     try:
                         row = json.loads(line)
                     except (ValueError, RecursionError):
                         continue
-                    if isinstance(row, dict) and row.get("schema") in (*TRACE_QUERY_SCHEMAS, *IO_LIFETIME_SCHEMAS, "kn.pending_io_trace.v1", "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.whea_event_comparison.v1", "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8", "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3"):
+                    if isinstance(row, dict) and row.get("schema") in (*TRACE_QUERY_SCHEMAS, *IO_LIFETIME_SCHEMAS, "kn.pending_io_trace.v1", *CRASH_SCHEMAS, "kn.etl_profile.v1", "kn.etl_profile.v2", "kn.etl_profile.v3", "kn.etl_profile.v4", "kn.etl_profile.v5", "kn.etl_profile.v6", "kn.etl_profile.v7", "kn.etl_profile.v8", "kn.etl_switches.v1", "kn.etl_switches.v2", "kn.etl_switches.v3"):
                         add("private-evidence-bundle", number)
                         break
         if ((not binary or view is not data) and '"virtual"' in text and
@@ -655,7 +664,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
             if frame:
                 add("private-evidence-bundle", text.count("\n", 0, frame.start()) + 1)
         if (not binary or view is not data) and any(key in text for key in
-                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, *ETL_COMPARISON_MARKERS, *IO_TIMING_MARKERS, *STORE_RETENTION_MARKERS, *DISCLOSURE_MARKERS)):
+                ('"captured_sha256"', '"type_guid"', '"notify_type"', '"matches_stop_status"', '"physical_address_mask"', '"system_time_utc"', '"requested_record_id"', '"target_created"', *ETL_ROW_MARKERS, *DUMP_EVIDENCE_MARKERS, *WAIT_PLAN_MARKERS, *ETL_COMPARISON_MARKERS, *IO_TIMING_MARKERS, *STORE_RETENTION_MARKERS, *DISCLOSURE_MARKERS)):
             line = detached_evidence_line(text)
             if line is not None:
                 add("private-evidence-bundle", line)

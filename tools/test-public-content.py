@@ -287,6 +287,23 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.log", sample.encode(encoding))})
         self.assertFalse(AUDIT.inspect("guide.md", ("See " + schema).encode()))
 
+    def test_saved_reboot_event_and_comparison(self):
+        self.assertIsNotNone(AUDIT.path_rule("system.EvTx"))
+        self.assertIsNotNone(AUDIT.path_rule("system.EVTX.zip"))
+        for identity in ("Name='Microsoft-Windows-Kernel-Power'", 'Guid="{331C3B3A-2005-44C2-AC5E-77220C37D6B4}"'):
+            export = "log\n" + "<Event><System><Provider " + identity + "/></System></Event>"
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-reboot-event", {f["rule"] for f in AUDIT.inspect("renamed.txt", export.encode(encoding))})
+        for signature in (b"ElfFile\0", b"ElfChnk\0"):
+            self.assertIn("private-windows-event-log", {f["rule"] for f in AUDIT.inspect("renamed.bin", signature + bytes(128))})
+        for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1"):
+            for text in (json.dumps({"status": "example", "schema": schema}),
+                         "log\n" + json.dumps({"schema": schema, "status": "example"}, indent=2)[:-3],
+                         "log\n" + json.dumps({"requested_record_id": "1", "log_sha256": "example", "same_stop_tuple": None})):
+                for encoding in ("utf-8", "utf-16", "utf-16-be"):
+                    self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("capture.txt", text.encode(encoding))})
+            self.assertFalse(AUDIT.inspect("guide.md", ("See " + schema).encode()))
+
     def test_whea_export_and_event_comparison(self):
         name = "Microsoft-Windows-WHEA-Logger"
         guid = "{c26c4f3c-3f66-4e99-8f8a-39405cfed220}"

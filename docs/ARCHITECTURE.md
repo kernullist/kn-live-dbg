@@ -4284,6 +4284,30 @@ missing evidence. Matching bytes corroborate the representation in the
 two inputs. Export provenance, host identity, boot identity and the
 cause of the crash remain separate questions.
 
+### Saved reboot event comparison
+
+The offline crash command accepts a separately pinned, fixed-drive EVTX
+archive up to 256 MiB. It holds the archive and its parent directories,
+gives Windows the volume path from the open handle and rechecks the file
+identity and SHA-256 after querying the saved record. A record is
+eligible only after enumeration returns exactly one result and reaches its
+end. The query records Windows errors and limits the rendered document to
+256 KiB. The shared System event reader checks the namespace, provider name
+and GUID, channel, record ID, UTC timestamp and named fields. A duplicate
+field or conflicting payload leaves the tuple unresolved.
+[Windows event queries](https://learn.microsoft.com/en-us/windows/win32/api/winevt/nf-winevt-evtquery)
+
+Kernel-Power 41 templates 2 through 10 supply a decimal stop code and four
+hexadecimal parameters. Version 1 supplies the code alone and version 0
+has no stop fields. A dump qualifies when its header and DbgEng agree at
+an initial stop, its attributes describe an ordinary dump, and its code is
+nonzero. The comparison preserves a missing parameter, a zero event code,
+a different tuple and an unavailable record as distinct outcomes. Host and
+boot identity require separate provenance. Windows writes the event during
+the next startup and can report a zero code after a bugcheck. Keep the
+archive and reports with the private dump.
+[Microsoft's Event 41 interpretation](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart)
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

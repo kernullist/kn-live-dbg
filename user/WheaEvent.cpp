@@ -1,5 +1,6 @@
 #include "WheaEvent.h"
 #include "WheaRecord.h"
+#include "RebootEvent.h"
 #include "SchemaArtifact.h"
 #include "SymbolArtifactCache.h"
 #include "McpJson.h"
@@ -22,6 +23,7 @@ namespace
     constexpr size_t MaxPayload = 1u << 20;
     constexpr View EventNamespace = L"http://schemas.microsoft.com/win/2004/08/events/event";
     constexpr wchar_t WheaProvider[] = L"{c26c4f3c-3f66-4e99-8f8a-39405cfed220}";
+    constexpr wchar_t PowerProvider[] = L"{331c3b3a-2005-44c2-ac5e-77220c37d6b4}";
 
     bool XmlSpace(wchar_t c) { return c == L' ' || c == L'\t' || c == L'\n' || c == L'\r'; }
 
@@ -60,7 +62,8 @@ namespace
     }
 
     enum class Group { Other, System, Data };
-    enum Field { None, Provider, Time, Id, Version, RecordId, Channel, Length, Raw, Count };
+    enum Field { None, Provider, Time, Id, Version, RecordId, Channel, Length, Raw,
+        StopCode, Parameter1, Parameter2, Parameter3, Parameter4, Count };
 
     bool Attribute(IXmlReader& reader, const wchar_t* name, std::wstring& out)
     {
@@ -82,6 +85,7 @@ namespace
 
     struct Event
     {
+        bool reboot = false;
         Group group = Group::Other;
         Field field = None;
         bool sawSystem = false, sawData = false, otherPayload = false;
@@ -141,8 +145,16 @@ namespace
                 std::wstring key;
                 if (Attribute(reader, L"Name", key))
                 {
-                    if (key == L"RawData") { field = Raw; }
-                    if (key == L"Length") { field = Length; }
+                    if (reboot)
+                    {
+                        if (key == L"BugcheckCode") { field = StopCode; }
+                        else if (key == L"BugcheckParameter1") { field = Parameter1; }
+                        else if (key == L"BugcheckParameter2") { field = Parameter2; }
+                        else if (key == L"BugcheckParameter3") { field = Parameter3; }
+                        else if (key == L"BugcheckParameter4") { field = Parameter4; }
+                    }
+                    else if (key == L"RawData") { field = Raw; }
+                    else if (key == L"Length") { field = Length; }
                 }
             }
             if (field == None) { return true; }
@@ -215,20 +227,30 @@ namespace
             return hr == S_FALSE;
         }
 
-        void Compare(const WheaRecord& dump)
+        struct Identity { uint64_t id, version, recordId; };
+
+        std::optional<Identity> Metadata(const wchar_t* name, const wchar_t* guid)
         {
-            if (!seen[Provider] || text[Provider] != L"Microsoft-Windows-WHEA-Logger" || providerGuid.size() != 38 ||
-                CompareStringOrdinal(providerGuid.c_str(), 38, WheaProvider, 38, TRUE) != CSTR_EQUAL ||
-                text[Channel] != L"System") { status = L"different_event_source"; return; }
+            if (!seen[Provider] || text[Provider] != name || providerGuid.size() != 38 ||
+                CompareStringOrdinal(providerGuid.c_str(), 38, guid, 38, TRUE) != CSTR_EQUAL ||
+                text[Channel] != L"System") { status = L"different_event_source"; return {}; }
             const auto id = Decimal(text[Id], UINT16_MAX), version = Decimal(text[Version], UINT8_MAX);
             const auto recordId = Decimal(text[RecordId], UINT64_MAX);
             if (!id || !version || !recordId || !*recordId || !UtcTimestamp(text[Time]))
-            { status = L"event_metadata_incomplete"; return; }
-            metadata = L"{\"provider\":\"Microsoft-Windows-WHEA-Logger\",\"channel\":\"System\",\"event_id\":" +
+            { status = L"event_metadata_incomplete"; return {}; }
+            metadata = L"{\"provider\":" + Quote(name) + L",\"channel\":\"System\",\"event_id\":" +
                 std::to_wstring(*id) + L",\"version\":" + std::to_wstring(*version) + L",\"event_record_id\":" +
                 Quote(std::to_wstring(*recordId)) + L",\"system_time_utc\":" + Quote(text[Time]) + L"}";
+            return Identity{*id, *version, *recordId};
+        }
+
+        void Compare(const WheaRecord& dump)
+        {
+            const auto identity = Metadata(L"Microsoft-Windows-WHEA-Logger", WheaProvider);
+            if (!identity) { return; }
+            const auto id = identity->id;
             // Version-zero WHEA-Logger manifest templates expose Length and RawData together.
-            if (*version != 0 || !((*id >= 1 && *id <= 3) || (*id >= 16 && *id <= 29) || (*id >= 40 && *id <= 47)))
+            if (identity->version != 0 || !((id >= 1 && id <= 3) || (id >= 16 && id <= 29) || (id >= 40 && id <= 47)))
             { status = L"unsupported_event_template"; return; }
             if (seen[Length]) { declaredBytes = Decimal(text[Length], UINT32_MAX); }
             if (!sawData || !seen[Raw]) { status = L"event_payload_missing"; return; }
@@ -259,22 +281,56 @@ namespace
         }
     };
 
-    void Parse(const std::vector<uint8_t>& bytes, const WheaRecord& dump, Event& event)
+    bool Parse(const BYTE* bytes, UINT count, Event& event)
     {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (FAILED(initialized)) { event.status = L"xml_reader_unavailable"; return; }
+        if (FAILED(initialized)) { return event.Reject(L"xml_reader_unavailable"); }
         struct Apartment { ~Apartment() { CoUninitialize(); } } apartment;
         ComPtr<IStream> stream;
-        stream.Attach(SHCreateMemStream(bytes.data(), static_cast<UINT>(bytes.size())));
+        stream.Attach(SHCreateMemStream(bytes, count));
         ComPtr<IXmlReader> reader;
         if (!stream || FAILED(CreateXmlReader(__uuidof(IXmlReader), reinterpret_cast<void**>(reader.GetAddressOf()), nullptr)) ||
             FAILED(reader->SetProperty(XmlReaderProperty_ConformanceLevel, XmlConformanceLevel_Document)) ||
             FAILED(reader->SetProperty(XmlReaderProperty_DtdProcessing, DtdProcessing_Prohibit)) ||
             FAILED(reader->SetProperty(XmlReaderProperty_XmlResolver, 0)) ||
             FAILED(reader->SetProperty(XmlReaderProperty_MaxElementDepth, 32)) || FAILED(reader->SetInput(stream.Get())))
-        { event.status = L"xml_reader_unavailable"; return; }
-        if (event.Read(*reader.Get())) { event.Compare(dump); }
+        { return event.Reject(L"xml_reader_unavailable"); }
+        return event.Read(*reader.Get());
     }
+}
+
+void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& result)
+{
+    Event event;
+    event.reboot = true;
+    if (!Parse(xml, byteCount, event)) { result.status = event.status; return; }
+    const auto id = event.Metadata(L"Microsoft-Windows-Kernel-Power", PowerProvider);
+    if (!id) { result.status = event.status; return; }
+    result.metadata = event.metadata;
+    if (id->recordId != result.recordId) { result.status = L"record_id_mismatch"; return; }
+    if (id->id != 41 || id->version > 10) { result.status = L"unsupported_event_template"; return; }
+    if (!id->version) { result.status = L"event_stop_code_unavailable"; return; }
+    SavedCrashStop stop;
+    const auto code = Decimal(event.text[StopCode], UINT32_MAX);
+    if (!code) { result.status = L"event_stop_fields_invalid"; return; }
+    stop.code = static_cast<ULONG>(*code);
+    result.eventCode = stop.code;
+    // The version-one manifest has a code but no bugcheck parameters.
+    if (id->version == 1) { result.status = stop.code ? L"event_code_only" : L"event_stop_code_unavailable"; return; }
+    for (size_t i = 0; i < stop.args.size(); ++i)
+    {
+        const auto& text = event.text[Parameter1 + i];
+        if (text.size() < 3 || text.size() > 18 || text[0] != L'0' || (text[1] != L'x' && text[1] != L'X'))
+        { result.status = L"event_stop_fields_invalid"; return; }
+        for (size_t j = 2; j < text.size(); ++j)
+        {
+            const auto digit = Nibble(text[j]);
+            if (digit < 0) { result.status = L"event_stop_fields_invalid"; return; }
+            stop.args[i] = (stop.args[i] << 4) | static_cast<unsigned>(digit);
+        }
+    }
+    result.eventStop = stop;
+    result.status = stop.code ? L"dump_stop_unqualified" : L"event_stop_code_unavailable";
 }
 
 std::wstring WheaEventComparison::Hypothesis() const
@@ -307,7 +363,7 @@ WheaEventComparison CompareSavedWheaEvent(const std::wstring& name, const std::w
     DWORD used = 0;
     if (bytes.empty() || !approved_file::ReadAt(file.Handle(), 0, bytes.data(), static_cast<DWORD>(bytes.size()), &used) ||
         used != bytes.size()) { event.status = L"event_source_unreadable"; return event.Result(dump); }
-    Parse(bytes, dump, event);
+    if (Parse(bytes.data(), static_cast<UINT>(bytes.size()), event)) { event.Compare(dump); }
     if (!file.Unchanged())
     {
         Event changed;

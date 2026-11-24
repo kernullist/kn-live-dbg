@@ -16,6 +16,8 @@ namespace etl_profile
         // An inventory binds length before hashing. Retain a differing observed size for the report.
         bool OpenMember(const std::wstring& name, uint64_t expectedBytes, std::optional<uint64_t>& observedBytes, DWORD& apiError);
         bool ReadStatement(std::vector<uint8_t>& bytes);
+        // Path-only Windows readers must reopen the leased object on its pinned volume.
+        const std::wstring& PinnedVolumePath() const { return VolumePath; }
         bool Revalidated();
         void Probe(SavedEtlCapabilityProbe& probe);
     private:

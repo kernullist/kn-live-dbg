@@ -7,6 +7,60 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved reboot events and crash dumps on 2026-11-24
+
+The x64 Release CLI with SHA-256 prefix `46924bf4a363` read a 69,632-byte
+System EVTX export containing four original Windows records. Two Kernel-Power
+41 records had nonzero stop codes, one had a zero code and one record came
+from another provider. Windows PowerShell read the provider properties from
+the saved archive. The CLI recovered the same two nonzero codes, all eight
+parameter values, record IDs and timestamps from Windows-rendered event XML.
+Each comparison used a constructed AMD64 dump with known header and debugger
+values. Changing the code or any one of the four parameters in that dump
+produced a conflict. The zero-code event, unrelated provider, absent record
+and live-dump controls each left the tuple comparison unresolved.
+
+The eight archive CLI tests also exercised pins, file size, writer and junction
+conflicts, redirected output aliases and combined WHEA input. One regression
+used option names as ordinary filenames and wrote the report to a distinct
+file. The command refused redirected output through a hard link to an input.
+The installed Kernel-Power manifest confirmed the stop fields for versions
+0 through 10. The example ran in Windows PowerShell 5.1 and PowerShell 7.6.
+The archive, one-record example and example dump retained their hashes. Nine
+v1 diagnoses and two v2 diagnoses were byte-identical to `aa0831c`, including
+the WHEA XML comparison. The test setup supplied no incident-matched dump.
+These controls validate stop-field comparison. Host, boot and cause attribution
+remain open. [Run the comparison](COMMAND_REFERENCE.md#compare-a-reboot-event-with-a-saved-dump)
+
+The native XML parser passed 131 checks, including missing and duplicate
+fields, valid and overflowing integers, unsupported templates and DTD
+rejection. The Windows AddressSanitizer build passed the same checks with
+`ASAN_OPTIONS=halt_on_error=1` and `ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1`.
+Its default runtime stopped during interceptor initialization on this host,
+which limits sanitizer coverage. The Release linker reported the existing
+C4744 warning for `KmonHuntIndex::NextQueryEpoch`.
+
+The crash, WHEA record and WHEA event suites passed 11, 9 and 10 tests.
+The external SDK debugger exceeded its 30-second timeout during a concurrent
+run. The crash and WHEA record suites passed with that same debugger and
+timeout when run sequentially.
+Command and console self-tests passed 3,088 and 570 checks. Restricted
+launch checked 90 CLI results with zero remote accepts. The 69 capability
+contracts, 261 command routes and generated support matrix agreed. The
+privacy suite passed 46 tests and release packaging passed 276 checks in
+each PowerShell edition. The archive, an extracted EVTX chunk and an actual
+comparison report were all recognized as private under generic filenames.
+
+To repeat the archive tests, pass a small private export containing all
+three event controls to the test runner.
+
+```text
+python -B tools/test-reboot-event.py --exe <controller> --archive <test-export.evtx>
+```
+
+The field-level tests are in
+[reboot-event-parser-selftest.cpp](../tools/reboot-event-parser-selftest.cpp).
+
 ## Global publication closure for legacy inventories on 2026-11-24
 
 On `c8526ef`, 70 names for the same synthetic bundle and a separate ledger

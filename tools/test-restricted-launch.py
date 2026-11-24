@@ -85,6 +85,7 @@ def main():
                     ["--crash-diagnose", str(trace), "--sha256", digest],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--whea"],
                     ["--crash-diagnose", str(trace), "--sha256", digest, "--whea", "--event-xml", str(trace), "--event-sha256", digest],
+                    ["--crash-diagnose", str(trace), "--sha256", digest, "--reboot-log", str(trace), "--log-sha256", digest, "--record-id", "1"],
                     ["--io-lifecycle", "50", str(root)],
                     ["--wait-chain", "1", "1", "1", "1", "--corroborate", "2", "2", "2", "10"],
                     ["--wait-chain", "1", "1", "1", "1"], ["--verify-process-image"], ["write", "on"], ["!kmon", "on"], ["kdinit"],

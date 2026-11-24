@@ -1,6 +1,7 @@
 #include "CrashDumpDiagnosis.h"
 #include "WheaRecord.h"
 #include "WheaEvent.h"
+#include "RebootEvent.h"
 #include "RuntimeCapabilities.h"
 #include "ArtifactOutput.h"
 
@@ -19,10 +20,9 @@ namespace
     using mcpjson::Quote;
     constexpr uint64_t MaxDumpBytes = 16ull << 30;
     constexpr ULONG MaxFrames = 32;
-    std::wstring Prefix(bool withWhea)
+    std::wstring Prefix(unsigned version)
     {
-        return withWhea ? L"{\"schema\":\"kn.crash_diagnosis.v2\",\"status\":" :
-            L"{\"schema\":\"kn.crash_diagnosis.v1\",\"status\":";
+        return L"{\"schema\":\"kn.crash_diagnosis.v" + std::to_wstring(version) + L"\",\"status\":";
     }
 
     std::wstring Hex(uint64_t value)
@@ -34,22 +34,10 @@ namespace
 
     const wchar_t* Bool(bool value) { return value ? L"true" : L"false"; }
 
-    struct Stop
-    {
-        ULONG code = 0;
-        std::array<ULONG64, 4> args{};
-        bool operator==(const Stop& other) const { return code == other.code && args == other.args; }
-        std::wstring Json() const
-        {
-            return L"{\"code\":" + Hex(code) + L",\"parameters\":[" + Hex(args[0]) + L"," + Hex(args[1]) +
-                L"," + Hex(args[2]) + L"," + Hex(args[3]) + L"]}";
-        }
-    };
-
     struct Engine
     {
         std::wstring calls, type = L"null", execution = L"null", selected = L"null", frames = L"null";
-        std::optional<Stop> stop;
+        std::optional<SavedCrashStop> stop;
         std::optional<bool> sameContext;
         bool initialStop = false;
         bool atLimit = false;
@@ -129,7 +117,7 @@ namespace
     }
 
     void Inspect(HANDLE file, const CONTEXT& headerContext, bool hasContext, Engine& e,
-        const Stop& headerStop, bool ordinaryDump, WheaRecord* record)
+        const SavedCrashStop& headerStop, bool ordinaryDump, WheaRecord* record)
     {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         e.Call(L"com_initialize", initialized);
@@ -175,7 +163,7 @@ namespace
                 qualifier == DEBUG_KERNEL_FULL_DUMP || qualifier == DEBUG_KERNEL_ACTIVE_DUMP))
             {
                 // An incomplete dump may still expose its stored tuple even when the initial stop is unavailable.
-                Stop s;
+                SavedCrashStop s;
                 if (e.Call(L"bugcheck", control->ReadBugCheckData(&s.code, &s.args[0], &s.args[1], &s.args[2], &s.args[3])))
                 { e.stop = s; }
                 ULONG status = 0;
@@ -216,9 +204,9 @@ namespace
         e.Call(L"end_session", client->EndSession(DEBUG_END_PASSIVE));
     }
 
-    int Failure(bool withWhea, const wchar_t* status)
+    int Failure(unsigned version, const wchar_t* status)
     {
-        return WriteCapabilityJson(Prefix(withWhea) + Quote(status) + L",\"attributed_cause\":null}") ? 1 : 2;
+        return WriteCapabilityJson(Prefix(version) + Quote(status) + L",\"attributed_cause\":null}") ? 1 : 2;
     }
 
     bool IsDigest(const std::wstring& text)
@@ -232,10 +220,55 @@ namespace
             return c >= L'A' && c <= L'F' ? static_cast<wchar_t>(c + L'a' - L'A') : c; });
         return digest;
     }
+
+    struct Options
+    {
+        bool whea = false, wheaEvent = false;
+        size_t rebootArg = 0;
+        uint64_t recordId = 0;
+    };
+
+    bool ReadOptions(const std::vector<std::wstring>& args, Options& options)
+    {
+        if (args.size() < 3 || args[1] != L"--sha256" || !IsDigest(args[2])) { return false; }
+        size_t i = 3;
+        if (i < args.size() && args[i] == L"--whea")
+        {
+            options.whea = true;
+            ++i;
+            if (i < args.size() && args[i] == L"--event-xml")
+            {
+                if (args.size() - i < 4 || args[i + 2] != L"--event-sha256" || !IsDigest(args[i + 3])) { return false; }
+                options.wheaEvent = true;
+                i += 4;
+            }
+        }
+        if (i == args.size()) { return true; }
+        if (args.size() - i != 6 || args[i] != L"--reboot-log" || args[i + 2] != L"--log-sha256" ||
+            !IsDigest(args[i + 3]) || args[i + 4] != L"--record-id") { return false; }
+        const auto& decimal = args[i + 5];
+        if (decimal.empty() || decimal.size() > 20) { return false; }
+        for (const auto c : decimal)
+        {
+            if (c < L'0' || c > L'9') { return false; }
+            const auto digit = static_cast<unsigned>(c - L'0');
+            if (options.recordId > (UINT64_MAX - digit) / 10) { return false; }
+            options.recordId = options.recordId * 10 + digit;
+        }
+        options.rebootArg = i;
+        return options.recordId != 0;
+    }
 }
 
-static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool withEvent)
+std::wstring SavedCrashStop::Json() const
 {
+    return L"{\"code\":" + Hex(code) + L",\"parameters\":[" + Hex(args[0]) + L"," + Hex(args[1]) +
+        L"," + Hex(args[2]) + L"," + Hex(args[3]) + L"]}";
+}
+
+static int Diagnose(const std::vector<std::wstring>& args, const Options& options)
+{
+    const unsigned version = options.rebootArg ? 3 : options.whea ? 2 : 1;
     const auto expected = LowerDigest(args[2]);
     std::filesystem::path path;
     symbol_artifacts::Directories parents;
@@ -243,16 +276,16 @@ static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool w
     if (!symbol_artifacts::LocalRoot(args[0], &path) || !parents.Pin(path.parent_path(), false) ||
         !source.Open(path.wstring(), MaxDumpBytes))
     {
-        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [withWhea] { return Failure(withWhea, L"source_unavailable"); });
+        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[0], [version] { return Failure(version, L"source_unavailable"); });
     }
-    if (source.Sha256 != expected) { return Failure(withWhea, L"digest_mismatch"); }
+    if (source.Sha256 != expected) { return Failure(version, L"digest_mismatch"); }
     DUMP_HEADER64 h{};
     DWORD got = 0;
     if (!approved_file::ReadAt(source.Handle(), 0, &h, sizeof(h), &got) || got != sizeof(h) ||
         h.Signature != DUMP_SIGNATURE64 || h.ValidDump != DUMP_VALID_DUMP64 ||
-        h.MachineImageType != IMAGE_FILE_MACHINE_AMD64) { return Failure(withWhea, L"unsupported_header"); }
+        h.MachineImageType != IMAGE_FILE_MACHINE_AMD64) { return Failure(version, L"unsupported_header"); }
 
-    Stop stop{h.BugCheckCode, {h.BugCheckParameter1, h.BugCheckParameter2, h.BugCheckParameter3, h.BugCheckParameter4}};
+    SavedCrashStop stop{h.BugCheckCode, {h.BugCheckParameter1, h.BugCheckParameter2, h.BugCheckParameter3, h.BugCheckParameter4}};
     CONTEXT context{};
     static_assert(sizeof(context) <= sizeof(h.ContextRecord));
     std::memcpy(&context, h.ContextRecord, sizeof(context));
@@ -261,12 +294,20 @@ static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool w
     Engine e;
     const bool ordinaryDump = knownAttributes && !h.Attributes.LiveDumpGeneratedDump && !h.Attributes.DumpIsGeneratedOffline;
     WheaRecord record;
-    Inspect(source.Handle(), context, hasContext, e, stop, ordinaryDump, withWhea ? &record : nullptr);
-    const auto event = withEvent ? CompareSavedWheaEvent(args[5], LowerDigest(args[7]), record) : WheaEventComparison{};
-    if (!source.Unchanged()) { return Failure(withWhea, L"source_changed_or_unreadable"); }
+    Inspect(source.Handle(), context, hasContext, e, stop, ordinaryDump, options.whea ? &record : nullptr);
+    const auto event = options.wheaEvent ? CompareSavedWheaEvent(args[5], LowerDigest(args[7]), record) : WheaEventComparison{};
     const bool match = e.stop && *e.stop == stop;
+    const bool stopEvidence = e.initialStop && ordinaryDump;
+    std::optional<RebootEventComparison> reboot;
+    if (options.rebootArg)
+    {
+        const auto i = options.rebootArg;
+        reboot = CompareSavedRebootEvent(args[i + 1], LowerDigest(args[i + 3]), options.recordId,
+            match && stopEvidence && stop.code ? &stop : nullptr);
+    }
+    if (!source.Unchanged()) { return Failure(version, L"source_changed_or_unreadable"); }
     const auto status = !e.stop ? L"header_only" : !match ? L"conflicting_stop_data" : L"matched_stop_data";
-    std::wstring report = Prefix(withWhea) + Quote(status) + L",\"dump_sha256\":" + Quote(source.Sha256) +
+    std::wstring report = Prefix(version) + Quote(status) + L",\"dump_sha256\":" + Quote(source.Sha256) +
         L",\"bytes\":" + std::to_wstring(source.Bytes()) + L",\"source_authenticated\":false,\"header\":{\"machine\":" + Hex(h.MachineImageType) + L",\"type\":" + std::to_wstring(h.DumpType) +
         L",\"bugcheck\":" + stop.Json() + L",\"attribute_bits\":" + Hex(h.Attributes.Attributes) +
         L",\"live_dump\":" + (knownAttributes ? Bool(h.Attributes.LiveDumpGeneratedDump != 0) : L"null") +
@@ -277,24 +318,25 @@ static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool w
         L"},\"initial_stop\":" + Bool(e.initialStop) + L",\"target\":" + e.type + L",\"execution_status\":" + e.execution + L",\"bugcheck\":" +
         (e.stop ? e.stop->Json() : L"null") + L",\"selected_context\":" + e.selected +
         L",\"frames\":" + e.frames + L",\"frame_limit_reached\":" + Bool(e.atLimit) + L"}";
-    if (withWhea) { report += L",\"whea_record\":" + record.Json(); }
-    if (withEvent) { report += L",\"whea_event\":" + event.report; }
+    if (options.whea) { report += L",\"whea_record\":" + record.Json(); }
+    if (options.wheaEvent) { report += L",\"whea_event\":" + event.report; }
+    if (reboot) { report += L",\"reboot_event\":" + reboot->Json(); }
     report += L",\"assessment\":{\"header_context_matches_selected\":" +
         std::wstring(e.sameContext ? Bool(*e.sameContext) : L"null") +
         L",\"header_context_matches_stack_top\":" + (e.topMatches ? Bool(*e.topMatches) : L"null") +
         L",\"unwind_quality\":\"unverified\",\"host_crash_verified\":false,\"attributed_cause\":null,\"hypotheses\":[";
     const bool whea = match && stop.code == 0x124;
-    const bool stopEvidence = e.initialStop && ordinaryDump;
     const bool located = match && stop.code && e.sameContext.value_or(true) && e.topInModule && e.topMatches.value_or(false);
     report += L"{\"candidate\":\"whea_reported_condition\",\"state\":" +
         Quote(whea ? (stopEvidence ? L"supported_by_stop_tuple" : L"code_recorded_only") :
             (match && stop.code ? L"different_stop_code" : L"unresolved")) +
         L",\"support\":" + (whea ? L"[\"/header/bugcheck\",\"/dbgeng/bugcheck\"]" : L"[]") +
         L",\"contrary\":" + (match && stop.code && !whea ? L"[\"/header/bugcheck\",\"/dbgeng/bugcheck\"]" : L"[]") +
-        L",\"next\":" + Quote(withWhea && record.status == L"linked" ? L"inspect_the_linked_whea_sections" :
+        L",\"next\":" + Quote(options.whea && record.status == L"linked" ? L"inspect_the_linked_whea_sections" :
             L"inspect_the_corresponding_whea_error_record") + L"},";
-    if (withWhea) { report += record.Hypothesis() + L","; }
-    if (withEvent) { report += event.Hypothesis() + L","; }
+    if (options.whea) { report += record.Hypothesis() + L","; }
+    if (options.wheaEvent) { report += event.Hypothesis() + L","; }
+    if (reboot) { report += reboot->Hypothesis() + L","; }
     report += L"{\"candidate\":\"component_present_at_stop\",\"state\":" +
         Quote(located ? L"mapped_frame_observed" : L"unresolved") +
         L",\"support\":" + (located ?
@@ -309,31 +351,29 @@ static int Diagnose(const std::vector<std::wstring>& args, bool withWhea, bool w
 
 int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
 {
-    const bool withEvent = args.size() == 8 && args[3] == L"--whea" && args[4] == L"--event-xml" &&
-        args[6] == L"--event-sha256" && IsDigest(args[7]);
-    const bool withWhea = withEvent || (args.size() == 4 && args[3] == L"--whea");
-    if ((!withWhea && args.size() != 3) || args[1] != L"--sha256" || !IsDigest(args[2]))
+    Options options;
+    const auto inputOption = [](const std::wstring& arg) { return arg == L"--event-xml" || arg == L"--reboot-log"; };
+    if (!ReadOptions(args, options))
     {
         auto usage = [&] {
             return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
                 std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> "
-                    L"[--whea [--event-xml <file> --event-sha256 <digest>]]\n";
+                    L"[--whea [--event-xml <file> --event-sha256 <digest>]] "
+                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal>]\n";
                 return 2;
             });
         };
-        const auto option = std::find(args.begin(), args.end(), L"--event-xml");
-        if (option != args.end() && option + 1 != args.end())
-        {
-            if (std::find(option + 1, args.end(), L"--event-xml") != args.end() &&
-                GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_DISK) { return 2; }
-            return WriteWithDistinctInput(STD_ERROR_HANDLE, *(option + 1), usage);
-        }
-        return usage();
+        if (GetFileType(GetStdHandle(STD_ERROR_HANDLE)) == FILE_TYPE_DISK &&
+            (std::count(args.begin(), args.end(), L"--event-xml") > 1 || std::count(args.begin(), args.end(), L"--reboot-log") > 1))
+        { return 2; }
+        return WriteWithDistinctSelectedInputs(STD_ERROR_HANDLE, args, inputOption, usage);
     }
-    if (withEvent)
+    const HANDLE sink = GetStdHandle(STD_OUTPUT_HANDLE);
+    DistinctArtifactInput xmlInput, logInput;
+    if (GetFileType(sink) == FILE_TYPE_DISK)
     {
-        // Keep a disk output distinct from both input identities, even if the XML read lease fails.
-        return WriteWithDistinctInput(STD_OUTPUT_HANDLE, args[5], [&] { return Diagnose(args, true, true); });
+        if (options.wheaEvent && !xmlInput.Hold(sink, args[5])) { return 2; }
+        if (options.rebootArg && !logInput.Hold(sink, args[options.rebootArg + 1])) { return 2; }
     }
-    return Diagnose(args, withWhea, false);
+    return Diagnose(args, options);
 }
