@@ -367,16 +367,21 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v1", "kn.benchmark_original_recovery.v1",
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
-                    "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1")
+                    "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.image_approval_provision.v1")
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
-                    '"truth_ref_sha256"', '"valid_key_ids"', '"signed_hashes"')
+                    '"truth_ref_sha256"', '"valid_key_ids"', '"signed_hashes"', '"native_policy_sha256"',
+                    '"policy_target"', '"source_approval_count"', '"publisher_reference_sha256"', '"source_policy_sha256"',
+                    '"reference_bytes"', '"policy_epoch"')
 RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("case_id", "original_status"), ("referenced_objects", "verified_objects"), ("missing_sha256",), ("original_files",),
     ("package_sha256", "results_sha256", "corpus_sha256"), ("package_sha256", "original_sha256", "original_bytes"),
     ("publisher_truth", "truth_reason"), ("trusted_root_sha256", "verification_time_utc"),
     ("target_path", "file_bytes", "missing"), ("target_path", "signed_hashes"), ("root", "snapshot", "timestamp", "targets"),
     ("truth_ref_sha256", "failed_role"), ("truth_ref_sha256", "metadata_links"), ("valid_key_ids", "threshold", "expires"),
+    ("native_policy_sha256",), ("policy_target", "publisher_proof"), ("publisher_reference_sha256", "policy_target"),
+    ("source_approval_count", "manifest_sha256"), ("source_policy_sha256", "policy_target_comparison"),
+    ("manifest_sha256", "reference_sha256", "reference_bytes"), ("issuer", "policy_epoch", "not_before_filetime", "not_after_filetime"),
 ))
 DETACHED_FIELD_SETS = RETAINED_FIELDS + READY_ORIGIN_FIELDS + WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + ETL_ROTATION_FIELDS + tuple(frozenset(fields) for fields in (
     ("captured_sha256", "captured_bytes", "reads", "status"),

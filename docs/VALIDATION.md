@@ -7,6 +7,43 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Publisher-provisioned native image approvals on 2026-11-24
+
+On development `main`, a test approval authority signed a two-row policy
+covering two owned PE fixtures. The publisher's top-level target carried
+both SHA-256 and SHA-512. Its timestamp role expired first. Each invocation
+emitted one row with that expiration as the exclusive native cutoff.
+The Windows `assess-image` command reopened the original capture with the
+selected manifest, derived policy and returned SHA-256.
+
+| Retained fixture | Authorized changed bytes | Unexplained changed bytes | Native outcome |
+| --- | ---: | ---: | --- |
+| Managed direct capture, 13,312-byte PE | 1 | 0 | Incomplete comparison |
+| Temporal sweep across a boundary, 10,240-byte PE | 2 | 0 | All observed changes authorized |
+
+Using either derived policy for the other fixture returned
+`manifest_not_approved`. The native reports kept the original comparison
+coverage and reported `issuer_signature_verified=false`. The approved issuer
+labels came from the test authority.
+
+A separate negative control verified the publicly signed Sigstore
+`trusted_root.json` target against the production root retained from the
+Sigstore 4.6.0 wheel. The exact target bytes passed publisher verification and
+failed the native policy schema. Supplying the test authority's native policy
+under that same signed target name failed the file hash check. Both attempts
+returned a rejection receipt and created zero policies. Public vendor
+approval of Windows image changes, root rotation and delegated policy updates
+remain unverified. See the [public publisher revision](https://github.com/sigstore/root-signing/tree/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4).
+
+OpenSSL independently verified two root signatures, one timestamp signature,
+one snapshot signature and two targets signatures from the test authority.
+The documented PowerShell example produced the same native policy digest in
+Windows PowerShell 5.1 and PowerShell 7.6. The 13 provisioning tests included
+all four expiration boundaries, exact input limits, malformed unselected rows,
+competing outputs and receipt-delivery failure. The existing publisher and
+corpus suites passed 9 and 21 tests. The public-content suite passed 50 tests
+and both PowerShell editions passed 276 release privacy checks each.
+
 ## Publisher file comparisons on 2026-11-24
 
 Ten development cases compared retained bytes against two direct targets in

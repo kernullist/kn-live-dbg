@@ -574,6 +574,36 @@ approval collection commands below retain direct and scoped inputs and
 assessments for later reproduction. See
 [approved image changes](ARCHITECTURE.md#approved-image-changes).
 
+For a policy distributed by a TUF publisher, first install the optional
+dependencies in the selected Python environment with
+`python -m pip install -r tools/requirements-publisher-truth.txt`.
+Set `$python` and `$debugger` to that interpreter and the native executable.
+Set `$publisherReference` to the retained four-role envelope, `$sourcePolicy`
+to the exact published policy file, `$manifest` to the change manifest and
+`$reference` to the whole retained PE file or its `.knblob` (up to 64 MiB).
+Use the approval authority's independently configured `$trustedRootSha256`
+and case-sensitive `$policyTarget`. Supply `$verificationTime` as UTC in
+`YYYYMMDDTHHMMSSZ` form, `$selectedPolicy` as a new filename in a private
+directory and `$capture` as the retained native capture to assess.
+
+```powershell
+$receiptJson = & $python -B tools/provision-image-approval.py --publisher-reference $publisherReference `
+    --trusted-root-sha256 $trustedRootSha256 --verification-time $verificationTime --policy-target $policyTarget `
+    --policy $sourcePolicy --manifest $manifest --reference $reference --out $selectedPolicy
+if ($LASTEXITCODE -ne 0) { throw 'Image approval provisioning failed' }
+$receipt = $receiptJson | ConvertFrom-Json
+& $debugger --offline '!kmon' assess-image $capture $manifest $selectedPolicy $receipt.native_policy_sha256 /json
+if ($LASTEXITCODE -ne 0) { throw 'Image assessment failed' }
+```
+
+Provisioning exits 0 after publishing one policy row and writing its private
+JSON receipt. A signature, target, document or approval mismatch exits 1 with
+a rejection reason and a null policy pin. Invalid arguments, an occupied
+destination, a file outside the input limits, or an I/O failure exit 2. The
+output file is created before its receipt is delivered. Preserve the signed
+source policy and reference envelope to reproduce the publisher check. See
+[publisher-signed image approval policies](ARCHITECTURE.md#publisher-signed-image-approval-policies).
+
 `KnLiveDbg.exe --offline !kmon journal-image-approval <directory|managed.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> /json`
 archives one assessment and its exact inputs into an `init-store` private
 root. The policy digest is a separate trust input as for `assess-image`; the ID

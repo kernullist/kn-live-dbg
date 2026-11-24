@@ -3725,9 +3725,9 @@ difference is authorized.
 
 `kn.image_change_assessment.v1` returns the unchanged original replay alongside
 rule outcomes, authorized/unexplained RVA spans, byte counts and completeness.
-`R-approved` means this exact reference is approved by the caller-pinned policy;
-it is not an assertion that a publisher signature was verified. A replaced local
-reference can match retained memory and still fail that policy. The result
+`R-approved` identifies the exact reference accepted by the caller-pinned
+policy. The provisioning receipt records any separate publisher verification.
+A replaced local reference can match retained memory and still fail that policy. The result
 never changes the recipe, original ownership/difference report, or stored claim.
 It proves neither current live state, execution, maliciousness, complete-image
 approval nor object lifetime. The assessment and its input artifacts remain
@@ -3765,10 +3765,36 @@ The evaluator admits at most 2,048 slices and 16,384 pages; its output is at mos
 4 MiB. A result over that limit is unavailable and explicitly omits the embedded
 replay rather than returning a truncated successful assessment.
 
-This bounded policy path does not provision signed distribution trust, consult
-revocation services or join other cases. The approval collections below retain
-direct and scoped assessments under separate journal policies. An updated
-policy requires its own explicit digest.
+The approval collections below retain direct and scoped assessments under
+separate journal policies. Each updated policy requires its own explicit digest.
+
+### Publisher-signed image approval policies
+
+An organization can distribute its image approval policy as a named top-level
+TUF target. The operator configures the authority's trusted root digest and
+target name independently of the capture. `tools/provision-image-approval.py`
+verifies the retained root, timestamp, snapshot and targets metadata at an
+explicit UTC instant. It checks the exact published policy bytes against the
+signed length and every declared target hash. It validates every policy row
+before selecting the row that matches the complete reference file, exact
+change manifest and issuer. The manifest and policy epochs must agree.
+
+The tool writes a new single-row native policy and returns its SHA-256. Its
+validity starts at the later of the policy and manifest start times and ends
+at the earliest of their end times and the four metadata expirations. The
+verification instant must fall inside that half-open window. This allows a
+publisher to endorse an earlier capture within its stated window. The native
+assessment independently checks the capture and evaluation times, reopens the
+retained reference and reproduces the observed changes.
+
+The publisher endorses the file and manifest digests with the issuer label in
+that row. A separate signature by the named issuer, Windows catalog or
+Authenticode trust, and collector authentication each require their own
+evidence. This verification covers one pinned metadata revision. Discovering
+newer revisions, root rotation, delegated targets and revocation between
+revisions remain open. Retain the source policy, four original metadata files,
+independent trust configuration and private provisioning receipt alongside the
+native replay inputs. See the [publisher reference format](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release).
 
 ### Approved image collections
 

@@ -660,6 +660,20 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("unsorted.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Use kn.benchmark_tuf_reference.v1 for retained metadata."))
 
+    def test_image_policy_provisioning_receipts(self):
+        samples = (dict(schema="kn.image_approval_provision.v1"), dict(native_policy_sha256=None),
+                   dict(native_policy_sha256="a"), dict(policy_target="name", publisher_proof={}),
+                   dict(publisher_reference_sha256="a", policy_target="name"),
+                   dict(source_approval_count=2, manifest_sha256="b"),
+                   dict(source_policy_sha256="c", policy_target_comparison={}),
+                   dict(manifest_sha256="d", reference_sha256="e", reference_bytes=4),
+                   dict(issuer="team", policy_epoch="3", not_before_filetime="1", not_after_filetime="9"))
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                data = ("receipt\n" + json.dumps({"items": [sample]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Read native_policy_sha256 from the provisioning receipt."))
+
     def test_window_message_wait_exports(self):
         for row in (dict(schema="kn.wait_message_fixture.v1"), dict(receiver_tid=17, receiver_created="20"),
                     dict(send_return_tick=200, handler_entry_tick=100, handler_leave_tick=200)):

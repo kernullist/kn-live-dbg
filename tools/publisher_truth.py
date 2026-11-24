@@ -45,15 +45,20 @@ def read_small(stream, objects, pin, limit):
     return bytes(data), None
 
 
+def target_name(name):
+    need(type(name) is str and 0 < len(name.encode("utf-8")) <= 512 and
+         not any(ord(ch) < 32 or ord(ch) == 127 or ch in "\\:" for ch in name) and
+         all(part not in ("", ".", "..") for part in name.split("/")), "invalid_target_name")
+    return name
+
+
 def file_scope(raw, decode):
     try:
         scope = decode(raw)
         need(type(scope) is dict and scope.keys() == {"schema", "target_path", "file_bytes", "missing"} and
              scope["schema"] == "kn.benchmark_target_scope.v1", "invalid_file_scope")
         name, length, missing = scope["target_path"], scope["file_bytes"], scope["missing"]
-        need(type(name) is str and 0 < len(name.encode("utf-8")) <= 512 and
-             not any(ord(ch) < 32 or ord(ch) == 127 or ch in "\\:" for ch in name) and
-             all(part not in ("", ".", "..") for part in name.split("/")), "invalid_target_name")
+        target_name(name)
         need(type(length) is int and 0 <= length <= MAX_PACKAGE and type(missing) is list, "invalid_file_scope")
         end = 0
         for span in missing:
@@ -162,13 +167,17 @@ def compare_target(scope, pin, original, targets, stream, sha512_cache):
     return "negative", "differs_from_signed_target", details
 
 
-def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio):
+def verification_time(at):
     try:
         if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", at):
             raise ValueError
-        instant = datetime.strptime(at, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
+        return datetime.strptime(at, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
     except ValueError:
         raise ValueError("verification time must be a valid UTC YYYYMMDDTHHMMSSZ") from None
+
+
+def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio):
+    instant = verification_time(at)
     groups = defaultdict(list)
     coverage = {r["case_id"]: r for r in report["coverage"]["cases"]}
     derived = {}
