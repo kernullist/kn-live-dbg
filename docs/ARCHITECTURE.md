@@ -719,6 +719,22 @@ and the number of distinct reference file bytes. Header qualification, the
 export instruction and the loaded slot have separate roles. Resolving the final
 function, observing its execution and identifying a writer require further evidence.
 
+For portable replay, a private archive retains the exact native stdout, PE
+and user dump. Its fixed header records the three lengths, the EFS requirement
+and the digest of the reader that verified the report at publication. The
+report supplies the expected PE and dump digests. The bounds are 1 MiB for the
+report, 64 MiB for the PE and 8 GiB for the dump. The publisher streams the
+files to an exclusive handle, verifies the sealed digest and publishes by
+rename to a new name.
+
+Replay takes independent digests for the archive, report and installed reader.
+It verifies the archive before writing private scratch files under fixed names.
+The reader must reproduce the original stdout and native exit status from
+those files. The replay result records both reader identities. This permits a
+compatible reader to verify an older observation. The store's ACL and EFS
+requirements apply to both the temporary files and the published archive.
+[Windows file encryption](https://learn.microsoft.com/en-us/windows/win32/fileio/file-encryption)
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a

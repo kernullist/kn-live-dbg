@@ -1,17 +1,15 @@
 """Pack or replay a private native approval collection together with its original publisher evidence."""
 import argparse
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack
 from datetime import datetime
 import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import struct
 import subprocess
 import sys
-import uuid
 
 from etl_reader_process import WindowsFiles, file_hash
 from image_approval_policy import (DECODE, IMAGE_LIMIT, NATIVE_LIMIT, authority_parameters, fields, filetime, hash_field,
@@ -19,7 +17,7 @@ from image_approval_policy import (DECODE, IMAGE_LIMIT, NATIVE_LIMIT, authority_
 from owned_module_benchmark import check, encoded, sha
 from retained_corpus import CHUNK, MAX_DOCUMENT, OutputCollision
 from saved_etl_comparison import digest, local_path, outputs_safe, write_result
-from windows_private_archive import publish_archive
+from windows_private_archive import held, native_result, publish_archive, replay_directory, verified_protection
 
 
 MAGIC = b"KNAPARC1"
@@ -39,16 +37,6 @@ def collection_paths(directory):
     check(directory.parent.name == "collections" and re.fullmatch(r"0|[1-9][0-9]{0,19}", directory.name),
           "invalid native collection directory")
     return (directory / "session.knsession", *(directory / "journal-segments" / n for n in SEGMENTS))
-
-
-@contextmanager
-def held(files, path):
-    with ExitStack() as stack:
-        files.parents(stack, path.parent, set(), share_directory_writes=False)
-        stream = stack.enter_context(files.hold(path))
-        if not outputs_safe((), stream):
-            raise OutputCollision("output aliases an input")
-        yield stream
 
 
 def document(files, path, limit):
@@ -126,10 +114,7 @@ def copy_member(read, target, size, expected):
 
 
 def native(program, *args):
-    # The executable and its ancestors remain leased. Never search an extracted directory for a program or DLL.
-    result = subprocess.run([str(program), "--offline", "!kmon", *map(str, args), "/json"], executable=program,
-                            cwd=program.parent, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                            stderr=subprocess.DEVNULL, timeout=180, creationflags=subprocess.CREATE_NO_WINDOW)
+    result = native_result(program, *args)
     check(result.returncode == 0 and 0 < len(result.stdout) <= 20 * MIB, f"native {args[0]} did not verify")
     return DECODE(result.stdout)
 
@@ -148,26 +133,7 @@ def check_journal(program, collection, parts, root, external_head):
 
 
 def privacy(program, root):
-    result = native(program, "privacy", root)
-    check(result["schema"] == "kn.evidence_privacy.v1" and result["status"] == "ready" and
-          result["root_acl_verified"] is True and type(result["efs_required"]) is bool,
-          "an initialized private store is required")
-    return result
-
-
-@contextmanager
-def replay_directory(workspace):
-    # Windows mode 0700 grants Administrators access. Create a new child with the private parent's inherited ACL.
-    directory = workspace / (".knapproval-replay-" + uuid.uuid4().hex)
-    directory.mkdir()
-    identity = directory.stat(follow_symlinks=False)
-    try:
-        yield directory
-    finally:
-        check(directory.resolve(strict=True) == workspace.resolve(strict=True) / directory.name and
-              os.path.samestat(identity, directory.stat(follow_symlinks=False)),
-              "private replay directory identity changed")
-        shutil.rmtree(directory)
+    return verified_protection(native(program, "privacy", root))
 
 
 def read_records(read):

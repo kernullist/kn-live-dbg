@@ -16,6 +16,8 @@ namespace etl_profile
     public:
         SchemaArtifact File;
         bool Open(const std::wstring& name, uint64_t maximum = MaxFileBytes, DWORD* apiError = nullptr);
+        // Allow sibling publications when the parser reads exclusively through File.Handle().
+        bool OpenForHandleReads(const std::wstring& name, uint64_t maximum);
         // An inventory binds length before hashing. Retain a differing observed size for the report.
         bool OpenMember(const std::wstring& name, uint64_t expectedBytes, std::optional<uint64_t>& observedBytes, DWORD& apiError);
         bool ReadStatement(std::vector<uint8_t>& bytes);

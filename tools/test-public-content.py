@@ -2,6 +2,7 @@
 import base64
 from contextlib import closing
 import importlib.util
+import io
 import json
 from pathlib import Path
 import re
@@ -191,6 +192,34 @@ class PublicContentTests(unittest.TestCase):
             encoded = base64.urlsafe_b64encode(part).rstrip(b"=")
             self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", encoded)})
         self.assertFalse(AUDIT.inspect("unrelated.json", json.dumps(dict(ordinal=1, observed_bytes=8)).encode()))
+
+    def test_minidump_observation_archive(self):
+        self.assertEqual(AUDIT.path_rule(".kniat-replay-owned/copied.bin"), "local-state-directory")
+        for name in ("saved.KNIATARCHIVE", ".kniatarchive.pending-owned"):
+            self.assertEqual(AUDIT.path_rule(name), "private-container-or-capture")
+        for data in (b"KNMDIAT1", b"KNMDIAT1" + bytes(100)):
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.bin", data)})
+        for row in (dict(schema="kn.minidump_iat_archive.v1"), dict(packing_reader_sha256="a" * 64),
+                    dict(original_report_reproduced=True, report_sha256="b" * 64)):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                found = AUDIT.inspect("excerpt.txt", json.dumps(row).encode(encoding))
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in found})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Replay a kn.minidump_iat_archive.v1 result."))
+
+    def test_private_archive_scan_accounts_for_all_bytes_with_bounded_reads(self):
+        class ArchiveStream(io.BytesIO):
+            def read(self, size=-1):
+                if not 0 <= size <= 1 << 20:
+                    raise AssertionError("archive payload read exceeded the chunk limit")
+                return super().read(size)
+
+        data = b"KNMDIAT1" + bytes((2 << 20) + 7)
+        for seekable in (False, True):
+            with ArchiveStream(data) as stream:
+                stream.seekable = lambda: seekable
+                size, findings = AUDIT.inspect_stream("renamed.bin", stream)
+                self.assertEqual(size, len(data))
+                self.assertEqual([f["rule"] for f in findings], ["private-evidence-bundle"])
 
     def test_portable_approval_evidence(self):
         for name in ("case.knapprovalarchive", ".knapprovalarchive.pending-owned"):
@@ -858,6 +887,13 @@ class PublicContentTests(unittest.TestCase):
                              {"tracked.txt": b"working", "untracked.txt": b"new"})
             (root / "tracked.txt").unlink()
             self.assertEqual(dict(AUDIT.inputs(root, False, False)), {"untracked.txt": b"new"})
+            archived = b"KNMDIAT1" + bytes((1 << 20) + 19)
+            (root / "tracked.txt").write_bytes(archived)
+            subprocess.run(["git", "-C", str(root), "add", "tracked.txt"], check=True, capture_output=True)
+            (root / "tracked.txt").write_bytes(b"working copy")
+            size, findings = dict(AUDIT.inputs(root, True, False, AUDIT.inspect_stream))["tracked.txt"]
+            self.assertEqual(size, len(archived))
+            self.assertEqual([f["rule"] for f in findings], ["private-evidence-bundle"])
 
     def test_tree_mode_checks_ignored_files_and_exit_codes(self):
         with tempfile.TemporaryDirectory() as tmp:

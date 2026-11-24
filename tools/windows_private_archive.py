@@ -1,12 +1,56 @@
 """Publish verified archive bytes through the same exclusive Windows handle that created them."""
+from contextlib import ExitStack, contextmanager
 import ctypes as c
 from ctypes import wintypes as w
 import os
 import re
+import shutil
+import subprocess
 import uuid
 
 from etl_reader_process import file_hash
 from owned_module_benchmark import check
+from retained_corpus import OutputCollision
+from saved_etl_comparison import outputs_safe
+
+
+@contextmanager
+def held(files, path, *, share_directory_writes=False):
+    with ExitStack() as stack:
+        files.parents(stack, path.parent, set(), share_directory_writes=share_directory_writes)
+        stream = stack.enter_context(files.hold(path))
+        if not outputs_safe((), stream):
+            raise OutputCollision("output aliases an input")
+        yield stream
+
+
+def native_result(program, *args, timeout=180):
+    # The installed executable stays leased. Never search an extracted directory for a program or DLL.
+    return subprocess.run([str(program), "--offline", "!kmon", *map(str, args), "/json"], executable=program,
+                          cwd=program.parent, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, timeout=timeout, creationflags=subprocess.CREATE_NO_WINDOW)
+
+
+def verified_protection(result):
+    check(result["schema"] == "kn.evidence_privacy.v1" and result["status"] == "ready" and
+          result["root_acl_verified"] is True and type(result["efs_required"]) is bool,
+          "an initialized private store is required")
+    return result
+
+
+@contextmanager
+def replay_directory(workspace, prefix=".knapproval-replay-"):
+    # Inherit the verified private parent's ACL. Windows mode 0700 would also grant Administrators access.
+    directory = workspace / (prefix + uuid.uuid4().hex)
+    directory.mkdir()
+    identity = directory.stat(follow_symlinks=False)
+    try:
+        yield directory
+    finally:
+        check(directory.resolve(strict=True) == workspace.resolve(strict=True) / directory.name and
+              os.path.samestat(identity, directory.stat(follow_symlinks=False)),
+              "private replay directory identity changed")
+        shutil.rmtree(directory)
 
 
 class SecurityAttributes(c.Structure):
@@ -17,7 +61,7 @@ class RenameInfo(c.Structure):
     _fields_ = [("flags", w.DWORD), ("directory", w.HANDLE), ("length", w.DWORD), ("name", w.WCHAR * 1)]
 
 
-def publish_archive(destination, files, protection, write):
+def publish_archive(destination, files, protection, write, *, pending_prefix=".knapprovalarchive.pending-"):
     import msvcrt
     kernel = c.WinDLL("kernel32", use_last_error=True)
     convert = c.WinDLL("advapi32", use_last_error=True).ConvertStringSecurityDescriptorToSecurityDescriptorW
@@ -35,7 +79,7 @@ def publish_archive(destination, files, protection, write):
         raise c.WinError(c.get_last_error())
     try:
         security = SecurityAttributes(c.sizeof(SecurityAttributes), descriptor, False)
-        pending = destination.with_name(f".knapprovalarchive.pending-{uuid.uuid4().hex}")
+        pending = destination.with_name(pending_prefix + uuid.uuid4().hex)
         # GENERIC_READ | GENERIC_WRITE | DELETE, no sharing, CREATE_NEW.
         handle = files.create(str(pending), 0xc0010000, 0, c.byref(security), 1, 0x80, None)
         if handle == c.c_void_p(-1).value:

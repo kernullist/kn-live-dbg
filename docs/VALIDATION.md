@@ -7,6 +7,50 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Portable user-minidump observations
+
+On 2026-11-25 the Windows x64 archive test used an owned DLL and DbgHelp's
+regular and full-memory dumps. After deleting the standalone dump, PE and
+stdout files, it reproduced the native reports for an observed slot, complete
+and partial declarations, a one-byte contradiction and an unavailable export.
+An empty dump also reproduced its original failure. The test independently
+checked the three lengths and SHA-256 digests against the archived bytes.
+The ACL-only and EFS cases used private NTFS stores. The archive suite passed
+158 checks and reproduced eight original reports. The native minidump suite
+passed all 520 checks after the process that supplied the test dumps exited.
+
+Changing the report's declaration verdict and recomputing both its digest
+and the archive digest still failed native replay. Substituted members,
+trailing bytes, length overflows and an EFS downgrade were rejected.
+Competing writers published one file. Closing the publisher's stdout before
+delivery left a complete archive that a second process could verify.
+The previous reader rejected a valid report while a sibling publisher held
+write access to the parent directory. The new reader reproduced it from the
+same files under that condition. A write handle on the PE or dump itself
+still prevented verification. The saved ETL probe retained its stricter
+directory sharing for the Windows APIs that reopen the trace by name.
+Across eight saved dumps, the previous and current readers returned identical
+stdout, stderr and exit codes for 48 requests. The current reader also
+reproduced both the ACL-only and EFS archives sealed with its predecessor.
+
+A separate trial extended the regular dump to 4,294,971,392 bytes, placing
+a marker beyond the 32-bit file-offset boundary. The archive retained that
+last byte and the original native report reproduced after removing the three
+inputs. The publication scan rejected the renamed archive by its signature
+and counted all 4,294,979,074 bytes. NTFS compression kept the zero-filled
+test data small on disk.
+These tests covered process exit and ordinary file operations. Power-loss
+recovery and the full 8 GiB input limit remain unverified.
+
+From an x64 Native Tools prompt, run the following command on an NTFS volume
+with EFS available.
+
+```powershell
+python -B tools/test-minidump-iat-archive.py --exe x64/Release/KnLiveDbg.exe --require-efs
+```
+
+[Archive a user-minidump import observation](COMMAND_REFERENCE.md#archive-a-user-minidump-import-observation)
+
 ## Import declaration bytes in user minidumps
 
 On 2026-11-25 the x64 Release reader compared three import declarations from

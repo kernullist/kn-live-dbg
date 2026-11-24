@@ -1094,6 +1094,38 @@ The command's exit code still describes the slot observation. Inspect
 declaration can survive that gap, and a readable slot can coexist with a
 contradictory declaration.
 
+### Archive a user-minidump import observation
+
+To replay an observation after the standalone files are removed, keep the
+original UTF-8 stdout of `dump-image-iat`, including its final newline. Supply
+that file, its SHA-256, the original dump and the reference PE to
+`tools/archive-minidump-iat.py pack`. The tool checks the two input digests
+recorded in the report and runs the named offline reader. Publication requires
+the same exit status and identical report bytes. The archive contains the
+entire supplied dump, including data outside the selected import.
+
+Run from the repository root with an initialized private store and a new
+archive filename. Use a trusted installed reader and its independently verified
+digest. In this example `$reportPin` is the digest recorded for the original
+stdout file. Retain it and the returned archive digest for replay.
+
+```powershell
+$archive = Join-Path $privateStore 'import.kniatarchive'
+$readerOptions = @('--debugger', $exe, '--debugger-sha256', $readerPin, '--report-sha256', $reportPin)
+$sealed = python -B tools/archive-minidump-iat.py pack @readerOptions --report $report --dump $dump --reference $reference --out $archive | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $sealed.reason }
+$restored = python -B tools/archive-minidump-iat.py replay @readerOptions --archive $archive --archive-sha256 $sealed.archive_sha256 --private-workspace $privateStore | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $restored.reason }
+$restored.observation | Select-Object status, slot_value_observed, declaration_check
+```
+
+Archive exit 0 means the recorded native outcome reproduced. A native gap
+retains `native_exit_code=1` and its original reason. `/declaration` is
+reapplied when the original report contains that check. Encrypted originals
+require an EFS private store. An EFS archive requires an EFS replay workspace.
+The scratch copies are removed after replay.
+[Validation](VALIDATION.md#portable-user-minidump-observations)
+
 ### Archive a process image acquisition
 
 Use an initialized private store and a new collection ID. Supply the

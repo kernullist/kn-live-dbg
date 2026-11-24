@@ -10,12 +10,14 @@ import argparse
 import base64
 import binascii
 import json
+import os
 import re
 import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".knsource", ".knsourceledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
+PRIVATE_ARCHIVE_HEADERS = (b"KNAPARC1", b"KNMDIAT1")
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".kniatarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".knsource", ".knsourceledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -72,7 +74,7 @@ def alternatives(values) -> str:
 # Both engines match one lower-case path component. '$' alone also matches before a final newline.
 END_OF_NAME = r"(?![\s\S])"
 PRIVATE_DIRECTORY_NAME = "^" + alternatives(PRIVATE_DIRECTORIES) + END_OF_NAME
-PRIVATE_PARENT = re.compile(PRIVATE_DIRECTORY_NAME + r"|^\.knbench-etl-|^\.knapproval-replay-")
+PRIVATE_PARENT = re.compile(PRIVATE_DIRECTORY_NAME + r"|^\.knbench-etl-|^\.knapproval-replay-|^\.kniat-replay-")
 PRIVATE_FILE_RULES = (
     ("local-state-directory", re.compile(PRIVATE_DIRECTORY_NAME)),
     ("private-operation-journal", re.compile(r"\.knmcpjournal" + END_OF_NAME + r"|\.knmcpjournal\.tmp\.")),
@@ -380,12 +382,12 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
 ))
 RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v1", "kn.benchmark_original_recovery.v1",
                     "kn.process_image_source.v1", "kn.image_source_replay.v1", "kn.image_source_collection.v1", "kn.image_source_session.v1",
-                    "kn.image_iat_reference.v1", "kn.minidump_iat_observation.v1", "kn.minidump_import_declaration.v1",
+                    "kn.image_iat_reference.v1", "kn.minidump_iat_observation.v1", "kn.minidump_import_declaration.v1", "kn.minidump_iat_archive.v1",
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
                     "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
-RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
+RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"packing_reader_sha256"', '"original_report_reproduced"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
                     '"iat_slot_rva"', '"import_lookup_rva"', '"instruction_reread"',
                     '"slot_value_sha256"', '"slot_file_spans"', '"instruction_file_spans"', '"module_list_index"',
@@ -405,6 +407,7 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("iat_slot_rva", "instruction_hex"), ("import_lookup_rva", "import_descriptor_rva"), ("instruction_reread", "byte_receipts"),
     ("slot_value_sha256",), ("slot_file_spans",), ("instruction_file_spans",), ("module_list_index", "basename", "coff_timestamp"),
     ("expected_dump_sha256", "expected_reference_sha256", "export"),
+    ("packing_reader_sha256",), ("original_report_reproduced", "report_sha256"),
     ("declaration_fields",), ("declaration_spans",), ("reference_field_sha256",),
     ("field_offset", "state", "bytes"), ("reference_import_name", "reference_module", "reference_ordinal"),
     ("different_bytes", "excluded_bytes", "read_error_bytes"),
@@ -595,7 +598,7 @@ def inspect(name: str, data: bytes, allow_private_symbols: bool = False) -> list
     if bad_path:
         add(bad_path)
     # A partially written or renamed acquisition still contains private executable and process evidence.
-    if data.startswith(b"KNAPARC1"):
+    if data.startswith(PRIVATE_ARCHIVE_HEADERS):
         add("private-evidence-bundle")
         return findings
     if data.startswith((b"KNETLBC1", b"KNCORP1\0")) or (data.startswith(b"PK\x03\x04") and data.startswith((b"owned-module-manifest.json", b"handoff-plan.json"), 30)):
@@ -786,13 +789,32 @@ def is_reparse(file: Path) -> bool:
                                     getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0))
 
 
-def inputs(root: Path, index: bool, tree: bool):
+def inspect_stream(name, stream, allow_private_symbols=False):
+    header = stream.read(8)
+    if header in PRIVATE_ARCHIVE_HEADERS:
+        # This signature already rejects the file. Account for its full extent without
+        # buffering the dump. Git delivers immutable blobs through a non-seekable pipe.
+        # Windows may report an anonymous Git pipe as seekable and return the buffered position.
+        try:
+            info = os.fstat(stream.fileno())
+        except (AttributeError, OSError):
+            info = None
+        size = info.st_size if info is not None and stat.S_ISREG(info.st_mode) else len(header) + sum(
+            len(block) for block in iter(lambda: stream.read(1 << 20), b""))
+        return size, inspect(name, header, allow_private_symbols)
+    data = header + stream.read()
+    return len(data), inspect(name, data, allow_private_symbols)
+
+
+def inputs(root: Path, index: bool, tree: bool, read=lambda name, stream: stream.read()):
     if tree:
         for file in sorted(root.rglob("*")):
             if is_reparse(file):
                 raise ValueError("reparse point in package input")
             if file.is_file():
-                yield file.relative_to(root).as_posix(), file.read_bytes()
+                name = file.relative_to(root).as_posix()
+                with file.open("rb") as stream:
+                    yield name, read(name, stream)
     elif index:
         for entry in git(root, "ls-files", "--stage", "-z").split(b"\0"):
             if not entry:
@@ -801,7 +823,14 @@ def inputs(root: Path, index: bool, tree: bool):
             mode, oid, stage = metadata.split()
             if stage != b"0" or mode not in (b"100644", b"100755"):
                 raise ValueError("unmerged or non-regular index input")
-            yield name.decode("utf-8"), git(root, "cat-file", "blob", oid.decode("ascii"))
+            name = name.decode("utf-8")
+            command = ["git", "-C", str(root), "cat-file", "blob", oid.decode("ascii")]
+            with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL) as process:
+                result = read(name, process.stdout)
+                process.stdout.close()
+                if process.wait():
+                    raise ValueError("index blob unavailable")
+            yield name, result
     else:
         names = git(root, "ls-files", "--cached", "--others", "--exclude-standard", "-z")
         for name in sorted(set(names.decode("utf-8").split("\0")) - {""}):
@@ -811,7 +840,8 @@ def inputs(root: Path, index: bool, tree: bool):
             if any(is_reparse(p) for p in (file, *file.parents) if p != root and root in p.parents) or not file.resolve().is_relative_to(root):
                 raise ValueError("reparse point in working-tree input")
             if file.is_file():
-                yield name, file.read_bytes()
+                with file.open("rb") as stream:
+                    yield name, read(name, stream)
 
 
 def main() -> int:
@@ -838,10 +868,12 @@ def main() -> int:
     try:
         if not root.is_dir():
             raise ValueError("input root is not a directory")
-        for name, data in inputs(root.resolve(), args.index, args.tree):
+        def scan(name, stream):
+            return inspect_stream(name, stream, args.allow_private_symbols)
+        for _, (size, findings) in inputs(root.resolve(), args.index, args.tree, scan):
             result["files"] += 1
-            result["bytes"] += len(data)
-            result["findings"].extend(inspect(name, data, args.allow_private_symbols))
+            result["bytes"] += size
+            result["findings"].extend(findings)
         if args.tree and result["files"] == 0:
             raise ValueError("empty package input")
     except (OSError, ValueError, subprocess.CalledProcessError):

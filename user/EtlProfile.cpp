@@ -598,7 +598,7 @@ namespace
 
     bool OpenSource(const std::filesystem::path& path, symbol_artifacts::Directories& parents,
         SchemaArtifact& source, std::wstring& volumePath, uint64_t maximum = MaxBytes,
-        std::optional<uint64_t>* memberBytes = nullptr, DWORD* apiError = nullptr)
+        std::optional<uint64_t>* memberBytes = nullptr, DWORD* apiError = nullptr, DWORD directoryShare = FILE_SHARE_READ)
     {
         const auto failed = [&] { if (apiError) { *apiError = GetLastError(); } return false; };
         HANDLE raw = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
@@ -620,8 +620,7 @@ namespace
             if (actual != maximum) { return false; }
         }
         if (!source.OpenHandle(raw, maximum) || !source.PathNamesFile()) { return false; }
-        // OpenTrace takes a name. Use the leased file's volume GUID and the
-        // pinned directory hierarchy for the entire decode, including reopens.
+        // Resolve the actual volume even when the supplied drive is substituted.
         std::vector<wchar_t> buffer(32768);
         const auto length = GetFinalPathNameByHandleW(raw, buffer.data(), static_cast<DWORD>(buffer.size()), VOLUME_NAME_GUID);
         if (!length) { return failed(); }
@@ -630,22 +629,23 @@ namespace
         if (volumePath.rfind(L"\\\\?\\Volume{", 0) != 0) { return false; }
         const auto root = volumePath.find(L"}\\");
         if (root == std::wstring::npos) { return false; }
-        // A substituted drive can start below the real volume root. Hold each
-        // actual ancestor against rename and reparse changes, then check the leaf.
+        // Pin every actual ancestor and recheck the leaf's identity. Path-based
+        // decoders also exclude directory writes throughout their Windows API calls.
         for (auto end = volumePath.find(L'\\', root + 2); end != std::wstring::npos; end = volumePath.find(L'\\', end + 1))
         {
-            if (!parents.HoldExisting(volumePath.substr(0, end), FILE_SHARE_READ, apiError)) { return false; }
+            if (!parents.HoldExisting(volumePath.substr(0, end), directoryShare, apiError)) { return false; }
         }
         return source.PathNamesFile(volumePath);
     }
 
     bool OpenTraceSource(const std::wstring& name, symbol_artifacts::Directories& parents, SchemaArtifact& source,
-        std::wstring& volumePath, uint64_t maximum = MaxBytes, std::optional<uint64_t>* memberBytes = nullptr, DWORD* apiError = nullptr)
+        std::wstring& volumePath, uint64_t maximum = MaxBytes, std::optional<uint64_t>* memberBytes = nullptr,
+        DWORD* apiError = nullptr, DWORD directoryShare = FILE_SHARE_READ)
     {
         if (apiError) { *apiError = ERROR_SUCCESS; }
         std::filesystem::path path;
         return symbol_artifacts::LocalRoot(name, &path) && parents.Pin(path.parent_path(), false, FILE_SHARE_READ | FILE_SHARE_WRITE, apiError) &&
-            OpenSource(path, parents, source, volumePath, maximum, memberBytes, apiError);
+            OpenSource(path, parents, source, volumePath, maximum, memberBytes, apiError, directoryShare);
     }
 
     std::wstring Hex(uint64_t value)
@@ -1821,6 +1821,11 @@ static int ReadSavedEtl(const std::vector<std::wstring>& args, Family family)
 bool etl_profile::SavedEtlInput::Open(const std::wstring& name, uint64_t maximum, DWORD* apiError)
 {
     return OpenTraceSource(name, Parents, File, VolumePath, maximum, nullptr, apiError);
+}
+
+bool etl_profile::SavedEtlInput::OpenForHandleReads(const std::wstring& name, uint64_t maximum)
+{
+    return OpenTraceSource(name, Parents, File, VolumePath, maximum, nullptr, nullptr, FILE_SHARE_READ | FILE_SHARE_WRITE);
 }
 
 bool etl_profile::SavedEtlInput::OpenMember(const std::wstring& name, uint64_t expectedBytes, std::optional<uint64_t>& observedBytes, DWORD& apiError)

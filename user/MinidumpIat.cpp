@@ -624,8 +624,8 @@ int RunMinidumpIatCommand(const std::vector<std::wstring>& args, bool directJson
     etl_profile::SavedEtlInput dump, reference;
     std::wstring fields, declaration;
     const wchar_t* issue = nullptr;
-    if (!dump.Open(args[2], MaxDumpBytes) || dump.File.Sha256 != dumpPin) { issue = L"dump_pin_unavailable"; }
-    else if (!reference.Open(args[4], ReferenceArtifactMaxBytes) || reference.File.Sha256 != refPin ||
+    if (!dump.OpenForHandleReads(args[2], MaxDumpBytes) || dump.File.Sha256 != dumpPin) { issue = L"dump_pin_unavailable"; }
+    else if (!reference.OpenForHandleReads(args[4], ReferenceArtifactMaxBytes) || reference.File.Sha256 != refPin ||
         !DistinctLocalFileHandles(dump.File.Handle(), reference.File.Handle())) { issue = L"reference_pin_unavailable"; }
     else
     {
