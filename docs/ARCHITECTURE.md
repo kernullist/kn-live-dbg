@@ -3492,9 +3492,22 @@ process generation. The saved capture report retains these facts when an
 open fails, a generation differs or the source opens but the reference
 fails. A published capture also carries the digest of the inner recipe
 used to publish its original claim. Offline source replay checks this
-digest against the reproduced case. The capture report requires separate
-retention. The caller's file digest identifies the report bytes. Producer
+digest against the reproduced case. A case archived with `journal-image`
+requires separate retention of the capture report. The caller's file
+digest identifies the report bytes. Producer
 authentication requires a separate trust source. [Windows handle duplication](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
+
+The process image source collection accepts a report after checking its
+external digest and replaying the original acquisition. For a published
+image it pins the raw claim and PE across the same replay and archives
+those bytes. The report digest names the acquisition transaction. A
+recorded or interrupted attempt contributes three original files. A
+failed attempt contributes one. The closure names every committed member
+and counts the supplied attempt. Multiple collections can reference the
+same PE. Recovery verifies the handle receipt, original recipe digest,
+operation, result and closure ledger. Reproducing the semantic claim uses
+the separate source replay command. After retirement the small ledger
+preserves the outcome and its denominator. [Archive and replay commands](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
 
 The one-shot collector registers a console interrupt handler before opening
 the target. The handler sets a stop flag. Reads and mapping checks record when

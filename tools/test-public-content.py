@@ -71,6 +71,9 @@ class PublicContentTests(unittest.TestCase):
 
     def test_process_image_source_receipts(self):
         samples = (dict(schema="kn.process_image_source.v1"), dict(schema="kn.image_source_replay.v1"),
+                   dict(schema="kn.image_source_session.v1"), dict(schema="kn.image_source_collection.v1"),
+                   dict(archived_attempts="1", archived_claims="0"), dict(report_committed=True, capture_status="failed"),
+                   dict(committed_source_report_path="private"),
                    dict(requested_pid="1", requested_creation_filetime="3"),
                    dict(acquisition_id="2", parent_acquisition_id="1", requested_filetime="3"),
                    dict(pid="1", creation_filetime="3", win32_status="0"), dict(capture_status="failed", original_claim_matched=False))
@@ -249,7 +252,7 @@ class PublicContentTests(unittest.TestCase):
                      "capture.KNIRP", "capture.knirp.pending-1", "session.KNIRPLEDGER", "session.knirpledger.pending-1", "capture.KNCASE", "capture.kncase.pending-123", "session.knledger", "session.knledger.pending-123",
                      "manifest.KNINDEX", "chunk.knchunk", "manifest.knindex.pending-123", "chunk.knchunk.pending-123",
                      "types.KNSCHEMA", "types.knschema.pending-123", "ref.knblob", "ref.knblob.pending-123",
-                     "case.KNSCOPEAPPROVAL", "case.knscopeapproval.pending-1", "input.KNSCOPEBLOB", "input.knscopeblob.pending-1", "session.KNSCOPELEDGER", "session.knscopeledger.pending-1", "case.KNAPPROVALCASE", "case.knapprovalcase.pending-1", "session.KNAPPROVALLEDGER", "session.knapprovalledger.pending-1", "changes.KNCHANGE", "changes.knchange.pending-1", "policy.KNAPPROVAL", "policy.knapproval.pending-1", "capture.KNCAPTURE", "capture.kncapture.pending-1", "session.KNCAPTURELEDGER", "session.kncaptureledger.pending-1", "recipe.KNVERIFY", "recipe.knverify.pending-123", "capture.KNTRACE", "capture.kntrace.pending-123",
+                     "case.KNSCOPEAPPROVAL", "case.knscopeapproval.pending-1", "input.KNSCOPEBLOB", "input.knscopeblob.pending-1", "session.KNSCOPELEDGER", "session.knscopeledger.pending-1", "case.KNAPPROVALCASE", "case.knapprovalcase.pending-1", "session.KNAPPROVALLEDGER", "session.knapprovalledger.pending-1", "changes.KNCHANGE", "changes.knchange.pending-1", "policy.KNAPPROVAL", "policy.knapproval.pending-1", "capture.KNCAPTURE", "capture.kncapture.pending-1", "source.KNSOURCE", "source.knsource.pending-1", "session.KNSOURCELEDGER", "session.knsourceledger.pending-1", "session.KNCAPTURELEDGER", "session.kncaptureledger.pending-1", "recipe.KNVERIFY", "recipe.knverify.pending-123", "capture.KNTRACE", "capture.kntrace.pending-123",
                      "original.KNREADS", "original.knreads.pending-123", "session.KNREADLEDGER", "session.knreadledger.pending-123",
                      "slice.KNSLICE", "slice.knslice.pending-123", "sweep.KNSWEEP", "sweep.knsweep.pending-123",
                      "session.KNSESSION", "session.knsession.pending-123", "record.KNJSEG", "record.knjseg.pending-123",

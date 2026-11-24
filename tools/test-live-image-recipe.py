@@ -91,6 +91,12 @@ def signal_capture(event, program, command):
     kernel.SetConsoleCtrlHandler.argtypes = [handler_type, wintypes.BOOL]
     kernel.GetConsoleProcessList.argtypes = [ctypes.POINTER(wintypes.DWORD), wintypes.DWORD]
     kernel.GenerateConsoleCtrlEvent.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.FindFirstChangeNotificationW.argtypes = [wintypes.LPCWSTR, wintypes.BOOL, wintypes.DWORD]
+    kernel.FindFirstChangeNotificationW.restype = wintypes.HANDLE
+    kernel.FindNextChangeNotification.argtypes = [wintypes.HANDLE]
+    kernel.FindCloseChangeNotification.argtypes = [wintypes.HANDLE]
+    kernel.WaitForMultipleObjects.argtypes = [wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.BOOL, wintypes.DWORD]
+    kernel.WaitForMultipleObjects.restype = wintypes.DWORD
 
     def members():
         ids = (wintypes.DWORD * 8)()
@@ -104,16 +110,23 @@ def signal_capture(event, program, command):
     case = Path(command[7])
     if case.exists() or members() != {os.getpid()}:
         raise RuntimeError("control trial requires a new case and its own console")
-    if not kernel.SetConsoleCtrlHandler(handler, True):
+    # Ctrl+C ignore is an inheritable attribute, independent of the handler list.
+    if not kernel.SetConsoleCtrlHandler(handler_type(), False) or not kernel.SetConsoleCtrlHandler(handler, True):
         raise ctypes.WinError(ctypes.get_last_error())
+    change = kernel.FindFirstChangeNotificationW(str(case.parent), False, 2)  # FILE_NOTIFY_CHANGE_DIR_NAME
     try:
+        if change == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
         with subprocess.Popen([program, *command], stdout=subprocess.PIPE, stderr=subprocess.PIPE) as capture:
             try:
+                waitables = (wintypes.HANDLE * 2)(change, int(capture._handle))
                 deadline = time.monotonic() + 30
                 while not case.is_dir():
-                    if capture.poll() is not None or time.monotonic() >= deadline:
+                    remaining = max(0, int(1000 * (deadline - time.monotonic())))
+                    if not remaining or kernel.WaitForMultipleObjects(2, waitables, False, remaining) != 0:
                         raise RuntimeError("capture did not create its new case")
-                    time.sleep(0.001)
+                    if not case.is_dir() and not kernel.FindNextChangeNotification(change):
+                        raise ctypes.WinError(ctypes.get_last_error())
                 # The capture creates the directory after opening the target and reference.
                 if members() != {os.getpid(), capture.pid}:
                     raise RuntimeError("unexpected console membership at interruption")
@@ -126,6 +139,8 @@ def signal_capture(event, program, command):
                     capture.kill()
                     capture.wait(timeout=10)
     finally:
+        if change != ctypes.c_void_p(-1).value:
+            kernel.FindCloseChangeNotification(change)
         kernel.SetConsoleCtrlHandler(handler, False)
 
 
@@ -152,8 +167,9 @@ def capture_interruptions(exe, command, root, check):
         args = command.copy()
         args[3], args[7] = reference, case
         diagnostic = run_console_capture(exe, args, event)
-        check(diagnostic["code"] == 1 and not diagnostic["stderr"], f"{name} exits with an interrupted acquisition")
-        result = json.loads(diagnostic["stdout"])
+        result = json.loads(diagnostic["stdout"]) if diagnostic["stdout"].strip() else {}
+        check(diagnostic["code"] == 1 and not diagnostic["stderr"],
+              f"{name}: exit={diagnostic['code']} capture={result.get('status')} stderr_bytes={len(diagnostic['stderr'].encode())}")
         check(result["status"] == "interrupted" and result["original_claim_recorded"] and
               result["result"]["ownership"] == "owned_unverified", "observed stop publishes an incomplete comparison")
         payload = unpack_recipe(json.loads((case / "recipe.knverify").read_bytes()))["payload"]
@@ -417,6 +433,12 @@ def main():
                         managed_source = run(["--offline", "!kmon", "replay-image-source", capture_file, capture_pin,
                                               store / archived["capture_path"], "/json"])
                         check(managed_source == source, "original source actions and interrupted claim bind to the archived case")
+                        acquisition = run(["--offline", "!kmon", "journal-image-source", capture_file, capture_pin, store,
+                                           "2", store / archived["capture_path"], "/json"])
+                        check(acquisition["closed"] and acquisition["capture_status"] == "interrupted", "interrupted attempt archived")
+                        capture_file.unlink()
+                        retained = run(["--offline", "!kmon", "replay-image-source", store / acquisition["report_path"], capture_pin, "/json"])
+                        check(retained == source, "the archive reproduces the interrupt after the original stdout is removed")
                 current = replay(directory, current=True)
                 check(current["status"] == "reanalyzed" and current["result"] == exact["result"], "current policy uses only retained inputs")
                 check(not exact["execution_observed"] and not exact["collector_authenticated"], "read evidence does not prove execution or collector trust")

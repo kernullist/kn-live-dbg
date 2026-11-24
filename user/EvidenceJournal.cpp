@@ -61,20 +61,20 @@ namespace
         return L"{\"schema\":" + mcpjson::Quote(schema) + L",\"payload_sha256\":" + mcpjson::Quote(Hash(payload)) +
             L",\"payload\":" + payload + L"}";
     }
-    std::wstring SessionJson(const std::wstring& id, unsigned version = 1)
+    constexpr const wchar_t* SessionPolicies[] = {L"kn.image_collection_journal.v1", L"kn.image_irp_collection_journal.v2",
+        L"kn.image_claim_irp_collection_journal.v3", L"kn.image_irp_claim_collection_journal.v4", DirectImageCollectionPolicy,
+        ImageApprovalCollectionPolicy, ImageScopeApprovalCollectionPolicy, ImageSourceCollectionPolicy};
+    std::wstring SessionJson(const std::wstring& id, size_t policy)
     {
         return Envelope(L"kn.evidence_session.v1", L"{\"collection_id\":" + mcpjson::Quote(id) +
-            L",\"policy\":" + mcpjson::Quote(version == 7 ? ImageScopeApprovalCollectionPolicy : version == 6 ? ImageApprovalCollectionPolicy : version == 5 ? DirectImageCollectionPolicy :
-                version == 4 ? L"kn.image_irp_claim_collection_journal.v4" :
-                version == 3 ? L"kn.image_claim_irp_collection_journal.v3" :
-                version == 2 ? L"kn.image_irp_collection_journal.v2" : L"kn.image_collection_journal.v1") +
+            L",\"policy\":" + mcpjson::Quote(SessionPolicies[policy]) +
             L",\"hash_basis\":\"exact_file_bytes\","
             L"\"collector_authenticated\":false,\"target_coverage_established\":false}");
     }
     bool FailureLedger(const std::wstring& schema)
     {
         return schema == L"kn.image_read_session.v1" || schema == L"kn.irp_capture_session.v1" || schema == DirectImageCollectionLedger ||
-            schema == ImageApprovalCollectionLedger || schema == ImageScopeApprovalCollectionLedger;
+            schema == ImageApprovalCollectionLedger || schema == ImageScopeApprovalCollectionLedger || schema == ImageSourceCollectionLedger;
     }
     bool IrpPath(const std::wstring& path) { return path.rfind(L"irp-", 0) == 0; }
     bool IrpCaptureSchema(const std::wstring& schema)
@@ -192,6 +192,14 @@ namespace
             return Id(id) && m.Bytes <= DirectImageCaptureMaxBytes && (m.Schema == L"kn.image_recipe.v1" ||
                 m.Schema == L"kn.image_recipe.v2" || m.Schema == L"kn.image_recipe.v3" || m.Schema == L"kn.image_claim_publication.v1");
         }
+        if (m.Path == ImageSourceReportPath(id, m.Sha256)) { return Id(id) && m.Schema == L"kn.image_capture.v3" && m.Bytes <= DirectImageCaptureMaxBytes; }
+        const auto casePrefix = L"image-captures/case-" + id + L"-";
+        if (m.Path.rfind(casePrefix, 0) == 0)
+        {
+            const auto pin = m.Path.substr(casePrefix.size(), 64);
+            return Id(id) && Digest(pin) && m.Path == ImageSourceCasePath(id, pin) &&
+                m.Schema == L"kn.image_claim_publication.v1" && m.Bytes <= DirectImageCaptureMaxBytes;
+        }
         if (m.Path == L"image-approvals/assessment-" + id + L".knapprovalcase")
             { return Id(id) && m.Schema == ImageApprovalPublicationSchema && m.Bytes <= ImageApprovalPublicationMaxBytes; }
         if (m.Path == L"image-approvals/scope-assessment-" + id + L".knscopeapproval")
@@ -204,6 +212,7 @@ namespace
         if (m.Path == L"image-approvals/changes-" + m.Sha256 + L".knchange")
             { return m.Schema == L"kn.authorized_image_changes.v1" && m.Bytes <= ImageApprovalInputMaxBytes; }
         if (m.Bytes > MaxJsonBytes) { return false; }
+        if (m.Path == ImageSourceSessionPath(id)) { return Id(id) && m.Schema == ImageSourceCollectionLedger; }
         if (m.Path == L"image-approvals/scope-session-" + id + L".knscopeledger") { return Id(id) && m.Schema == ImageScopeApprovalCollectionLedger; }
         if (m.Path == L"image-approvals/session-" + id + L".knapprovalledger") { return Id(id) && m.Schema == ImageApprovalCollectionLedger; }
         if (m.Path == L"image-captures/session-" + id + L".kncaptureledger") { return Id(id) && m.Schema == DirectImageCollectionLedger; }
@@ -448,6 +457,7 @@ struct EvidenceJournal::Impl
     {
         std::map<std::wstring, Handle> Files;
         std::map<std::wstring, std::wstring> ImagePayloads;
+        std::wstring SourceLedger, SourceClaimBinding;
     };
     fs::path Root, Collection;
     EvidenceJournalRecovery Result;
@@ -474,6 +484,8 @@ struct EvidenceJournal::Impl
     bool Direct = false;
     bool Approved = false;
     bool ScopedApproval = false;
+    bool SourceArchive = false;
+    std::wstring ExpectedSourceLedger;
     bool RetirementSeen = false;
     bool InspectPriority = false, SweepHasGap = false;
     std::array<uint64_t, 5> ImageTickets{};
@@ -596,15 +608,18 @@ struct EvidenceJournal::Impl
         const bool directCapture = Direct && t.Kind == L"image_capture";
         const bool approval = Approved && t.Kind == L"image_approval";
         const bool scopedApproval = ScopedApproval && t.Kind == L"image_scope_approval";
-        if (((Direct || Approved || ScopedApproval) ? (!directCapture && !approval && !scopedApproval && t.Kind != L"closure") :
+        const bool source = SourceArchive && t.Kind == L"image_source";
+        const bool single = Direct || Approved || ScopedApproval || SourceArchive;
+        if ((single ? (!directCapture && !approval && !scopedApproval && !source && t.Kind != L"closure") :
                 (t.Kind != L"image_reads" && t.Kind != L"image_sweep" && t.Kind != L"closure" && !irp && !irpLedger)) ||
-            (irp || directCapture || approval || scopedApproval ? !Digest(t.Id) : !Id(t.Id)) ||
+            (irp || directCapture || approval || scopedApproval || source ? !Digest(t.Id) : !Id(t.Id)) ||
             t.Members.empty() || t.Members.size() > 8192 || t.Requires.size() > 8192 ||
             t.Members.size() + t.Requires.size() > MaxReferences - References) { return Fail(L"invalid_transaction_or_reference_budget"); }
         if (SharedReferences != nullptr && t.Members.size() + t.Requires.size() > StoreMaxReferences - *SharedReferences)
             { SharedBudgetIssue = L"store_reference_budget_exhausted"; return Fail(SharedBudgetIssue); }
         if ((t.Kind == L"closure" && (t.Id != L"0" || t.Members.size() != 1 ||
-                t.Members[0].Path != (ScopedApproval ? L"image-approvals/scope-session-" + Result.CollectionId + L".knscopeledger" :
+                t.Members[0].Path != (SourceArchive ? ImageSourceSessionPath(Result.CollectionId) :
+                    ScopedApproval ? L"image-approvals/scope-session-" + Result.CollectionId + L".knscopeledger" :
                     Approved ? L"image-approvals/session-" + Result.CollectionId + L".knapprovalledger" :
                     Direct ? L"image-captures/session-" + Result.CollectionId + L".kncaptureledger" :
                     L"image-reads/session-" + Result.CollectionId + L".knreadledger"))) ||
@@ -629,9 +644,11 @@ struct EvidenceJournal::Impl
             { return Fail(L"one_approval_with_five_members_required"); }
         if (scopedApproval && (t.Members.size() < 5 || t.Members.size() > ImageScopeApprovalMaximumInputs + 4 ||
             !t.Requires.empty() || !Records.empty())) { return Fail(L"one_scoped_approval_with_original_inputs_required"); }
-        if ((Direct || Approved || ScopedApproval) && t.Kind == L"closure")
+        if (source && (!Records.empty() || !t.Requires.empty() || (t.Members.size() != 1 && t.Members.size() != 3)))
+            { return Fail(L"invalid_image_source_members"); }
+        if (single && t.Kind == L"closure")
         {
-            if (Records.size() != 1 || Records.front().Transaction.Kind != (ScopedApproval ? L"image_scope_approval" : Approved ? L"image_approval" : L"image_capture"))
+            if (Records.size() != 1 || Records.front().Transaction.Kind != (SourceArchive ? L"image_source" : ScopedApproval ? L"image_scope_approval" : Approved ? L"image_approval" : L"image_capture"))
                 { return Fail(L"direct_capture_required_before_closure"); }
             std::vector<std::wstring> required;
             for (const auto& member : Records.front().Transaction.Members) { required.push_back(member.Path); }
@@ -639,7 +656,7 @@ struct EvidenceJournal::Impl
         }
         std::wstring previous;
         size_t added = 0;
-        bool irpRoot = false, directRoot = false;
+        bool irpRoot = false, directRoot = false, sourceRoot = false;
         bool approvalRoot = false, approvalCapture = false, approvalReference = false, approvalPolicy = false, approvalManifest = false;
         uint64_t scopeInputs = 0, scopeInputBytes = 0;
         for (const auto& m : t.Members)
@@ -647,7 +664,7 @@ struct EvidenceJournal::Impl
             if (!MemberValid(m, Result.CollectionId) || (!previous.empty() && m.Path <= previous)) { return Fail(L"invalid_or_duplicate_member"); }
             if (!Claims && !ScopedApproval && m.Schema == ImageScopeClaimPublicationSchema) { return Fail(L"claim_publication_requires_v3_policy"); }
             if (!IrpClaims && m.Schema == PendingIrpClaimPublicationSchema) { return Fail(L"irp_claim_publication_requires_v4_policy"); }
-            if (!Direct && !Approved && DirectPath(m.Path)) { return Fail(L"direct_capture_policy_required"); }
+            if (!Direct && !Approved && !SourceArchive && DirectPath(m.Path)) { return Fail(L"direct_capture_policy_required"); }
             if (!Approved && !ScopedApproval && ApprovalPath(m.Path)) { return Fail(L"approval_collection_policy_required"); }
             if (!ScopedApproval && ScopeInputPath(m.Path)) { return Fail(L"scope_approval_collection_policy_required"); }
             if ((!irp && !irpLedger && IrpPath(m.Path)) || (irpLedger && m.Schema != L"kn.irp_capture_session.v1"))
@@ -666,6 +683,12 @@ struct EvidenceJournal::Impl
                     { directRoot = true; }
                 else if (m.Schema != L"raw.bytes" || m.Path != L"image-references/" + m.Sha256 + L".knblob")
                     { return Fail(L"invalid_direct_capture_member"); }
+            }
+            if (source)
+            {
+                if (m.Path == ImageSourceReportPath(Result.CollectionId, t.Id) && m.Sha256 == t.Id) { sourceRoot = true; }
+                else if (m.Path != ImageSourceCasePath(Result.CollectionId, t.Id) && m.Path != L"image-references/" + m.Sha256 + L".knblob")
+                    { return Fail(L"invalid_image_source_member"); }
             }
             if (approval)
             {
@@ -707,6 +730,7 @@ struct EvidenceJournal::Impl
         }
         if (irp && !irpRoot) { return Fail(L"irp_capture_root_required"); }
         if (directCapture && !directRoot) { return Fail(L"direct_capture_root_required"); }
+        if (source && !sourceRoot) { return Fail(L"image_source_report_required"); }
         if (approval && !(approvalRoot && approvalCapture && approvalReference && approvalPolicy && approvalManifest))
             { return Fail(L"approval_member_set_incomplete"); }
         if (scopedApproval && !(approvalRoot && scopeInputs && approvalReference && approvalPolicy && approvalManifest))
@@ -744,7 +768,9 @@ struct EvidenceJournal::Impl
             {
                 const auto member = std::lower_bound(t.Members.begin(), t.Members.end(), input.first,
                     [](const auto& m, const auto& path) { return m.Path < path; });
-                if (member == t.Members.end() || member->Path != input.first || !MatchesImageArchiveInput(input.second, *member, L""))
+                const auto payload = added.ImagePayloads.find(input.first);
+                if (member == t.Members.end() || member->Path != input.first ||
+                    !MatchesImageArchiveInput(input.second, *member, payload == added.ImagePayloads.end() ? L"" : payload->second))
                     { return Fail(L"image_reference_not_committed"); }
             }
         }
@@ -756,7 +782,14 @@ struct EvidenceJournal::Impl
                 [&](const auto& member) { return member.Path == slice; }))) { priority = CollectionPriority::Gap; }
             ++ImageTickets[static_cast<size_t>(priority)];
         }
-        if (kind == ImageArchiveKind::Reads || kind == ImageArchiveKind::Slice)
+        if (kind == ImageArchiveKind::SourceReport)
+        {
+            if (t.Kind != L"image_source" || catalog.Inputs.size() + 1 != t.Members.size() ||
+                added.SourceClaimBinding != catalog.SourceClaimBinding) { return Fail(L"capture_report_dependencies_mismatch"); }
+            added.SourceLedger = ImageSourceSessionJson(Result.CollectionId, t.Members, catalog.CaptureStatus, catalog.SourceStatus);
+        }
+        if (t.Kind == L"image_source" && kind == ImageArchiveKind::Capture) { added.SourceClaimBinding = std::move(catalog.SourceClaimBinding); }
+        if (kind == ImageArchiveKind::Reads || kind == ImageArchiveKind::Slice || (t.Kind == L"image_source" && kind == ImageArchiveKind::Capture))
             { added.ImagePayloads.emplace(root.Path, std::move(catalog.PayloadSha256)); }
         return Timely();
     }
@@ -793,6 +826,8 @@ struct EvidenceJournal::Impl
             if (m.Schema != L"raw.bytes" && (!mcpjson::GetString(json, L"schema", &schema) || schema != m.Schema))
                 { return Fail(L"member_schema_mismatch"); }
             if (imageKind != ImageArchiveKind::None && !VerifyImageCatalog(t, m, imageKind, json, *added)) { return false; }
+            if (!ledgersOnly && m.Schema == ImageSourceCollectionLedger && json != ExpectedSourceLedger)
+                { return Fail(L"image_source_ledger_mismatch"); }
             if (InspectPriority && !ledgersOnly && (m.Schema == L"kn.image_read_session.v1" || m.Schema == L"kn.irp_capture_session.v1"))
             {
                 const auto count = [&](const wchar_t* kind)
@@ -844,6 +879,7 @@ struct EvidenceJournal::Impl
         auto accepted = Result;
         Files.merge(added.Files);
         ImagePayloads.merge(added.ImagePayloads);
+        if (!added.SourceLedger.empty()) { ExpectedSourceLedger = std::move(added.SourceLedger); }
         for (const auto& m : r.Transaction.Members)
         {
             ++accepted.MemberReferences; accepted.LogicalBytes += m.Bytes;
@@ -853,6 +889,11 @@ struct EvidenceJournal::Impl
                 { accepted.SweepPaths.push_back(m.Path); }
             if ((r.Transaction.Kind == L"image_capture" || r.Transaction.Kind == L"image_approval") && DirectPath(m.Path))
                 { accepted.DirectCapturePaths.push_back(m.Path); }
+            if (r.Transaction.Kind == L"image_source")
+            {
+                if (m.Schema == L"kn.image_capture.v3") { accepted.SourceReportPath = m.Path; }
+                else if (DirectPath(m.Path)) { accepted.DirectCapturePaths.push_back(m.Path); }
+            }
             if (r.Transaction.Kind == L"image_approval" && m.Schema == ImageApprovalPublicationSchema) { accepted.ApprovalPaths.push_back(m.Path); }
             if (r.Transaction.Kind == L"image_scope_approval" && m.Schema == ImageScopeApprovalPublicationSchema) { accepted.ApprovalPaths.push_back(m.Path); }
         }
@@ -865,7 +906,8 @@ struct EvidenceJournal::Impl
         if (SharedReferences != nullptr)
             { *SharedReferences += Records.back().Transaction.Members.size() + Records.back().Transaction.Requires.size(); }
     }
-    bool Load(const std::wstring& artifactRoot, const std::wstring& id, bool create, bool coordinated = false)
+    bool Load(const std::wstring& artifactRoot, const std::wstring& id, bool create, bool coordinated = false,
+        EvidenceJournalPolicy requested = EvidenceJournalPolicy::ImageV1)
     {
         if (!Id(id)) { return Fail(L"invalid_collection_id"); }
         if (!Text(artifactRoot, 30000)) { return Fail(L"invalid_artifact_root"); }
@@ -892,23 +934,29 @@ struct EvidenceJournal::Impl
             (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
             { return Fail(L"collection_busy_or_lock_unavailable"); }
         const auto manifest = Collection / L"session.knsession";
-        const auto session = SessionJson(id, ScopedApproval ? 7 : Approved ? 6 : Direct ? 5 : IrpClaims ? 4 : Claims ? 3 : Typed ? 2 : 1);
+        const auto policyIndex = static_cast<size_t>(requested);
+        if (policyIndex >= std::size(SessionPolicies)) { return Fail(L"unknown_journal_policy"); }
+        const auto session = SessionJson(id, policyIndex);
         const auto attrs = GetFileAttributesW(NativePath(manifest).c_str());
         if (attrs == INVALID_FILE_ATTRIBUTES && create && GetLastError() == ERROR_FILE_NOT_FOUND &&
             !SaveObservationJson(NativePath(manifest), session, nullptr, AdmitOutput)) { return Fail(L"session_publication_failed"); }
         Handle lease{nullptr, &CloseHandle};
         uint64_t bytes = 0;
-        std::wstring json;
+        std::wstring json, payload, policyName;
         if (!Read(manifest, 4096, &lease, &Result.SessionSha256, &bytes, &json) ||
-            (create ? json != session : (json != SessionJson(id) && json != SessionJson(id, 2) &&
-                json != SessionJson(id, 3) && json != SessionJson(id, 4) && json != SessionJson(id, 5) && json != SessionJson(id, 6) && json != SessionJson(id, 7))))
+            !mcpjson::FindRawValue(json, L"payload", &payload) || !mcpjson::GetString(payload, L"policy", &policyName))
             { return Fail(L"session_missing_or_invalid"); }
-        Direct = json == SessionJson(id, 5);
-        Approved = json == SessionJson(id, 6);
-        ScopedApproval = json == SessionJson(id, 7);
-        IrpClaims = json == SessionJson(id, 4);
-        Claims = IrpClaims || json == SessionJson(id, 3);
-        Typed = Claims || json == SessionJson(id, 2);
+        const auto found = std::find(std::begin(SessionPolicies), std::end(SessionPolicies), policyName);
+        if (found == std::end(SessionPolicies) || (create ? json != session : json != SessionJson(id, found - std::begin(SessionPolicies))))
+            { return Fail(L"session_missing_or_invalid"); }
+        const auto policy = static_cast<EvidenceJournalPolicy>(found - std::begin(SessionPolicies));
+        Direct = policy == EvidenceJournalPolicy::DirectImageV1;
+        Approved = policy == EvidenceJournalPolicy::ApprovedImageV1;
+        ScopedApproval = policy == EvidenceJournalPolicy::ApprovedImageScopeV1;
+        SourceArchive = policy == EvidenceJournalPolicy::ImageSourceV1;
+        IrpClaims = policy == EvidenceJournalPolicy::ImageAndIrpClaimsV4;
+        Claims = IrpClaims || policy == EvidenceJournalPolicy::ImageClaimsAndIrpV3;
+        Typed = Claims || policy == EvidenceJournalPolicy::ImageAndIrpV2;
         Files.emplace(L"@session", std::move(lease));
         Result.HeadSha256 = Result.SessionSha256;
         RetirementRecord retirement;
@@ -961,6 +1009,7 @@ struct EvidenceJournal::Impl
                 ledgers.Paths != retirement.Ledgers.Paths || ledgers.Bytes != retirement.Ledgers.Bytes) { return Fail(L"retirement_closure_or_impact_mismatch"); }
             Result.RetirementSha256 = std::move(receiptHash);
             Result.SweepPaths.clear(); Result.DirectCapturePaths.clear(); Result.ApprovalPaths.clear();
+            Result.SourceReportPath.clear();
         }
         Result.Status = RetirementSeen ? L"retired" : L"verified_prefix"; Result.Issue.clear(); Result.CanResume = !Result.Closed;
         Writable = create && Result.CanResume; Healthy = true;
@@ -1023,14 +1072,8 @@ bool EvidenceJournal::Open(const std::wstring& root, const std::wstring& id, std
     bool ok = false;
     try
     {
-        Data->Direct = policy == EvidenceJournalPolicy::DirectImageV1;
-        Data->Approved = policy == EvidenceJournalPolicy::ApprovedImageV1;
-        Data->ScopedApproval = policy == EvidenceJournalPolicy::ApprovedImageScopeV1;
-        Data->IrpClaims = policy == EvidenceJournalPolicy::ImageAndIrpClaimsV4;
-        Data->Claims = Data->IrpClaims || policy == EvidenceJournalPolicy::ImageClaimsAndIrpV3;
-        Data->Typed = Data->Claims || policy == EvidenceJournalPolicy::ImageAndIrpV2;
         Data->AdmitOutput = std::move(admitOutput);
-        ok = Data->Load(root, id, true);
+        ok = Data->Load(root, id, true, false, policy);
     }
     catch (...) { Data->Fail(L"journal_open_exception"); }
     if (error) { *error = Data->Result.Issue; }
@@ -1164,6 +1207,7 @@ std::wstring EvidenceJournalRecoveryJson(const EvidenceJournalRecovery& r)
         L",\"member_references\":" + N(r.MemberReferences) + L",\"unique_paths\":" + N(r.UniquePaths) +
         L",\"logical_bytes\":" + N(r.LogicalBytes) + L",\"unique_content_bytes\":" + N(r.UniqueContentBytes) +
         L",\"duplicate_reference_bytes\":" + N(r.LogicalBytes - r.UniqueContentBytes) + L",\"read_bytes\":" + N(r.ReadBytes) +
+        (r.SourceReportPath.empty() ? L"" : L",\"committed_source_report_path\":" + mcpjson::Quote(r.SourceReportPath)) +
         L",\"pending_segment_files\":" + N(r.PendingFiles) + L",\"index_status\":" + mcpjson::Quote(r.IndexStatus) +
         L",\"index_created\":" + N(r.IndexCreated) + L",\"index_reused\":" + N(r.IndexReused) +
         L",\"committed_sweep_paths\":" + sweeps + L"],\"committed_direct_capture_paths\":" + captures +
@@ -1547,7 +1591,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
         std::map<std::wstring, ApprovalInputs> approvalCatalogs;
         bool unreadableDirectApproval = false, unreadableScopedApproval = false;
         std::map<std::wstring, ImageArchiveCatalog> imageCatalogs;
-        bool unknownImageReference = false, unknownSweepInputs = false;
+        bool unknownImageReference = false, unknownSweepInputs = false, unknownSourceCases = false;
         std::set<std::wstring> observed;
         uint64_t rootEntries = 0;
         for (const auto folder : store_files::Folders)
@@ -1608,6 +1652,7 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                             {
                                 unknownImageReference = true;
                                 if (imageKind == ImageArchiveKind::Sweep) { unknownSweepInputs = true; }
+                                if (imageKind == ImageArchiveKind::SourceReport) { unknownSourceCases = true; }
                                 if (!decoded) { ++out.UnreadableImageCatalogs; a.ImageCatalog = L"unreadable"; }
                                 else
                                 {
@@ -1738,7 +1783,8 @@ EvidenceStoreInventory EvidenceStoreAccess::Inspect(const std::wstring& artifact
                     { pair.second.Retention = L"unresolved_irp_reference_protected"; }
                 else if (!pair.second.ImageReferrers.empty()) { pair.second.Retention = L"uncommitted_image_input_protected"; }
                 else if ((unknownImageReference && pair.first.rfind(L"image-references/", 0) == 0) ||
-                    (unknownSweepInputs && pair.first.rfind(L"image-reads/", 0) == 0))
+                    (unknownSweepInputs && pair.first.rfind(L"image-reads/", 0) == 0) ||
+                    (unknownSourceCases && pair.first.rfind(L"image-captures/case-", 0) == 0))
                     { pair.second.Retention = L"unresolved_image_input_protected"; }
             }
             if (pair.second.JournalReferences != 0 && !observed.count(pair.first))

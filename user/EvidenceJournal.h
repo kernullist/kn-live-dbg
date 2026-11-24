@@ -34,6 +34,7 @@ struct EvidenceJournalRecovery
     std::vector<std::wstring> SweepPaths;
     std::vector<std::wstring> DirectCapturePaths;
     std::vector<std::wstring> ApprovalPaths;
+    std::wstring SourceReportPath;
 };
 
 struct EvidenceJournalCommit
@@ -44,7 +45,7 @@ struct EvidenceJournalCommit
 };
 
 struct EvidenceStoreInventory;
-enum class EvidenceJournalPolicy { ImageV1, ImageAndIrpV2, ImageClaimsAndIrpV3, ImageAndIrpClaimsV4, DirectImageV1, ApprovedImageV1, ApprovedImageScopeV1 };
+enum class EvidenceJournalPolicy { ImageV1, ImageAndIrpV2, ImageClaimsAndIrpV3, ImageAndIrpClaimsV4, DirectImageV1, ApprovedImageV1, ApprovedImageScopeV1, ImageSourceV1 };
 
 // One writer owns the collection lock and immutable-file leases. Recovery uses
 // the same lock: no live snapshot can be mistaken for a final committed prefix.

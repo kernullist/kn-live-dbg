@@ -15,7 +15,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".knsource", ".knsourceledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -379,13 +379,13 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
     ("contiguous_inventory_verified", "closed_controller_inventory_verified"),
 ))
 RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v1", "kn.benchmark_original_recovery.v1",
-                    "kn.process_image_source.v1", "kn.image_source_replay.v1",
+                    "kn.process_image_source.v1", "kn.image_source_replay.v1", "kn.image_source_collection.v1", "kn.image_source_session.v1",
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
                     "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
-                    '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
+                    '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
                     '"package_sha256"', '"publisher_truth"', '"trusted_root_sha256"', '"target_path"', '"snapshot"',
                     '"truth_ref_sha256"', '"valid_key_ids"', '"signed_hashes"', '"native_policy_sha256"',
                     '"policy_target"', '"source_approval_count"', '"publisher_reference_sha256"', '"source_policy_sha256"',
@@ -394,6 +394,7 @@ RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"original_wind
                     '"wintrust_status"', '"finished_utc"', '"root_updates"', '"root_rotation"', '"last_root_sha256"',
                     '"presented_updates"', '"verified_updates"', '"minimum_root_version"')
 RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
+    ("archived_attempts", "archived_claims"), ("report_committed", "capture_status"), ("committed_source_report_path",),
     ("requested_pid", "requested_creation_filetime"), ("acquisition_id", "parent_acquisition_id", "requested_filetime"),
     ("pid", "creation_filetime", "win32_status"), ("capture_status", "original_claim_matched"),
     ("archive_requires_efs", "journal_head_sha256"), ("original_windows_verification",), ("current_windows_verification",),

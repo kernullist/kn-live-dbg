@@ -246,6 +246,7 @@
     <ClCompile Include="ImageProcessMappings.cpp" />
     <ClCompile Include="ImageClaimPublication.cpp" />
     <ClCompile Include="ImageCaptureCollection.cpp" />
+    <ClCompile Include="ImageSourceCollection.cpp" />
     <ClCompile Include="ImageAuthorizedChanges.cpp" />
     <ClCompile Include="ImageApprovalCollection.cpp" />
     <ClCompile Include="ImageScopeApprovalCollection.cpp" />
@@ -260,6 +261,7 @@
     <ClCompile Include="KmonImageReadSelfTest.cpp" />
     <ClCompile Include="ProcessImageCapture.cpp" />
     <ClCompile Include="ProcessImageSourceReceipt.cpp" />
+    <ClCompile Include="ProcessImageSourceReplay.cpp" />
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
     <ClCompile Include="RebootEvent.cpp" />
     <ClCompile Include="EtlProfile.cpp" />
@@ -520,6 +522,7 @@
     <ClInclude Include="ImageProof.h" />
     <ClInclude Include="ImageClaimPublication.h" />
     <ClInclude Include="ImageCaptureCollection.h" />
+    <ClInclude Include="ImageSourceCollection.h" />
     <ClInclude Include="ImageAuthorizedChanges.h" />
     <ClInclude Include="ImageApprovalCollection.h" />
     <ClInclude Include="ImageScopeApprovalCollection.h" />

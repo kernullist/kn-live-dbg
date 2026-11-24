@@ -78,6 +78,7 @@ def main():
                     ["--connect", address], ["remote", "on"], ["mcp", "on"], ["--cloak"],
                     ["--schema-worker"], ["--symbol-index-worker"], ["--self-test", "all"],
                     ["--offline", "!kmon", "init-store", str(root / "denied-store"), "/acl-only"],
+                    ["--offline", "!kmon", "journal-image-source", "PRIVATE-SENTINEL", "a" * 64, str(root / "denied-store"), "7"],
                     ["--offline", "!kmon", "inventory", str(root), str(root / "denied-index"), "/resume", "/chunks", "1"],
                     ["--offline", "!kmon", "inventory", str(root), str(root / "denied-index"), "/resume", "/verify-entries", "1"],
                     ["--offline", "!kmon", "evidence", str(root), "/inventory", str(root / "denied-index"), "/closure"],

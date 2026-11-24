@@ -1022,7 +1022,31 @@ Omit `$case` for a failed capture. Exit 0 then means the acquisition
 receipt reproduced, and `capture_status` still reports `failed`. A
 published capture with a missing or mismatched case returns exit 1.
 Older capture reports return `source_receipt_missing`. Keep the report and
-its pin alongside an archived case to retain the source history.
+its pin alongside an archived case, or archive the acquisition together.
+
+### Archive a process image acquisition
+
+Use an initialized private store and a new collection ID. Supply the
+collector's original UTF-8 stdout and its SHA-256. For a recorded or
+interrupted capture, include the direct case directory or managed
+`.kncapture` file. A failed capture needs only its report.
+
+```powershell
+$pin = (Get-FileHash -LiteralPath $report -Algorithm SHA256).Hash
+$saved = & $exe --offline '!kmon' journal-image-source $report $pin $store 7 $case /json | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0 -or !$saved.closed) { throw $saved.issue }
+$savedReport = Join-Path $store $saved.report_path
+& $exe --offline '!kmon' journal (Join-Path $store 'collections/7') /index /json
+& $exe --offline '!kmon' replay-image-source $savedReport $pin /json
+```
+
+Exit 0 and `closed=true` confirm publication. The archived report retains
+its exact bytes. Managed replay locates the case from the collection ID and
+the report digest. Replay returns the original failed or interrupted
+outcome as recorded. Keep the external pin when transferring the archive.
+The journal command independently verifies the file membership and closure.
+If delivery of the command result fails, an exact retry uses the same
+collection ID and files. A committed ID rejects a different report.
 
 ## Trace an I/O request through completion
 

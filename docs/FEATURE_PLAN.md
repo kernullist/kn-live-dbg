@@ -76,6 +76,12 @@ The direct process-image collector also preserves the
 needed to distinguish a denied open, a mismatched process generation and
 a reference failure after a successful open.
 
+The [source collection](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
+retains the original acquisition report and its image dependencies in one
+private journal. It also closes attempts that produced no image. The
+original report can be removed after verifying the archive and retaining
+its digest.
+
 Implementation, integration, validation and deployment readiness are independent
 states. A package stays open when its required adapter, raw evidence, compatible
 environment or independent truth is missing. Preserve T01-T30 failure, negative,

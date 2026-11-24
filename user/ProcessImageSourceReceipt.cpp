@@ -1,9 +1,6 @@
 #include "ProcessImageSourceReceipt.h"
 #include "BoundedObservationJson.h"
 #include "ImageClaimPublication.h"
-#include "ReferenceArtifact.h"
-#include "SymbolArtifactCache.h"
-#include <string_view>
 
 namespace
 {
@@ -138,79 +135,51 @@ std::wstring ProcessImageSourceReceiptJson(const ProcessImageSourceReceipt& r)
         L",\"acquired\":" + N(acquired) + L",\"closed\":" + N(closed) + L",\"handle_actions\":" + rows + L"]}";
 }
 
-bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring& reportSha256,
-    const std::wstring& imageCase, std::wstring& output)
+const wchar_t* ParseProcessImageCaptureReport(const std::wstring& page, ProcessImageCaptureReport& report)
 {
-    std::wstring verified = L"null", capture = L"null", pin = L"null";
-    const auto finish = [&](const wchar_t* status, bool matched = false)
-    {
-        output = L"{\"schema\":\"kn.image_source_replay.v1\",\"status\":" + mcpjson::Quote(status) +
-            L",\"report_sha256\":" + pin + L",\"capture_status\":" + capture + L",\"source_initialization\":" + verified +
-            L",\"original_claim_matched\":" + json::B(matched) + L",\"collector_authenticated\":false,\"execution_observed\":false}";
-        return std::wstring_view(status) == L"replayed";
-    };
-    ReferenceArtifact file;
-    std::filesystem::path path;
-    symbol_artifacts::Directories reportParents;
-    if (!symbol_artifacts::LocalRoot(reportPath, &path) || !reportParents.Pin(path.parent_path(), false) ||
-        !file.Open(path.wstring(), nullptr, ImageClaimPublicationMaxBytes)) { return finish(L"report_unavailable"); }
-    if (file.Sha256() != reportSha256) { return finish(L"report_digest_mismatch"); }
-    pin = mcpjson::Quote(reportSha256);
-    const auto& bytes = file.Bytes();
-    const auto page = mcpjson::Utf8ToWide(std::string(bytes.begin(), bytes.end()));
     json::IndexedObject doc;
     std::wstring raw, recorded, openStatus, claim;
-    if (!doc.Parse(page) || doc.String(L"schema") != L"kn.image_capture.v3") { return finish(L"report_invalid"); }
-    if (!doc.Raw(L"source_initialization", &raw)) { return finish(L"source_receipt_missing"); }
+    if (!doc.Parse(page) || doc.String(L"schema") != L"kn.image_capture.v3") { return L"report_invalid"; }
+    if (!doc.Raw(L"source_initialization", &raw)) { return L"source_receipt_missing"; }
     const auto fieldIs = [&](const wchar_t* key, const wchar_t* expected)
     {
         std::wstring value;
         return doc.Raw(key, &value) && value == expected;
     };
     if (!fieldIs(L"collector_authenticated", L"false") || !fieldIs(L"execution_observed", L"false") ||
-        !fieldIs(L"residency_consent", L"true")) { return finish(L"report_invalid"); }
+        !fieldIs(L"residency_consent", L"true")) { return L"report_invalid"; }
     ProcessImageSourceReceipt r;
     if (!ParseReceipt(raw, r) || !doc.Raw(L"original_claim_recorded", &recorded) ||
         !doc.Raw(L"open_status", &openStatus) || openStatus != std::to_wstring(r.Actions.front().Status) ||
-        !doc.Raw(L"result", &claim)) { return finish(L"source_receipt_invalid"); }
+        !doc.Raw(L"result", &claim)) { return L"source_receipt_invalid"; }
     const auto status = doc.String(L"status");
     const bool published = status == L"recorded" || status == L"interrupted";
-    if ((!published && status != L"failed") || recorded != json::B(published)) { return finish(L"report_invalid"); }
+    if ((!published && status != L"failed") || recorded != json::B(published)) { return L"report_invalid"; }
     if (!published)
     {
-        if (claim != L"null" || doc.String(L"policy") != ImageRecipePolicy) { return finish(L"report_invalid"); }
+        if (claim != L"null" || doc.String(L"policy") != ImageRecipePolicy) { return L"report_invalid"; }
         for (auto key : {L"recipe_sha256", L"source_id", L"operation_id", L"reference_sha256", L"target_id", L"consistency"})
-            { if (!fieldIs(key, L"\"\"")) { return finish(L"report_invalid"); } }
+            { if (!fieldIs(key, L"\"\"")) { return L"report_invalid"; } }
     }
-    else if (r.SourceId.empty() || r.SourceId != doc.String(L"source_id") ||
-        doc.String(L"target_id") != L"process:" + std::to_wstring(r.RequestedPid) + L":" + std::to_wstring(r.RequestedCreation) ||
-        doc.String(L"recipe_sha256").size() != 64 || doc.String(L"operation_id").empty() || claim == L"null")
-        { return finish(L"report_invalid"); }
-    verified = raw;
-    capture = mcpjson::Quote(status);
-    if (!published) { return finish(imageCase.empty() ? L"replayed" : L"unexpected_image_case"); }
-    if (imageCase.empty()) { return finish(L"image_case_required"); }
-    symbol_artifacts::Directories caseParents, references;
-    if (!symbol_artifacts::LocalRoot(imageCase, &path) || !caseParents.Pin(path.parent_path(), false))
-        { return finish(L"image_case_unavailable"); }
-    const DWORD attr = GetFileAttributesW(path.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || (attr & FILE_ATTRIBUTE_REPARSE_POINT)) { return finish(L"image_case_unavailable"); }
-    if (attr & FILE_ATTRIBUTE_DIRECTORY)
+    const auto digest = [&](const wchar_t* key)
     {
-        if (!references.Pin(path, false)) { return finish(L"image_case_unavailable"); }
-        path /= L""; // Select directory replay even for a directory with a suffix.
-    }
-    else if (_wcsicmp(path.extension().c_str(), L".kncapture") != 0 ||
-        !references.Pin(path.parent_path().parent_path() / L"image-references", false))
-        { return finish(L"image_case_unavailable"); }
-    DirectImageReplayEvidence evidence;
-    const auto replay = ReplayImageRecipe(path.wstring(), false, nullptr, &evidence);
-    if (replay.Status != L"replayed" || replay.OriginalClaimStatus != L"reproduced") { return finish(L"image_case_unavailable"); }
-    const auto& recipe = evidence.Recipe;
-    if (recipe.FormatVersion != 3 || recipe.SourceId != r.SourceId || recipe.ReadSet.TargetId != doc.String(L"target_id") ||
-        recipe.ReadSet.OperationId != doc.String(L"operation_id") || recipe.ReferenceSha256 != doc.String(L"reference_sha256") ||
-        recipe.Policy != doc.String(L"policy") || recipe.SourceConsistency != doc.String(L"consistency") ||
-        replay.RecipeSha256 != doc.String(L"recipe_sha256") || replay.RecordedResult != claim ||
-        replay.CaptureInterrupted != (status == L"interrupted")) { return finish(L"image_case_mismatch"); }
-    return finish(L"replayed", true);
+        const auto text = doc.String(key);
+        return text.size() == 64 && text.find_first_not_of(L"0123456789abcdef") == std::wstring::npos;
+    };
+    if (published && (r.SourceId.empty() || r.SourceId != doc.String(L"source_id") ||
+        doc.String(L"target_id") != L"process:" + std::to_wstring(r.RequestedPid) + L":" + std::to_wstring(r.RequestedCreation) ||
+        !digest(L"recipe_sha256") || !digest(L"reference_sha256") || doc.String(L"operation_id").empty() || claim == L"null"))
+        { return L"report_invalid"; }
+    report.ReceiptJson = std::move(raw);
+    report.CaptureStatus = status;
+    report.SourceStatus = Outcome(r);
+    report.SourceId = std::move(r.SourceId);
+    report.TargetId = doc.String(L"target_id");
+    report.OperationId = doc.String(L"operation_id");
+    report.ReferenceSha256 = doc.String(L"reference_sha256");
+    report.RecipeSha256 = doc.String(L"recipe_sha256");
+    report.Policy = doc.String(L"policy");
+    report.Consistency = doc.String(L"consistency");
+    report.Result = std::move(claim);
+    return nullptr;
 }

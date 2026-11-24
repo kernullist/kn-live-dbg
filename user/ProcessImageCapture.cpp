@@ -114,61 +114,17 @@ namespace
         for (size_t i = 0; i < args.size(); ++i)
         {
             if (valid && i != 2 && i != 6) { continue; }
-            auto& lease = leases.emplace_back();
-            if (!lease.Hold(sink, args[i], true) || !OutsideCaptureDirectory(sink, lease.PinnedHandle())) { return false; }
+            if (!HoldImageCommandOperand(sink, args[i], leases)) { return false; }
         }
         return true;
     }
 
-    bool ProtectSourceReplayOutput(HANDLE sink, const std::vector<std::wstring>& args, bool valid,
-        const std::wstring& imageCase, std::vector<DistinctArtifactInput>& leases)
-    {
-        if (GetFileType(sink) != FILE_TYPE_DISK) { return true; }
-        if (args.size() > 6) { return false; }
-        const auto hold = [&](const std::wstring& name)
-        {
-            auto& lease = leases.emplace_back();
-            return lease.Hold(sink, name, true) && OutsideCaptureDirectory(sink, lease.PinnedHandle());
-        };
-        for (size_t i = 2; i < args.size(); ++i)
-        {
-            if (valid && i != 2 && !(i == 4 && !imageCase.empty())) { continue; }
-            if (!hold(args[i])) { return false; }
-            std::filesystem::path path;
-            if ((!valid || i == 4) && symbol_artifacts::LocalRoot(args[i], &path) &&
-                _wcsicmp(path.extension().c_str(), L".kncapture") == 0 &&
-                !hold((path.parent_path().parent_path() / L"image-references").wstring())) { return false; }
-        }
-        return true;
-    }
 }
 
-int RunReplayImageSourceCommand(const std::vector<std::wstring>& args, bool directJsonOutput)
+bool HoldImageCommandOperand(HANDLE sink, const std::wstring& name, std::vector<DistinctArtifactInput>& leases)
 {
-    const bool json = !args.empty() && _wcsicmp(args.back().c_str(), L"/json") == 0;
-    const auto fields = args.size() - (json ? 1 : 0);
-    const bool valid = (fields == 4 || fields == 5) && !args[2].empty() && args[3].size() == 64 &&
-        args[3].find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos &&
-        (fields != 5 || (!args[4].empty() && args[4][0] != L'/'));
-    const auto imageCase = valid && fields == 5 ? args[4] : L"";
-    const auto sink = GetStdHandle(valid ? STD_OUTPUT_HANDLE : STD_ERROR_HANDLE);
-    std::vector<DistinctArtifactInput> leases;
-    if (!ProtectSourceReplayOutput(sink, args, valid, imageCase, leases)) { return 2; }
-    if (!valid)
-    {
-        std::wcerr << L"usage: !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/json]\n";
-        return 2;
-    }
-    auto digest = args[3];
-    std::transform(digest.begin(), digest.end(), digest.begin(), towlower);
-    std::wstring output;
-    bool reproduced = false;
-    try { reproduced = ReplayProcessImageSource(args[2], digest, imageCase, output); }
-    catch (const std::exception&) { output = L"{\"schema\":\"kn.image_source_replay.v1\",\"status\":\"replay_failed\"}"; }
-    if (!ProtectSourceReplayOutput(sink, args, true, imageCase, leases)) { return 2; }
-    if (directJsonOutput) { if (!WriteCapabilityJson(output)) { return 3; } }
-    else { std::wcout << output << L"\n"; }
-    return reproduced ? 0 : 1;
+    auto& lease = leases.emplace_back();
+    return lease.Hold(sink, name, true) && OutsideCaptureDirectory(sink, lease.PinnedHandle());
 }
 
 int RunProcessImageCaptureCommand(const std::vector<std::wstring>& args, const std::atomic<bool>* cancellation)

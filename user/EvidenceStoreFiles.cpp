@@ -26,7 +26,7 @@ namespace store_files
     {
         if ((folder.empty() || folder == L"image-references") && ext == L".knblob") { return {MaxBlobBytes, true}; }
         if (folder.empty() && ext == L".knirp") { return {MaxIrpBytes}; }
-        if (folder == L"image-captures" && ext == L".kncapture") { return {DirectImageCaptureMaxBytes}; }
+        if (folder == L"image-captures" && (ext == L".kncapture" || ext == L".knsource")) { return {DirectImageCaptureMaxBytes}; }
         if (folder == L"image-approvals")
         {
             if (ext == L".knscopeapproval") { return {ImageScopeApprovalPublicationMaxBytes}; }
@@ -34,7 +34,7 @@ namespace store_files
             if (ext == L".knapproval" || ext == L".knchange") { return {ImageApprovalInputMaxBytes}; }
             if (ext == L".knapprovalledger" || ext == L".knscopeledger") { return {MaxJsonBytes}; }
         }
-        if ((folder.empty() && ext == L".knirpledger") || (folder == L"image-captures" && ext == L".kncaptureledger") ||
+        if ((folder.empty() && ext == L".knirpledger") || (folder == L"image-captures" && (ext == L".kncaptureledger" || ext == L".knsourceledger")) ||
             (folder == L"image-reads" && (ext == L".knreads" || ext == L".knslice" || ext == L".knreadledger")) ||
             (folder == L"image-sweeps" && ext == L".knsweep") || (folder == L"image-scope-inputs" && ext == L".knscopeblob"))
             { return {MaxJsonBytes}; }

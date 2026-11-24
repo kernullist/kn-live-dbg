@@ -4,6 +4,7 @@
 #include "ImageClaimPublication.h"
 #include "ImageScopeClaimPublication.h"
 #include "ImageSweepManifest.h"
+#include "ProcessImageSourceReceipt.h"
 
 using bounded_observation_json::IndexedObject;
 
@@ -35,6 +36,33 @@ namespace
     bool AddReference(ImageArchiveCatalog& catalog, const std::wstring& hash, uint64_t bytes = 0)
     {
         return AddInput(catalog, L"image-references/" + hash + L".knblob", hash, false, bytes);
+    }
+
+    // A verified recipe digest identifies the stored image input. Separately
+    // compare the outcome the capture report attributed to that operation.
+    std::wstring SourceClaimBinding(const std::wstring& status, const std::wstring& source, const std::wstring& target,
+        const std::wstring& operation, const std::wstring& policy, const std::wstring& consistency, const std::wstring& result)
+    {
+        using mcpjson::Quote;
+        const auto bytes = mcpjson::WideToUtf8(L"[" + Quote(status) + L"," + Quote(source) + L"," + Quote(target) +
+            L"," + Quote(operation) + L"," + Quote(policy) + L"," + Quote(consistency) + L"," + result + L"]");
+        ContentHash hash;
+        return hash.Add(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()) ? hash.Finish() : L"";
+    }
+
+    bool SourceInputs(const std::wstring& page, const EvidenceJournalMember& root, ImageArchiveCatalog& catalog)
+    {
+        const auto id = ImageSourceReportCollection(root.Path, root.Sha256);
+        if (id.empty()) { return false; }
+        ProcessImageCaptureReport report;
+        if (root.Schema != L"kn.image_capture.v3" || ParseProcessImageCaptureReport(page, report)) { return false; }
+        catalog.CaptureStatus = report.CaptureStatus;
+        catalog.SourceStatus = report.SourceStatus;
+        if (!report.Published()) { return true; }
+        catalog.SourceClaimBinding = SourceClaimBinding(report.CaptureStatus, report.SourceId, report.TargetId, report.OperationId,
+            report.Policy, report.Consistency, report.Result);
+        return !catalog.SourceClaimBinding.empty() && AddInput(catalog, ImageSourceCasePath(id, root.Sha256), report.RecipeSha256, true) &&
+            AddReference(catalog, report.ReferenceSha256);
     }
 
     bool ReadReference(const IndexedObject& payload, const std::wstring& schema, ImageArchiveCatalog& catalog)
@@ -81,10 +109,32 @@ namespace
     }
 }
 
+std::wstring ImageSourceSessionJson(const std::wstring& id, const std::vector<EvidenceJournalMember>& members,
+    const std::wstring& captureStatus, const std::wstring& sourceStatus)
+{
+    using bounded_observation_json::N;
+    using mcpjson::Quote;
+    const EvidenceJournalMember* report = nullptr;
+    uint64_t bytes = 0;
+    for (const auto& m : members)
+    {
+        if (m.Schema == L"kn.image_capture.v3") { report = &m; }
+        bytes += m.Bytes;
+    }
+    if (!report || (members.size() != 1 && members.size() != 3)) { return {}; }
+    return L"{\"schema\":" + Quote(ImageSourceCollectionLedger) + L",\"collection_id\":" + Quote(id) +
+        L",\"report_path\":" + Quote(report->Path) + L",\"report_sha256\":" + Quote(report->Sha256) +
+        L",\"capture_status\":" + Quote(captureStatus) + L",\"source_status\":" + Quote(sourceStatus) +
+        L",\"archived_attempts\":\"1\",\"archived_claims\":" + N(members.size() == 3 ? 1 : 0) +
+        L",\"logical_referenced_bytes\":" + N(bytes) +
+        L",\"denominator_scope\":\"one_supplied_capture_report\",\"collector_authenticated\":false}";
+}
+
 ImageArchiveKind ImageArchiveKindForPath(const std::wstring& path)
 {
     const auto dot = path.rfind(L'.');
     if (dot == std::wstring::npos) { return ImageArchiveKind::None; }
+    if (path.rfind(L"image-captures/", 0) == 0 && path.compare(dot, std::wstring::npos, L".knsource") == 0) { return ImageArchiveKind::SourceReport; }
     if (path.rfind(L"image-captures/", 0) == 0 && path.compare(dot, std::wstring::npos, L".kncapture") == 0) { return ImageArchiveKind::Capture; }
     if (path.rfind(L"image-sweeps/", 0) == 0 && path.compare(dot, std::wstring::npos, L".knsweep") == 0) { return ImageArchiveKind::Sweep; }
     if (path.rfind(L"image-reads/", 0) == 0)
@@ -99,6 +149,7 @@ bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember&
     const std::wstring& json, ImageArchiveCatalog& catalog, bool includeReadTicket)
 {
     IndexedObject record, claim;
+    if (kind == ImageArchiveKind::SourceReport) { return SourceInputs(json, root, catalog); }
     if (!record.Parse(json) || record.String(L"schema") != root.Schema) { return false; }
     const bool wrapped = root.Schema == ImageClaimPublicationSchema || root.Schema == ImageScopeClaimPublicationSchema;
     std::wstring inner;
@@ -133,6 +184,18 @@ bool ReadImageArchiveCatalog(ImageArchiveKind kind, const EvidenceJournalMember&
         {
             if (includeReadTicket && schema == L"kn.image_reads.v3") { payload.Raw(L"retention", &catalog.RetentionTicket); }
             return !wrapped && ReadReference(payload, schema, catalog);
+        }
+        if (kind == ImageArchiveKind::Capture && root.Path.rfind(L"image-captures/case-", 0) == 0)
+        {
+            IndexedObject readSet;
+            std::wstring cancelled, result;
+            if (!wrapped || schema != L"kn.image_recipe.v3" || !payload.Raw(L"read_set", &raw) || !readSet.Parse(raw) ||
+                !readSet.Raw(L"cancelled", &cancelled) || (cancelled != L"false" && cancelled != L"true") ||
+                !payload.Raw(L"recorded_result", &result)) { return false; }
+            catalog.SourceClaimBinding = SourceClaimBinding(cancelled == L"true" ? L"interrupted" : L"recorded",
+                payload.String(L"source_id"), readSet.String(L"target_id"), readSet.String(L"operation_id"),
+                payload.String(L"policy"), payload.String(L"source_consistency"), result);
+            if (catalog.SourceClaimBinding.empty()) { return false; }
         }
         reference = payload.String(L"reference_sha256");
         if (!AddReference(catalog, reference)) { return false; }

@@ -7,6 +7,48 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Archived process image acquisitions on 2026-11-25
+
+At `f6c2121`, `journal-image` retained the image case and reference PE.
+Removing the standalone capture report made the handle history unavailable.
+An attempt denied at process open had no case to archive.
+
+The x64 Release `journal-image-source` command archived six acquisitions
+from the owned DLL test. Two captured the same bytes in separate operations.
+Four recorded failures from access denial (Win32 5), a nonexistent PID
+(87), a different process generation, and a missing reference after the
+source was ready. Each journal retained the exact report bytes.
+The two successful acquisitions also retained their original claims and
+shared one PE. After the child exited and the input reports and cases were
+removed, all six replays matched the results obtained from the inputs.
+
+Blocking creation of the closure ledger left one verified transaction.
+A fresh process closed it on retry and preserved that transaction's bytes
+and modification time. When delivery of stdout failed after publication,
+the journal still exposed the closed result. On a retired copy, the
+report protected its claim and PE until explicit, ordered reclamation.
+The small ledger still recorded the outcome and the count of one supplied
+attempt. Changing a report's operation ID and recomputing every physical
+digest produced a closed journal in the first implementation. The final
+build rejected the first transaction and independently rejected source replay.
+
+The archive test passed 226 checks and its native source test passed 127.
+The live suite passed 251, including Ctrl+C and Ctrl+Break. An earlier
+parallel run missed an expected interrupt. In a separate controlled run,
+an inherited Ctrl+C-ignore setting allowed capture to finish. After the
+test controller enabled Ctrl+C and waited for the new case directory, the
+same control returned exit 1 and retained the interrupted claim. Six
+prior source reports, one journal recovery and two claim replays matched
+the preceding binary byte for byte. These runs used owned processes.
+System-provider loader events and power-loss durability remain unverified.
+[Windows console control handler](https://learn.microsoft.com/en-us/windows/console/setconsolectrlhandler)
+
+```powershell
+python -B tools/test-image-source-archive.py --exe x64/Release/KnLiveDbg.exe
+```
+
+[Archive a process image acquisition](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
+
 ## Native process image source receipts on 2026-11-25
 
 At `cb35c1d`, a normal capture and a request with the wrong creation

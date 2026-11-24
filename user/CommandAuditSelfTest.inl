@@ -500,6 +500,10 @@ static int RunCommandAuditSelfTest()
     const auto approvalArchive = L"!kmon journal-image-approval x y z " + std::wstring(64, L'a') + L" store 7";
     const auto approvalReplay = L"!kmon replay-image-approval x " + std::wstring(64, L'a');
     const auto sourceReplay = L"!kmon replay-image-source missing-source-report " + std::wstring(64, L'a');
+    const auto sourceArchive = L"!kmon journal-image-source missing-source-report " + std::wstring(64, L'a') + L" store 7";
+    check(IsWriteLikeCommandLine(sourceArchive) && run(sourceArchive + L" /json").Output.find(L"kn.image_source_collection.v1") != std::wstring::npos &&
+        !device.IsOpen(), L"source archival requires write authorization and uses offline inputs");
+    check(run(sourceArchive + L" /bad").Error.find(L"usage") != std::wstring::npos, L"source archive rejects unknown case option");
     check(!IsWriteLikeCommandLine(sourceReplay) && run(sourceReplay + L" /json").Output.find(L"kn.image_source_replay.v1") != std::wstring::npos &&
         !device.IsOpen(), L"source receipt replay stays read only in the interactive transcript");
     for (const auto& suffix : {L" /bad", L" /json /json"})
