@@ -670,6 +670,17 @@ An additional byte-identical copy with a recognized outcome is routine.
 Two collections that share a PE or an inner recipe can still have different
 original files. Each closure ledger preserves its own supplied-attempt count.
 
+Source replay can also project a static `references` relation from an AMD64
+export entry to a declared IAT slot. It binds the acquisition report, original
+claim, reference digest and read sequences from one operation. The original
+mapping queries must support a native image at the recorded base. The complete
+RIP-relative jump instruction must have been compared, agree across original
+reads and match the retained PE outside normalization ranges. The export table
+supplies the instruction boundary. The import descriptor, terminated thunk
+tables and IAT directory must identify one slot. The report names the imported
+symbol as declared in that PE. Delay imports, forwarded exports, the loaded
+slot value and execution require other evidence. [PE format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#import-address-table)
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a

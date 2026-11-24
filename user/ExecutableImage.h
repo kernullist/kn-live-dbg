@@ -2,6 +2,7 @@
 
 #include <Windows.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <set>
@@ -59,6 +60,7 @@ namespace executable_image
         uint32_t CheckSum = 0;
         uint16_t Machine = 0;
         uint16_t OptionalMagic = 0;
+        std::array<IMAGE_DATA_DIRECTORY, IMAGE_NUMBEROF_DIRECTORY_ENTRIES> DataDirectories{};
         uint32_t DebugDirectoryRva = 0;
         uint32_t DebugDirectorySize = 0;
         uint32_t PdbRva = 0;
@@ -93,6 +95,23 @@ namespace executable_image
     bool ReadFileBytesAt(HANDLE file, uint64_t offset, uint32_t length, std::vector<uint8_t>* bytes);
     bool RvaToRawOffset(const DiskPeMetadata& metadata, uint32_t rva, uint64_t* rawOffset);
     const DiskPeSection* FindDiskSectionForRva(const DiskPeMetadata& metadata, uint32_t rva);
+    // The complete interval must be backed by bytes in one declared header or section.
+    inline bool FileBackedRvaRange(const DiskPeMetadata& pe, uint32_t rva, uint32_t length, uint64_t& offset)
+    {
+        if (!rva || !length || rva >= pe.SizeOfImage || length > pe.SizeOfImage - rva) { return false; }
+        if (rva < pe.SizeOfHeaders)
+        {
+            offset = rva;
+            return length <= pe.SizeOfHeaders - rva;
+        }
+        const auto* section = FindDiskSectionForRva(pe, rva);
+        if (!section) { return false; }
+        const auto delta = rva - section->VirtualAddress;
+        const auto span = (std::min)(section->SizeOfRawData, section->VirtualSize);
+        if (delta >= span || length > span - delta) { return false; }
+        offset = static_cast<uint64_t>(section->PointerToRawData) + delta;
+        return true;
+    }
     bool ReadDiskBytesForRva(
         HANDLE file,
         const DiskPeMetadata& metadata,

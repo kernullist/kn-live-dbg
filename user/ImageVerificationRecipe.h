@@ -92,6 +92,6 @@ struct DirectImageReplayEvidence
 bool ConsistentImageRecipeBytes(const ImageVerificationRecipe& recipe, uint64_t address, size_t length,
     std::vector<uint8_t>* bytes);
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error,
-    DirectImageReplayEvidence* evidence = nullptr);
+    DirectImageReplayEvidence* evidence = nullptr, executable_image::DiskPeMetadata* originalMetadata = nullptr);
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay);
 std::wstring ImageRecipeReplayJson(const ImageRecipeReplay& replay, bool includeCaptureOutcome);

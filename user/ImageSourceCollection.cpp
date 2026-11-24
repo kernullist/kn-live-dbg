@@ -28,7 +28,7 @@ namespace
     {
         if (GetFileType(sink) != FILE_TYPE_DISK) { return true; }
         const size_t caseIndex = archive ? 6 : 4;
-        if (args.size() > caseIndex + 2) { return false; }
+        if (args.size() > caseIndex + (archive ? 2 : 3)) { return false; }
         for (size_t i = 2; i < args.size(); ++i)
         {
             if (valid && i != 2 && !(archive && i == 4) && !(hasCase && i == caseIndex)) { continue; }
@@ -147,9 +147,13 @@ int RunImageSourceCommand(const std::vector<std::wstring>& args, bool directJson
     const bool archive = args.size() >= 2 && _wcsicmp(args[1].c_str(), L"journal-image-source") == 0;
     const size_t caseIndex = archive ? 6 : 4;
     const bool json = !args.empty() && _wcsicmp(args.back().c_str(), L"/json") == 0;
-    const auto fields = args.size() - (json ? 1 : 0);
+    auto fields = args.size() - (json ? 1 : 0);
+    const bool hasExport = !archive && fields > caseIndex && !_wcsnicmp(args[fields - 1].c_str(), L"/iat:", 5);
+    const auto exportName = hasExport ? args[--fields].substr(5) : L"";
+    const bool validExport = !hasExport || (!exportName.empty() && exportName.size() <= 255 &&
+        std::all_of(exportName.begin(), exportName.end(), [](wchar_t c) { return c >= 0x21 && c <= 0x7e; }));
     const bool hasCase = fields == caseIndex + 1;
-    const bool valid = (fields == caseIndex || hasCase) && !args[2].empty() && args[3].size() == 64 &&
+    const bool valid = validExport && (fields == caseIndex || hasCase) && !args[2].empty() && args[3].size() == 64 &&
         args[3].find_first_not_of(L"0123456789abcdefABCDEF") == std::wstring::npos &&
         (!archive || (!args[4].empty() && args[4][0] != L'/' && ValidId(args[5]))) &&
         (!hasCase || (!args[caseIndex].empty() && args[caseIndex][0] != L'/'));
@@ -159,7 +163,7 @@ int RunImageSourceCommand(const std::vector<std::wstring>& args, bool directJson
     if (!valid)
     {
         if (archive) { std::wcerr << L"usage: !kmon journal-image-source <capture-report> <report-sha256> <private-store> <collection-id> [directory|capture.kncapture] [/json]\n"; }
-        else { std::wcerr << L"usage: !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/json]\n"; }
+        else { std::wcerr << L"usage: !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/iat:export-name] [/json]\n"; }
         return 2;
     }
     auto pin = args[3];
@@ -175,7 +179,7 @@ int RunImageSourceCommand(const std::vector<std::wstring>& args, bool directJson
     }
     else
     {
-        try { ok = ReplayProcessImageSource(args[2], pin, imageCase, output); }
+        try { ok = ReplayProcessImageSource(args[2], pin, imageCase, output, nullptr, exportName); }
         catch (const std::exception&) { output = L"{\"schema\":\"kn.image_source_replay.v1\",\"status\":\"replay_failed\"}"; }
     }
     if (!ProtectOutput(sink, args, true, archive, hasCase, leases)) { return 2; }

@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Retained IAT references on 2026-11-25
+
+The x64 Release reader recovered two export-to-IAT references from a previously
+archived `version.dll` capture. For `GetFileVersionInfoSizeW` and
+`VerQueryValueW`, the instruction bytes and their signed displacements agreed
+with the original read receipt and the import slot in the retained PE.
+The ordinary source replay output matched `52dbe5e` byte for byte on all seven
+archived reports, including four failed acquisitions.
+
+The x64 Microsoft linker produced an owned DLL with two named imports and an
+ordinal import. The child reported its own export addresses and bytes before
+exit. All three references reproduced from the managed archive after removal
+of the direct files. The 65-check integration test also exercised forwarding,
+a regular exported function, name case, partial instruction ranges, a mismatched
+capture, digest substitution and output redirected to evidence files. Run it
+from an x64 Native Tools command prompt with
+`python -B tools/test-image-iat-reference.py --exe <release-exe>`.
+
+A relocation-free fixture produced a qualified reference with zero compared
+bytes at the observed base. The reader withheld the relation. Twenty native
+in-memory controls covered missing terminators, table bounds, conflicting
+descriptors, duplicate export names, unbound fallback and ordinal encodings.
+The native source and archive regressions passed 127 and 541 checks. The live
+image suite passed 266 checks and released all three children. Two private
+loader captures also replayed after target exit.
+
+Each positive case contained one complete read of the instruction. The
+before/after mapping observations and the original claim reproduced. The
+loaded slot value, instruction execution, writer and uninterrupted mapping
+lifetime remain unknown.
+
 ## Retention of native acquisition copies on 2026-11-25
 
 At `0126c2d`, the retention inventory put all seven closed source collections

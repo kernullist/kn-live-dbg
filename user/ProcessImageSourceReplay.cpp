@@ -1,6 +1,7 @@
 #include "ProcessImageSourceReceipt.h"
 #include "BoundedObservationJson.h"
 #include "ImageClaimPublication.h"
+#include "ImageIatReference.h"
 #include "ImageArchiveDependencies.h"
 #include "ReferenceArtifact.h"
 #include "SymbolArtifactCache.h"
@@ -9,15 +10,17 @@
 #include <string_view>
 
 bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring& reportSha256,
-    const std::wstring& imageCase, std::wstring& output, ProcessImageSourceFiles* retained)
+    const std::wstring& imageCase, std::wstring& output, ProcessImageSourceFiles* retained, const std::wstring& iatExport)
 {
     if (retained) { *retained = {}; }
     std::wstring verified = L"null", capture = L"null", pin = L"null";
+    std::wstring iat = L"null";
     const auto finish = [&](const wchar_t* status, bool matched = false)
     {
         output = L"{\"schema\":\"kn.image_source_replay.v1\",\"status\":" + mcpjson::Quote(status) +
             L",\"report_sha256\":" + pin + L",\"capture_status\":" + capture + L",\"source_initialization\":" + verified +
-            L",\"original_claim_matched\":" + bounded_observation_json::B(matched) + L",\"collector_authenticated\":false,\"execution_observed\":false}";
+            L",\"original_claim_matched\":" + bounded_observation_json::B(matched) + L",\"collector_authenticated\":false,\"execution_observed\":false" +
+            (iatExport.empty() ? L"" : L",\"iat_reference\":" + iat) + L"}";
         return std::wstring_view(status) == L"replayed";
     };
     ReferenceArtifact file;
@@ -36,8 +39,9 @@ bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring
     ReferenceArtifact claimFile, referenceFile;
     const auto keep = [&]()
     {
-        if (!retained) { return true; }
+        if (!retained && iatExport.empty()) { return true; }
         if (!file.Unchanged() || (report.Published() && (!claimFile.Unchanged() || !referenceFile.Unchanged()))) { return false; }
+        if (!retained) { return true; }
         retained->CaptureStatus = report.CaptureStatus;
         retained->SourceStatus = report.SourceStatus;
         retained->Report = file.Snapshot();
@@ -72,7 +76,7 @@ bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring
     else if (_wcsicmp(path.extension().c_str(), L".kncapture") != 0 ||
         !references.Pin(path.parent_path().parent_path() / L"image-references", false))
         { return finish(L"image_case_unavailable"); }
-    if (retained)
+    if (retained || !iatExport.empty())
     {
         const bool direct = (attr & FILE_ATTRIBUTE_DIRECTORY) != 0;
         const auto referenceRoot = direct ? path : path.parent_path().parent_path() / L"image-references";
@@ -81,7 +85,8 @@ bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring
             referenceFile.Sha256() != report.ReferenceSha256) { return finish(L"image_case_unavailable"); }
     }
     DirectImageReplayEvidence evidence;
-    const auto replay = ReplayImageRecipe(path.wstring(), false, nullptr, &evidence);
+    executable_image::DiskPeMetadata metadata;
+    const auto replay = ReplayImageRecipe(path.wstring(), false, nullptr, &evidence, iatExport.empty() ? nullptr : &metadata);
     if (replay.Status != L"replayed" || replay.OriginalClaimStatus != L"reproduced") { return finish(L"image_case_unavailable"); }
     const auto& recipe = evidence.Recipe;
     if (recipe.FormatVersion != 3 || recipe.SourceId != report.SourceId || recipe.ReadSet.TargetId != report.TargetId ||
@@ -89,6 +94,7 @@ bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring
         recipe.Policy != report.Policy || recipe.SourceConsistency != report.Consistency ||
         replay.RecipeSha256 != report.RecipeSha256 || replay.RecordedResult != report.Result ||
         replay.CaptureInterrupted != (report.CaptureStatus == L"interrupted")) { return finish(L"image_case_mismatch"); }
-    if (!keep()) { return finish(L"image_case_unavailable"); }
+    if (!iatExport.empty()) { iat = ImageIatReferenceJson(iatExport, evidence, replay, metadata, referenceFile, claimFile.Sha256()); }
+    if (!keep()) { iat = L"null"; return finish(L"image_case_unavailable"); }
     return finish(L"replayed", true);
 }

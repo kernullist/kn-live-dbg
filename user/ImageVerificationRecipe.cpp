@@ -576,9 +576,10 @@ bool CaptureObservedImageRecipe(const std::wstring& image, IObservationSource& s
 }
 
 ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentReanalysis, std::wstring* error,
-    DirectImageReplayEvidence* evidence)
+    DirectImageReplayEvidence* evidence, executable_image::DiskPeMetadata* originalMetadata)
 {
     if (evidence) { *evidence = {}; }
+    if (originalMetadata) { *originalMetadata = {}; }
     auto extension = std::filesystem::path(directory).extension().wstring();
     std::transform(extension.begin(), extension.end(), extension.begin(), towlower);
     if (extension == L".knsweep")
@@ -686,5 +687,6 @@ ImageRecipeReplay ReplayImageRecipe(const std::wstring& directory, bool currentR
         result.CaptureInterrupted = p.ReadSet.Cancelled && ObservedCancellation(p);
     }
     if (evidence && !currentReanalysis && result.Status == L"replayed") { *evidence = std::move(evaluated); }
+    if (originalMetadata && !currentReanalysis && result.Status == L"replayed") { *originalMetadata = std::move(metadata); }
     return result;
 }

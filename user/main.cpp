@@ -23133,7 +23133,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
-    std::wcout << L"  !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/json]\n";
+    std::wcout << L"  !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/iat:export-name] [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";
     std::wcout << L"  !kmon journal-image-approval <directory|capture.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> [/json]\n";
     std::wcout << L"  !kmon replay-image-approval <assessment.knapprovalcase|assessment.knscopeapproval> <policy-sha256> [/current] [/json]\n";

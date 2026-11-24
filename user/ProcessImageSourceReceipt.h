@@ -32,4 +32,5 @@ struct ProcessImageSourceFiles
 };
 
 bool ReplayProcessImageSource(const std::wstring& reportPath, const std::wstring& reportSha256,
-    const std::wstring& imageCase, std::wstring& output, ProcessImageSourceFiles* retained = nullptr);
+    const std::wstring& imageCase, std::wstring& output, ProcessImageSourceFiles* retained = nullptr,
+    const std::wstring& iatExport = {});

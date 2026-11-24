@@ -14,6 +14,13 @@ those publications after the recent index expires or the monitor exits, then
 explain the stored facts and missing evidence. This covers the declared read
 sets of admitted references, not every scanner or every observation.
 
+VS1 source replay links captured AMD64 export instructions to named or ordinal
+imports using the original reads and the retained PE. Reading the destination
+stored in a live slot, connecting callback and vtable slots to image
+observations, and establishing mapping lifetime remain open.
+See the [offline command](COMMAND_REFERENCE.md#replay-a-process-image-source-receipt)
+and [validation](VALIDATION.md#retained-iat-references-on-2026-11-25).
+
 | Implemented contract | Acceptance evidence |
 | --- | --- |
 | Scoped queries | Filter each endpoint before the result limit, retain the other endpoint of a matching relation, expose exact retained-scope counts and bounded continuation; test targets beyond 256 global results, paging, and stale cursors |

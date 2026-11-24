@@ -1029,6 +1029,25 @@ published capture with a missing or mismatched case returns exit 1.
 Older capture reports return `source_receipt_missing`. Keep the report and
 its pin alongside an archived case, or archive the acquisition together.
 
+To check whether the captured code at a named AMD64 export referenced an import
+address table (IAT) slot, pass `/iat:export-name` before `/json`. Export names
+are case-sensitive. For example, a capture covering the export in `version.dll`
+can be queried after the process exits.
+
+```powershell
+$page = & $exe --offline '!kmon' replay-image-source $report $pin $case '/iat:GetFileVersionInfoSizeW' /json | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $page.status }
+$page.iat_reference
+```
+
+For a managed source report, omit `$case`. An observed result gives the original
+instruction bytes and read sequences, the slot RVA, and the imported DLL and
+name or ordinal declared in the retained PE. `instruction_reread` records
+whether two or more complete reads covered the instruction. The loaded slot
+value, execution and mapping lifetime remain unverified. A reproduced claim
+can return `iat_reference.status=unavailable` with a reason. A source without
+a reproduced image claim returns `iat_reference=null`.
+
 ### Archive a process image acquisition
 
 Use an initialized private store and a new collection ID. Supply the

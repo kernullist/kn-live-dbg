@@ -84,6 +84,14 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {row["rule"] for row in AUDIT.inspect("capture.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Replay a saved kn.process_image_source.v1 receipt."))
 
+    def test_image_iat_reference(self):
+        records = (dict(schema="kn.image_iat_reference.v1"), dict(iat_slot_rva="8", instruction_hex="00"),
+                   dict(import_lookup_rva="8", import_descriptor_rva="4"), dict(instruction_reread=False, byte_receipts=[]))
+        for record in records:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("capture.txt", json.dumps(record).encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Replay the kn.image_iat_reference.v1 record."))
+
     def test_store_file_ranges_and_positions(self):
         samples = [json.dumps(dict(schema="kn.store_file_scan.v1")), json.dumps(dict(next_file_cursor="", file_receipt="held")),
                    json.dumps(dict(file_offset="0", block_sha256="held")), json.dumps(dict(file_namespace_sha256="held", namespace_entries="3")),

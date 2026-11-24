@@ -1389,6 +1389,7 @@ namespace executable_image
                     break;
                 }
 
+                std::copy_n(optional.DataDirectory, optional.NumberOfRvaAndSizes, metadata->DataDirectories.begin());
                 metadata->ImageBase = optional.ImageBase;
                 metadata->EntryPointRva = optional.AddressOfEntryPoint;
                 metadata->SizeOfHeaders = optional.SizeOfHeaders;
@@ -1461,6 +1462,7 @@ namespace executable_image
                     break;
                 }
 
+                std::copy_n(optional.DataDirectory, optional.NumberOfRvaAndSizes, metadata->DataDirectories.begin());
                 metadata->ImageBase = optional.ImageBase;
                 metadata->EntryPointRva = optional.AddressOfEntryPoint;
                 metadata->SizeOfHeaders = optional.SizeOfHeaders;
