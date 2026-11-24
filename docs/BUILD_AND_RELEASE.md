@@ -124,6 +124,21 @@ record even under a public filename. The release privacy regression exercises
 both copy paths and verifies the bytes of a synthetic ZIP.
 [Validation results](VALIDATION.md#release-package-path-checks-on-2026-11-23)
 
+### Packaging regression
+
+Run the packaging regression from the source checkout.
+
+```powershell
+.\tools\validate-release-privacy.ps1
+```
+
+The regression creates a fresh directory under `.build`. On success or a
+handled validation error, it removes the files it registered and then removes
+empty directories. An unexpected file stays in place and cleanup reports an
+error. Use `-KeepFixtures` to retain the synthetic ZIP, inspection report and
+test inputs for diagnosis. The command prints the retained directory. A forced
+process exit can leave partial fixtures. [Fixture cleanup checks](VALIDATION.md#release-privacy-fixture-cleanup-on-2026-11-24)
+
 ## Public-content check
 
 Before staging or packaging source changes, run the offline check with Python

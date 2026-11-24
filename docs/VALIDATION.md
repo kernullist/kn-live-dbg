@@ -7,6 +7,23 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Release privacy fixture cleanup on 2026-11-24
+
+At `70443b6`, a successful run of the packaging regression left 152 files
+after reporting 276 passing checks. On the same Windows host, Windows
+PowerShell 5.1 and PowerShell 7.6 completed the 276 checks and left no new
+fixture directory with default options. The test ran from a source checkout.
+
+The lifecycle tests synchronized two runs after each had written its ZIP.
+One retained its fixtures on request and the other cleaned up. A prior
+inspection report kept its original bytes. Python independently compared every
+retained ZIP member with the corresponding package file. A final scanner error
+preserved the diagnostic, and the partial ZIP remained available when the
+caller requested it. Separate tests covered an unregistered nested file, an
+occupied output name, simultaneous validation and cleanup errors, and a
+pre-existing directory junction. The checks exercise normal script completion
+and handled errors. [Packaging regression](BUILD_AND_RELEASE.md#packaging-regression)
+
 ## Saved reboot events and crash dumps on 2026-11-24
 
 The x64 Release CLI with SHA-256 prefix `46924bf4a363` read a 69,632-byte
