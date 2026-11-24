@@ -91,6 +91,132 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0 if data["status"] == "ok" else 1)
         return data
 
+    def closure(self, *options, code=0, source=None, index=None):
+        command = [str(ARGS.cli), "--offline", "!kmon", "evidence", str(source or self.source),
+                   "/inventory", str(index or self.output), "/closure", *options]
+        run = subprocess.run(command, capture_output=True, timeout=240)
+        self.assertEqual(run.returncode, code, (run.stdout[-500:], run.stderr[-300:]))
+        if code == 2:
+            return
+        report = json.loads(run.stdout)
+        self.assertEqual(report["schema"], "kn.evidence_inventory_closure.v1")
+        self.assertIs(report["collector_authenticated"], False)
+        return report
+
+    def test_global_closure_across_result_windows(self):
+        # Use the preceding publisher if supplied. Each ledger is valid even at UINT64_MAX.
+        maximum = 2**64 - 1
+        wide = []
+        for name in ("first", "middle", "last"):
+            item = json.loads(ledger(name))
+            item.update(admitted=str(maximum), failed=str(maximum), dropped=str(maximum))
+            wide.append(encode(item))
+        (self.source / "first.knledger").write_bytes(wide[0])
+        (self.source / "middle.knledger").write_bytes(wide[1])
+        for i in range(4100):
+            (self.source / f"row-{i:04}.knledger").write_bytes(ledger(i))
+        (self.source / "y-copy.knledger").write_bytes(b"\xef\xbb\xbf" + wide[0])
+        (self.source / "z-last.knledger").write_bytes(wide[2])
+        published = subprocess.run(self.command(cli=ARGS.legacy) + ["/json"], capture_output=True, timeout=140)
+        self.assertEqual(published.returncode, 0, published.stdout[-400:])
+        self.assertFalse(self.query(ARGS.cli)["publication_closure_evaluated"])
+        (self.source / "later.knledger").write_bytes(ledger("outside-index"))
+        report = self.closure("/json")
+        self.assertEqual((report["status"], report["snapshot_entries"], report["inspected_files"]), ("ok", "4104", "4104"))
+        manifest = self.output / "manifest.knindex"
+        self.assertEqual(report["snapshot_sha256"], digest(manifest.read_bytes()))
+        assessment = report["assessment"]
+        self.assertEqual((assessment["publication_closure_known"], assessment["ledger_files"], assessment["duplicate_ledger_files"]),
+                         (True, "4104", "1"))
+        totals = assessment["unambiguous_ledger_totals"]
+        self.assertEqual(totals, dict(collections="4103", admitted=str(3 * maximum), written="0", failed=str(3 * maximum),
+                                      dropped=str(3 * maximum), reported_bytes="0", observed_canonical_bytes="0",
+                                      byte_mismatch_collections="0", unavailable_written_bundles="0", unexpected_bundles="0"))
+        read_bytes = sum(p.stat().st_size for p in self.source.iterdir() if p.name != "later.knledger")
+        self.assertEqual(int(report["read_bytes"]), read_bytes)
+        limit = self.closure("/max-bytes", str(read_bytes - 1), code=1)
+        self.assertEqual((limit["status"], limit["assessment"]), ("budget_exhausted", None))
+        self.assertLess(int(limit["read_bytes"]), read_bytes)
+        self.assertEqual(self.closure("/max-bytes", str(read_bytes))["assessment"], assessment)
+        expired = self.closure("/deadline-ms", "1", code=1)
+        self.assertEqual((expired["status"], expired["assessment"]), ("deadline_exhausted", None))
+
+    def test_global_conflicts_missing_and_invalid(self):
+        original = json.loads(ledger("conflict"))
+        other = dict(original, dropped="2")
+        for i, record in enumerate((original, other, other, original)):
+            (self.source / f"conflict-{i}.knledger").write_bytes(encode(record))
+        clean = json.loads(ledger("independent"))
+        clean.update(admitted="2", written="1", failed="1", dropped="3", bytes="220")
+        (self.source / "kept.knledger").write_bytes(encode(clean))
+        (self.source / "removed.knledger").write_bytes(ledger("removed"))
+        (self.source / "replaced.knledger").write_bytes(ledger("old"))
+        (self.source / "invalid.kncase").write_bytes(b"invalid")
+        self.build("/resume")
+        (self.source / "removed.knledger").unlink()
+        (self.source / "replaced.knledger").write_bytes(ledger("new"))
+        result = self.closure(code=1)
+        a = result["assessment"]
+        self.assertEqual((result["status"], a["publication_closure_known"], a["invalid_at_build"],
+                          a["changed_or_missing"], a["conflicting_collections"], a["duplicate_ledger_files"]),
+                         ("partial_inventory", False, "1", "2", "1", "2"))
+        totals = a["unambiguous_ledger_totals"]
+        self.assertEqual((totals["collections"], totals["written"], totals["failed"], totals["dropped"],
+                          totals["unavailable_written_bundles"], totals["byte_mismatch_collections"]), ("1", "1", "1", "3", "1", "1"))
+        empty = self.root / "different-source"
+        empty.mkdir()
+        denied = self.closure(source=empty, code=1)
+        self.assertEqual((denied["status"], denied["assessment"]), ("source_directory_changed", None))
+
+    def test_global_membership_and_incomplete_work(self):
+        self.fill(129)
+        self.checkpoint()
+        partial = self.closure(code=1)
+        self.assertEqual((partial["status"], partial["assessment"]), ("invalid_inventory", None))
+        self.build("/resume")
+        manifest = self.output / "manifest.knindex"
+        initial = json.loads(manifest.read_bytes())
+        head, tail = initial["chunks"]
+        member = self.output / (tail["digest"] + ".knchunk")
+        self.assertTrue(member.exists())
+        member.rename(self.root / "saved-chunk")
+        truncated = self.closure(code=1)
+        self.assertEqual((truncated["status"], truncated["inspected_files"], truncated["assessment"]), ("corrupt_inventory_chunk", "128", None))
+        rows = json.loads((self.output / (head["digest"] + ".knchunk")).read_bytes())
+        row = dict(rows["entries"][0])
+        for name, status in ((row["name"], "duplicate_inventory_name"), (row["name"].replace("entry", "ENTRY"), "partial_inventory")):
+            changed = encode(dict(schema=rows["schema"], entries=[dict(row, name=name)]))
+            key = digest(changed)
+            (self.output / (key + ".knchunk")).write_bytes(changed)
+            tail["digest"] = key
+            manifest.write_bytes(encode(initial))
+            report = self.closure(code=1)
+            self.assertEqual(report["status"], status)
+            if status == "partial_inventory":
+                self.assertEqual(report["assessment"]["changed_or_missing"], "1")
+            else:
+                self.assertIsNone(report["assessment"])
+        for args in (("/pid", "1"), ("/role", "x"), ("/limit", "1"), ("/cursor", "x"), ("/inventory-cursor", "x"),
+                     ("/closure",), ("/max-bytes", "0"), ("/max-bytes", "-1"), ("/deadline-ms", "1", "/deadline-ms", "1"),
+                     ("/max-bytes", "18446744073709551616")):
+            self.closure(*args, code=2)
+
+    def test_global_empty_inventory_and_held_writer(self):
+        self.build("/resume")
+        empty = self.closure(code=1)
+        self.assertEqual((empty["snapshot_entries"], empty["assessment"]["publication_closure_known"]), ("0", False))
+        member = self.source / "active.knledger"
+        member.write_bytes(ledger("stable"))
+        index = self.root / "active-index"
+        self.build("/resume", output=index)
+        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in index.iterdir()}
+        with member.open("r+b"):
+            blocked = self.closure(index=index, code=1)
+            self.assertEqual((blocked["read_bytes"], blocked["assessment"]["changed_or_missing"]), ("0", "1"))
+        ready = self.closure(index=index)
+        self.assertTrue(ready["assessment"]["publication_closure_known"])
+        self.assertEqual(before, {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in index.iterdir()})
+
     def test_windows_and_legacy_reader(self):
         self.fill(300)
         bom_file = self.source / "entry-00001.knledger"
@@ -370,7 +496,81 @@ class InventoryTests(unittest.TestCase):
                                directory_id=source_id, entries=str(count), chunks=chunks))
         self.assertEqual((self.output / "manifest.knindex").read_bytes(), manifest)
         self.assertEqual(result["snapshot_digest"], digest(manifest))
+        full = self.closure("/max-bytes", str(count * member_size), "/deadline-ms", "240000", code=1)
+        self.assertEqual((full["status"], int(full["read_bytes"]), full["assessment"]["unique_bundles"],
+                          int(full["assessment"]["duplicate_case_files"]), full["assessment"]["publication_closure_known"]),
+                         ("partial_inventory", count * member_size, "1", count - 1, False))
         print(f"large inventory: members={count} calls={calls} original_bytes={count * member_size} read_bytes={reads}", flush=True)
+
+    def test_global_case_and_publication_bytes(self):
+        if not ARGS.large_case:
+            self.skipTest("supply the synthetic case emitted by evidence-bundle-selftest --publish")
+        base = json.loads(ARGS.large_case.read_bytes())
+        payload = base["payload"]
+        self.assertEqual(base["schema"], "kmon.bundle.v1")
+        payload["collection_id"] = "closure-owned"
+        base["payload_sha256"] = digest(encode(payload))
+        canonical = encode(base)
+        first = self.source / "case-0000.kncase"
+        first.write_bytes(canonical)
+        count = 260
+        for i in range(1, count - 1):
+            os.link(first, self.source / f"case-{i:04}.kncase")
+        (self.source / "case-bom.kncase").write_bytes(b"\xef\xbb\xbf" + canonical)
+        record = dict(json.loads(ledger(0)), collection_id=payload["collection_id"], admitted="3", written="1",
+                      failed="2", dropped="1", bytes=str(len(canonical)))
+        (self.source / "last.knledger").write_bytes(encode(record))
+        self.build("/resume")
+        head = self.query(ARGS.cli)
+        tail = self.query(ARGS.cli, "/inventory-cursor", head["next_inventory_cursor"])
+        self.assertFalse(head["publication_closure_evaluated"] or tail["publication_closure_evaluated"])
+        # Terminate our reader after its I/O counters advance by 64 MiB.
+        # Probing the manifest with a writer would race the reader's admission.
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        class IoCounters(ctypes.Structure):
+            _fields_ = [(name, ctypes.c_uint64) for name in
+                        ("read_operations", "write_operations", "other_operations", "read_bytes", "write_bytes", "other_bytes")]
+        kernel.GetProcessIoCounters.argtypes = [wintypes.HANDLE, ctypes.POINTER(IoCounters)]
+        counters = IoCounters()
+        index_before = {p.name: (digest(p.read_bytes()), p.stat().st_mtime_ns) for p in self.output.iterdir()}
+        command = [str(ARGS.cli), "--offline", "!kmon", "evidence", str(self.source), "/inventory", str(self.output), "/closure"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+            try:
+                self.assertTrue(kernel.GetProcessIoCounters(int(child._handle), ctypes.byref(counters)))
+                target_reads = counters.read_bytes + 64 * 1024**2
+                deadline = time.monotonic() + 45
+                while counters.read_bytes < target_reads:
+                    self.assertIsNone(child.poll(), "reader finished before observed I/O")
+                    self.assertLess(time.monotonic(), deadline)
+                    self.assertTrue(kernel.GetProcessIoCounters(int(child._handle), ctypes.byref(counters)))
+                    time.sleep(0.001)
+                child.kill()
+                stdout, _ = child.communicate(timeout=15)
+                self.assertNotEqual(child.returncode, 0)
+                self.assertEqual(stdout, b"")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=15)
+        self.assertEqual(index_before, {p.name: (digest(p.read_bytes()), p.stat().st_mtime_ns) for p in self.output.iterdir()})
+        report = self.closure()
+        a = report["assessment"]
+        self.assertEqual((report["status"], a["publication_closure_known"], a["unique_bundles"], int(a["duplicate_case_files"])),
+                         ("ok", True, "1", count - 1))
+        self.assertEqual(int(report["read_bytes"]), len(canonical) * count + 3 + len(encode(record)))
+        self.assertEqual(a["unambiguous_ledger_totals"]["observed_canonical_bytes"], str(len(canonical)))
+        # A different, valid ledger can agree on the file count but disagree on what was written.
+        (self.source / "last.knledger").write_bytes(encode(dict(record, bytes=str(len(canonical) + 1))))
+        second_index = self.root / "second-index"
+        self.build("/resume", output=second_index)
+        a = self.closure(index=second_index, code=1)["assessment"]
+        self.assertFalse(a["publication_closure_known"])
+        self.assertEqual((a["unambiguous_ledger_totals"]["byte_mismatch_collections"],
+                          a["unambiguous_ledger_totals"]["unavailable_written_bundles"]), ("1", "0"))
+        (self.source / "last.knledger").unlink()
+        missing = self.closure(index=second_index, code=1)["assessment"]
+        self.assertEqual((missing["collections_without_ledger"], missing["unattributed_bundles"],
+                          missing["changed_or_missing"], missing["publication_closure_known"]), ("1", "0", "1", False))
 
     def test_source_and_output_generations(self):
         self.fill(145)

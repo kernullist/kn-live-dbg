@@ -38,6 +38,9 @@ def main():
             "semantic_validation": "not_probed", "environment_regression": "not_performed"}
         assert capability["requirements"] and capability["limits"]
     by_key = dict(zip(keys, data["capabilities"]))
+    query = by_key[("evidence", "query", "bundle")]
+    assert "direct_offline_global_closure_with_v1_snapshot" in query["requirements"]
+    assert "global_closure_requires_full_original_traversal" in query["limits"] and "window_scoped_counts" in query["limits"]
     inventory = by_key[("evidence", "build_inventory", "local_files")]
     assert "terminal_original_byte_and_row_recheck" in inventory["requirements"]
     assert "signed_original_verification_windows" in inventory["requirements"]

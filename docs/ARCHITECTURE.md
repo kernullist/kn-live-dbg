@@ -2001,9 +2001,42 @@ Missing or changed members remain gaps; new files do not alter membership.
 `next_cursor` pages results in the same window; only after those results drain
 does `next_inventory_cursor` advance the inventory. Cursors bind the snapshot,
 query/filter and budgets; a result cursor also binds current-window validity.
-Counts and deduplication apply to the current window. Global publication closure
-is evaluated only when one window covers the entire snapshot. The legacy query
-without `/inventory` retains its original bounded-directory contract.
+Counts and deduplication on this paged route apply to the current window.
+When one window covers the entire snapshot, its publication closure check
+compares the ledger's write count with the number of distinct bundles.
+The legacy query without `/inventory` retains its original bounded-directory
+contract.
+
+The direct offline `evidence /inventory <index> /closure` route reconciles the
+entire v1 snapshot in one read-only invocation. It pins the source and index
+paths and the manifest, returns the canonical v1 snapshot digest, verifies
+each chunk against its declared digest and
+rejects repeated member names across chunks. Each member recorded as valid
+must still have its indexed directory-entry spelling, length and content
+digest. The reader holds a file handle that denies writes and deletion during that comparison.
+It counts invalid-at-build rows and missing, changed or unreadable originals
+separately. Names added after publication fall outside this snapshot.
+The spelling check uses the long filename returned in `cFileName`, including
+when a lookup accepts a short alias. [Windows directory entry names](https://learn.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-win32_find_dataw)
+
+Case identity is the validated payload digest. A repeated canonical ledger
+counts as a physical duplicate. Distinct valid ledgers for the same collection
+make its reported totals ambiguous, so every variant in that collection is
+excluded from `unambiguous_ledger_totals`. For the other ledgers the reader
+compares both writes and canonical UTF-8 bundle bytes with the unique
+publications. A UTF-8 BOM on a copy contributes to the read budget only.
+Admission, failure and drop totals are exact decimal strings even when their
+sum exceeds 64 bits. The report tracks unattributed bundles separately from
+named collections missing a ledger.
+
+Only a full traversal yields an assessment. The byte budget counts actual
+source payload reads, and the cooperative deadline includes the final
+per-collection reconciliation. The reader retains names, digest sets and
+collection counts in memory. The result describes the committed membership
+at the individual read times. Publisher authentication and the identity of
+each historical publication require evidence beyond the ledger's counts and
+byte total. Each retry rechecks the originals.
+
 The `--offline !kmon` entry point runs these file commands before elevation,
 driver service or symbol initialization.
 `replay` and `why` reconstruct supported static transfers using the original byte

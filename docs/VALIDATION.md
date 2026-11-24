@@ -7,6 +7,61 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Global publication closure for legacy inventories on 2026-11-24
+
+On `c8526ef`, 70 names for the same synthetic bundle and a separate ledger
+occupied two ordinary query windows. They reported 62 and 6 duplicate cases.
+Both windows reported `publication_closure_evaluated` as false. Across the snapshot there were
+69 duplicate cases.
+
+The x64 Release executable with SHA-256 prefix `47e9ed018eca` read a v1
+index created by the preceding CLI. Its three members were an attributed
+bundle, a copy with a UTF-8 BOM and the collection ledger. The global query
+read 2,110,805 payload bytes. It reconciled one publication of 1,055,300
+canonical bytes and preserved the ledger's two failed and four dropped
+attempts. Windows PowerShell 5.1 and PowerShell 7.6 produced identical
+reports. The three source files, chunk and manifest kept their SHA-256 values.
+
+A preceding executable (`f2eb6acd7097`) published a 4,104-member v1 snapshot.
+The global query read 4,103 distinct ledgers and one BOM-prefixed duplicate.
+Three ledgers each reported UINT64_MAX admissions, failures and drops. The
+three aggregate fields each matched Python's integer sum of
+55,340,232,221,128,654,845. A ledger added after indexing stayed outside
+the totals. A byte budget exactly equal to the indexed source bytes admitted
+the report. One byte less, an expired deadline, a missing chunk and a
+repeated name across chunks all returned a null assessment.
+
+With an explicit byte budget, one global pass read 8,590,936,788 logical
+bytes from 8,141 hard-linked synthetic case names. It counted one unique
+unattributed bundle and 8,140 duplicates, with publication closure unknown.
+The 20 direct CLI tests included conflicting ledgers, a changed original,
+an open writer and a collection with the right file count but the wrong
+published byte count. In a further 260-name run, the reader process was
+terminated after its I/O counters advanced by 64 MiB. It emitted no
+report. A fresh process reconciled the collection, and every index file
+retained its digest and write time. Removing the ledger then reported one
+named collection without a ledger. These runs measure logical reads on
+the test filesystem. Each retry starts at the beginning. [Windows process I/O counters](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-io_counters)
+
+The native suite passed 539 checks and reopened a case in a fresh process.
+It exercised a v2 bundle beside a v1 publication, an extra publication,
+an unattributed bundle and cancellation before reading.
+The ordinary offline CLI suite passed 99 checks and skipped one symbolic-link
+control on this host. Separate junctions in either the source or index path
+were refused with zero original bytes read. Command and console self-tests passed 3,088 and 570
+checks. Restricted launch exercised 88 CLI results with zero remote accepts.
+The executable reported 69 capability contracts and 261 command routes, and
+the generated support matrix matched. The 45 source privacy tests passed.
+Release packaging passed 272 checks in each PowerShell edition. The Release
+link reported the existing MSVC C4744 alignment warning for
+`KmonHuntIndex::NextQueryEpoch`.
+
+The Windows AddressSanitizer build passed the same 539 checks and reopened
+the case in a new process with `ASAN_OPTIONS=halt_on_error=1` and
+`ASAN_WIN_CONTINUE_ON_INTERCEPTION_FAILURE=1`. The default runtime stopped
+during interceptor startup. The continuation run reported the unsupported
+interception, which limits its coverage.
+
 ## Bounded verification of legacy inventory originals on 2026-11-24
 
 The x64 Release CLI with SHA-256 prefix `d2a1db98d0f1` signed the first 17

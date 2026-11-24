@@ -1,4 +1,5 @@
 #include "EvidenceInventory.h"
+#include "EvidenceInventoryClosure.h"
 #include "EvidenceInventoryFiles.h"
 #include "EvidenceInventoryVerification.h"
 #include "AnalystSnapshot.h"
@@ -59,6 +60,7 @@ namespace
                     return false;
                 }
                 Json = std::move(json);
+                CanonicalBytes = 0;
                 Digest = std::move(parsedDigest);
                 Bundle = std::move(parsed);
             }
@@ -67,10 +69,18 @@ namespace
             return true;
         }
 
+        size_t CanonicalSize()
+        {
+            // ParseEvidenceBundle already required this exact historical serialization. The writer accounts for UTF-8 without a BOM.
+            if (!CanonicalBytes) { CanonicalBytes = mcpjson::WideToUtf8(Json).size(); }
+            return CanonicalBytes;
+        }
+
     private:
         std::wstring Json;
         std::wstring Digest;
         EvidenceBundle Bundle;
+        size_t CanonicalBytes = 0;
     };
 
     bool DirectoryPathValid(const std::wstring& path)
@@ -92,7 +102,14 @@ namespace
         return mcpjson::Quote(std::to_wstring(value));
     }
 
-    Entry ReadEntry(const std::filesystem::path& path, BundleReader& reader, std::wstring* byteDigest = nullptr)
+    struct Publication
+    {
+        std::wstring CaseCollection;
+        EvidenceSessionSummary Ledger;
+    };
+
+    Entry ReadEntry(const std::filesystem::path& path, BundleReader& reader, std::wstring* byteDigest = nullptr,
+        Publication* publication = nullptr, size_t maximumBytes = EvidenceBundleMaxJsonBytes)
     {
         Entry entry;
         entry.Name = path.filename().wstring();
@@ -100,16 +117,19 @@ namespace
         if (path.extension() == L".kncase")
         {
             EvidenceBundle bundle;
-            entry.Valid = reader.Read(path.wstring(), &bundle, &entry.Digest, EvidenceBundleMaxJsonBytes, &read, byteDigest);
+            entry.Valid = reader.Read(path.wstring(), &bundle, &entry.Digest, maximumBytes, &read, byteDigest);
+            if (entry.Valid && publication) { publication->CaseCollection = std::move(bundle.CollectionId); }
         }
         else
         {
             std::wstring json, error;
             EvidenceSessionSummary session;
-            if (ReadAnalystSnapshot(path.wstring(), &json, &error, 32768, &read, true, byteDigest) && ParseEvidenceSession(json, &session))
+            if (ReadAnalystSnapshot(path.wstring(), &json, &error, (std::min<size_t>)(32768, maximumBytes),
+                &read, true, byteDigest) && ParseEvidenceSession(json, &session))
             {
                 entry.Digest = Hash(json);
                 entry.Valid = entry.Digest.size() == 64;
+                if (entry.Valid && publication) { publication->Ledger = std::move(session); }
             }
         }
         entry.Bytes = read;
@@ -295,6 +315,23 @@ namespace
             entries->push_back(std::move(entry));
         }
         return ChunkJson(*entries) == json;
+    }
+
+    bool IsNamedOriginal(HANDLE file, const std::filesystem::path& path, const Entry& entry)
+    {
+        FILE_STANDARD_INFO standard{};
+        FILE_ATTRIBUTE_TAG_INFO tag{};
+        if (!file || GetFileType(file) != FILE_TYPE_DISK ||
+            !GetFileInformationByHandleEx(file, FileAttributeTagInfo, &tag, sizeof(tag)) ||
+            (tag.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
+            !GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard)) ||
+            standard.EndOfFile.QuadPart != static_cast<LONGLONG>(entry.Bytes)) { return false; }
+        // A case alias or DOS short name does not establish a second directory entry.
+        WIN32_FIND_DATAW found{};
+        const auto search = FindFirstFileW((L"\\\\?\\" + path.native()).c_str(), &found);
+        if (search == INVALID_HANDLE_VALUE) { return false; }
+        FindClose(search);
+        return entry.Name == found.cFileName;
     }
 
     class ResumableInventory
@@ -826,6 +863,94 @@ EvidenceInventoryBuildResult BuildEvidenceInventory(const std::wstring& director
     }
     result.Status = L"ok";
     return result;
+}
+
+EvidenceInventoryClosureResult InspectEvidenceInventoryClosure(const std::wstring& directory, const std::wstring& snapshot,
+    const EvidenceInventoryClosureOptions& options)
+{
+    EvidenceInventoryClosureResult result;
+    if (!options.ReadBudget || !options.DeadlineMs) { result.Status = L"invalid_budget"; return result; }
+    const auto started = GetTickCount64();
+    const auto running = [&]() {
+        if (options.Cancellation && options.Cancellation->load()) { result.Status = L"cancelled"; return false; }
+        if (GetTickCount64() - started >= options.DeadlineMs) { result.Status = L"deadline_exhausted"; return false; }
+        return true;
+    };
+    if (!running()) { return result; }
+    std::filesystem::path source, index;
+    inventory_files::Pins pins;
+    if (!DirectoryPathValid(directory) || !DirectoryPathValid(snapshot) || !inventory_files::LocalPath(directory, source) ||
+        !inventory_files::LocalPath(snapshot, index) || !pins.Ancestors(source) || !pins.Ancestors(index))
+    { result.Status = L"invalid_path"; return result; }
+
+    const std::wstring literalIndex = L"\\\\?\\" + index.native();
+    const std::wstring literalSource = L"\\\\?\\" + source.native();
+    Manifest manifest;
+    if (!pins.ReadFile(index / L"manifest.knindex") || !ReadManifest(literalIndex, &manifest, &result.SnapshotDigest))
+    { result.SnapshotDigest.clear(); result.Status = L"invalid_inventory"; return result; }
+    result.SnapshotEntries = manifest.Entries;
+    if (DirectoryId(literalSource) != manifest.DirectoryId) { result.Status = L"source_directory_changed"; return result; }
+
+    std::set<std::wstring> names;
+    BundleReader reader;
+    inventory_closure::Publications publications;
+    std::vector<Entry> entries;
+    for (const auto& chunk : manifest.Chunks)
+    {
+        if (!running()) { return result; }
+        if (!ReadChunk(literalIndex, chunk, &entries)) { result.Status = L"corrupt_inventory_chunk"; return result; }
+        for (const auto& entry : entries)
+        {
+            if (!running()) { return result; }
+            if (!names.insert(entry.Name).second) { result.Status = L"duplicate_inventory_name"; return result; }
+            if (!entry.Valid) { ++publications.Counts.InvalidAtBuild; ++result.InspectedFiles; continue; }
+            const auto path = source / entry.Name;
+            auto pin = inventory_files::Open(path, GENERIC_READ, FILE_SHARE_READ);
+            if (!IsNamedOriginal(pin.get(), path, entry)) { ++publications.Counts.ChangedOrMissing; ++result.InspectedFiles; continue; }
+            if (entry.Bytes > options.ReadBudget - result.ReadBytes) { result.Status = L"budget_exhausted"; return result; }
+            Publication original;
+            const auto actual = ReadEntry(std::filesystem::path(literalSource) / entry.Name, reader, nullptr, &original, static_cast<size_t>(entry.Bytes));
+            result.ReadBytes += actual.Bytes;
+            ++result.InspectedFiles;
+            if (!actual.Valid || actual.Bytes != entry.Bytes || actual.Digest != entry.Digest) { ++publications.Counts.ChangedOrMissing; }
+            else if (path.extension() == L".kncase")
+            {
+                const auto canonicalBytes = reader.CanonicalSize();
+                if (!canonicalBytes) { result.Status = L"source_unavailable"; return result; }
+                publications.AddCase(actual.Digest, original.CaseCollection, canonicalBytes);
+            }
+            else { publications.AddLedger(actual.Digest, original.Ledger); }
+        }
+    }
+    if (!publications.Finish(running) || !running()) { return result; }
+    result.Assessment = std::move(publications.Counts);
+    result.Status = result.Assessment->ClosureKnown ? L"ok" : L"partial_inventory";
+    return result;
+}
+
+std::wstring EvidenceInventoryClosureJson(const EvidenceInventoryClosureResult& result)
+{
+    std::wstring assessment = L"null";
+    if (result.Assessment)
+    {
+        const auto& a = *result.Assessment;
+        assessment = L"{\"publication_closure_known\":" + std::wstring(a.ClosureKnown ? L"true" : L"false") +
+            L",\"invalid_at_build\":" + Number(a.InvalidAtBuild) + L",\"changed_or_missing\":" + Number(a.ChangedOrMissing) +
+            L",\"case_files\":" + Number(a.CaseFiles) + L",\"unique_bundles\":" + Number(a.UniqueCases) +
+            L",\"duplicate_case_files\":" + Number(a.CaseFiles - a.UniqueCases) + L",\"unattributed_bundles\":" + Number(a.UnattributedCases) +
+            L",\"ledger_files\":" + Number(a.LedgerFiles) + L",\"duplicate_ledger_files\":" + Number(a.DuplicateLedgers) +
+            L",\"collections_without_ledger\":" + Number(a.CollectionsWithoutLedger) + L",\"conflicting_collections\":" + Number(a.ConflictingCollections) +
+            L",\"unambiguous_ledger_totals\":{\"collections\":" + Number(a.UnambiguousCollections) + L",\"admitted\":" + mcpjson::Quote(a.Admitted) +
+            L",\"written\":" + Number(a.Written) + L",\"failed\":" + mcpjson::Quote(a.Failed) + L",\"dropped\":" + mcpjson::Quote(a.Dropped) +
+            L",\"reported_bytes\":" + Number(a.PublishedBytes) + L",\"observed_canonical_bytes\":" + Number(a.ObservedCanonicalBytes) +
+            L",\"byte_mismatch_collections\":" + Number(a.ByteMismatchCollections) + L",\"unavailable_written_bundles\":" + Number(a.MissingWritten) +
+            L",\"unexpected_bundles\":" + Number(a.UnexpectedCases) + L"}}";
+    }
+    return L"{\"schema\":\"kn.evidence_inventory_closure.v1\",\"scope\":\"all_snapshot_members\",\"observation\":\"non_atomic_original_reread\","
+        L"\"collector_authenticated\":false,\"status\":" + mcpjson::Quote(result.Status) + L",\"snapshot_sha256\":" +
+        (result.SnapshotDigest.empty() ? L"null" : mcpjson::Quote(result.SnapshotDigest)) + L",\"snapshot_entries\":" +
+        (result.SnapshotDigest.empty() ? L"null" : Number(result.SnapshotEntries)) + L",\"inspected_files\":" + Number(result.InspectedFiles) +
+        L",\"read_bytes\":" + Number(result.ReadBytes) + L",\"assessment\":" + assessment + L"}";
 }
 
 std::wstring EvidenceInventoryBuildJson(const EvidenceInventoryBuildResult& result)

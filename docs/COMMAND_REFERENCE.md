@@ -177,6 +177,27 @@ After `deadline_exhausted`, the next bounded call can use the last completed
 verification record. The full catalog and construction-chain checks still
 have to fit within an invocation.
 
+To reconcile publications across all query windows, run
+`KnLiveDbg.exe --offline !kmon evidence cases /inventory index-001 /closure /json`.
+Supply the source and index on local fixed drives. A reparse point in either
+directory path returns `invalid_path`.
+The command rereads the valid members of the completed v1 snapshot and reports
+unique bundles, duplicate files, conflicting ledgers and missing publications.
+Each unambiguous collection ledger is also checked against the canonical UTF-8
+byte count of its unique bundles. The ledger's failed and dropped counts
+remain visible even when all reported writes can be accounted for.
+
+The default budget is 8 GiB of original payloads with a 120,000 ms cooperative
+deadline. Use `/max-bytes N` and `/deadline-ms N` to set positive decimal
+limits for one call. Budget exhaustion or an invalid index returns a null
+`assessment`. A terminated CLI process can leave no report. Rerun the command
+from the beginning. A completed
+scan with gaps returns `partial_inventory` and the measured global counts.
+Exit 0 indicates reconciled publication counts and bytes, 1 indicates gaps
+or an incomplete scan, 2 indicates invalid arguments, and 3 indicates output
+failure. The command always writes JSON. Case filters and cursors apply to the
+ordinary paged query.
+
 `KnLiveDbg.exe --offline !kmon init-store <new-root> [/acl-only] [/json]`
 creates a new private local root under an existing directory. By default it
 requires EFS encryption and a protected current-user/SYSTEM ACL. `/acl-only`

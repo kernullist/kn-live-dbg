@@ -542,6 +542,7 @@ static int RunCommandAuditSelfTest()
         L"inventory publication is an explicit file export while snapshot queries are read-only");
     for (const auto& line : {L"!kmon inventory x", L"!kmon inventory x y /bad", L"!kmon evidence x /inventory",
         L"!kmon evidence x /inventory /json", L"!kmon evidence x /inventory-cursor token",
+        L"!kmon evidence x /inventory y /closure", L"!kmon evidence x /inventory y /max-bytes 1",
         L"!kmon inventory x y /resume", L"!kmon inventory x y /chunks 1",
         L"!kmon inventory x y /resume /verify-entries 1",
         L"!kmon dump-read x.dmp 1000", L"!kmon dump-read x.dmp 1000 0", L"!kmon dump-read x.dmp 1000 4097",

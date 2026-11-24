@@ -285,6 +285,7 @@
     <ClInclude Include="EvidenceBundle.h" />
     <ClInclude Include="EvidenceInvestigation.h" />
     <ClInclude Include="EvidenceInventory.h" />
+    <ClInclude Include="EvidenceInventoryClosure.h" />
     <ClInclude Include="EvidenceInventoryFiles.h" />
     <ClInclude Include="EvidenceInventoryVerification.h" />
     <ClInclude Include="EvidenceJournal.h" />

@@ -730,7 +730,7 @@ namespace
         { L"cases", L"!kmon cases [/pid N] [/role name] [/limit N] [/cursor token] [/json] [/save path]", L"filtered recent kernel/user investigation leads" },
         { L"inventory", L"!kmon inventory <directory> <new-snapshot-directory> [/json]", L"publish an immutable evidence index (direct --offline /resume accepts /chunks and /verify-entries)" },
         { L"dump-read", L"!kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]", L"bounded offline reads with explicit missing pages and mapping failures" },
-        { L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence without a live driver" },
+        { L"evidence", L"!kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]", L"query private retained evidence; direct --offline /inventory also accepts /closure" },
         { L"replay", L"!kmon replay <file.kncase> [/json]", L"reconstruct static facts from stored original bytes" },
         { L"store", L"!kmon store <artifact-root> [/scan-catalog | /scan-files | /scan-receipt token | /file-receipt token] [/json]", L"verify a stopped store or resume journal or file checks" },
         { L"replay-irp", L"!kmon replay-irp <capture.knirp> [/json]", L"replay IRP reads and evaluate scoped claims" },

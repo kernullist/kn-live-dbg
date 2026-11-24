@@ -23138,6 +23138,7 @@ static void PrintKmonHelp()
     std::wcout << L"  --offline !kmon gc <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] [/apply operation-id] [/json] (offline CLI only)\n";
     std::wcout << L"  --offline !kmon retire-collection <artifact-root> <policy.json> [/scan-receipt token] [/file-receipt token] [/apply] [/json] (offline CLI only)\n";
     std::wcout << L"  !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit N] [/cursor token] [/json]\n";
+    std::wcout << L"  --offline !kmon evidence <directory> /inventory <snapshot-directory> /closure [/max-bytes N] [/deadline-ms N] [/json]\n";
     std::wcout << L"  !kmon replay|why <file.kncase> [/json]  offline original bytes and evidence requirements\n";
     std::wcout << L"  passive firmware/hive/ETW slots and user execution references are checked;\n";
     std::wcout << L"  content links do not prove communication, execution, or a cheat verdict.\n";
@@ -24019,6 +24020,7 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
         KmonHuntFilter filter;
         KmonHuntQueryOptions options;
         EvidenceInventoryOptions inventory;
+        EvidenceInventoryClosureOptions closureOptions;
         bool jsonOutput = false;
         bool valid = args.size() >= 3 && !args[2].empty();
         std::set<std::wstring> seen;
@@ -24027,6 +24029,16 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
             const auto option = ToLower(args[i]);
             if (!seen.insert(option).second) { valid = false; break; }
             if (option == L"/json") { jsonOutput = true; }
+            else if (option == L"/closure") { valid = directJsonOutput; }
+            else if ((option == L"/max-bytes" || option == L"/deadline-ms") && directJsonOutput && i + 1 < args.size())
+            {
+                const auto& value = args[++i];
+                uint64_t amount = 0;
+                valid = !value.empty() && value.find_first_not_of(L"0123456789") == std::wstring::npos &&
+                    ParseUnsigned(value, 10, &amount) && amount > 0;
+                if (option == L"/max-bytes") { closureOptions.ReadBudget = amount; }
+                else { closureOptions.DeadlineMs = amount; }
+            }
             else if ((option == L"/pid" || option == L"/role" || option == L"/limit" || option == L"/cursor" ||
                 option == L"/inventory" || option == L"/inventory-cursor") &&
                 i + 1 < args.size() && !args[i + 1].empty())
@@ -24058,10 +24070,27 @@ static int RunKmonOfflineCommand(const std::vector<std::wstring>& args, bool dir
             }
             else { valid = false; }
         }
+        const bool closure = seen.count(L"/closure") != 0;
+        if (closure)
+        {
+            valid = valid && !inventory.Path.empty() && !seen.count(L"/pid") && !seen.count(L"/role") &&
+                !seen.count(L"/limit") && !seen.count(L"/cursor") && !seen.count(L"/inventory-cursor");
+        }
+        else { valid = valid && !seen.count(L"/max-bytes") && !seen.count(L"/deadline-ms"); }
         if (!valid || (!inventory.Cursor.empty() && inventory.Path.empty()))
         {
-            std::wcerr << L"!kmon evidence: usage: !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit 1..256] [/cursor token] [/json]\n";
+            std::wcerr << L"!kmon evidence: usage: !kmon evidence <directory> [/inventory snapshot-directory] [/inventory-cursor token] [/pid N] [/role name] [/limit 1..256] [/cursor token] [/json]\n"
+                L"       --offline !kmon evidence <directory> /inventory <snapshot-directory> /closure [/max-bytes N] [/deadline-ms N] [/json]\n";
             return 2;
+        }
+        if (closure)
+        {
+            closureOptions.Cancellation = &g_StopRequested;
+            EvidenceInventoryClosureResult report;
+            try { report = InspectEvidenceInventoryClosure(args[2], inventory.Path, closureOptions); }
+            catch (const std::bad_alloc&) { report.Status = L"insufficient_memory"; }
+            if (!WriteCapabilityJson(EvidenceInventoryClosureJson(report))) { return 3; }
+            return report.Status == L"ok" ? 0 : 1;
         }
         const auto result = QueryEvidenceDirectory(args[2], filter, options, inventory);
         if (jsonOutput) { std::wcout << EvidenceQueryJson(result, filter) << L"\n"; return result.Status == L"ok" ? 0 : 1; }

@@ -31,6 +31,46 @@ namespace evidence_inventory_test
         const auto built = BuildEvidenceInventory(source, snapshot);
         check(built.Status == L"ok" && built.Entries == 6 && built.InvalidFiles == 0 && built.Digest.size() == 64,
             "bounded snapshot published with content-bound chunks");
+        const auto open = InspectEvidenceInventoryClosure(source, snapshot);
+        check(open.Status == L"partial_inventory" && open.Assessment && !open.Assessment->ClosureKnown &&
+            open.Assessment->UniqueCases == 6 && (fixture.CollectionId.empty() ? open.Assessment->UnattributedCases == 6 :
+            open.Assessment->CollectionsWithoutLedger == 1), "whole snapshot distinguishes absent collection identity from an absent ledger");
+        EvidenceInventoryClosureOptions stop;
+        std::atomic<bool> requested{true};
+        stop.Cancellation = &requested;
+        auto stopped = InspectEvidenceInventoryClosure(source, snapshot, stop);
+        check(stopped.Status == L"cancelled" && !stopped.Assessment && !stopped.ReadBytes,
+            "pre-cancelled closure exposes no global assessment");
+        stop.Cancellation = nullptr;
+        stop.ReadBudget = 1;
+        stopped = InspectEvidenceInventoryClosure(source, snapshot, stop);
+        check(stopped.Status == L"budget_exhausted" && !stopped.Assessment && !stopped.ReadBytes,
+            "closure reserves the next original's actual size before reading");
+        auto named = fixture;
+        named.CollectionId = L"owned-closure";
+        const auto namedSource = root + L"\\closure-cases", namedIndex = root + L"\\closure-index";
+        check(CreateDirectoryW(namedSource.c_str(), nullptr) && SaveEvidenceBundle(namedSource + L"\\a.kncase", named, &error) &&
+            CopyFileW((namedSource + L"\\a.kncase").c_str(), (namedSource + L"\\b.kncase").c_str(), TRUE),
+            "global closure case and duplicate saved");
+        const auto caseBytes = mcpjson::WideToUtf8(EvidenceBundleJson(named)).size();
+        EvidenceSessionSummary reported{named.CollectionId, 1, 1, 0, 7, caseBytes};
+        check(SaveObservationJson(namedSource + L"\\a.knledger", EvidenceSessionJson(reported), &error) &&
+            BuildEvidenceInventory(namedSource, namedIndex).Status == L"ok", "named physical publication retained with canonical ledger");
+        const auto closed = InspectEvidenceInventoryClosure(namedSource, namedIndex);
+        check(closed.Status == L"ok" && closed.Assessment && closed.Assessment->ClosureKnown && closed.Assessment->CaseFiles == 2 &&
+            closed.Assessment->UniqueCases == 1 && closed.Assessment->ObservedCanonicalBytes == caseBytes && closed.Assessment->Dropped == L"7",
+            "reported loss and duplicated physical bytes remain separate from exact original publication closure");
+        const auto excessIndex = root + L"\\closure-excess-index";
+        named.CaptureEndedMs++;
+        named.Acquisition = L"local_user_reader";
+        named.Origin = {std::wstring(32, L'a'), std::wstring(32, L'b'), std::wstring(32, L'c'), 7};
+        named.Receipt.Reference.Context.Identity.BootId = named.Origin.LocalBootId;
+        check(SaveEvidenceBundle(namedSource + L"\\extra.kncase", named, &error) && BuildEvidenceInventory(namedSource, excessIndex).Status == L"ok",
+            "distinct v2 original published beside the v1 bundle and older ledger");
+        const auto excess = InspectEvidenceInventoryClosure(namedSource, excessIndex);
+        check(excess.Status == L"partial_inventory" && excess.Assessment && excess.Assessment->UnexpectedCases == 1 &&
+            excess.Assessment->ByteMismatchCollections == 1 && !excess.Assessment->ClosureKnown,
+            "a ledger cannot close an extra unique publication even when duplicate files coexist");
         check(BuildEvidenceInventory(source, snapshot).Status == L"output_exists_or_unavailable",
             "snapshot builder never overwrites an existing destination");
         const auto nulOutput = root + L"\\nul-path-index";

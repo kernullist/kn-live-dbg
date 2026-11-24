@@ -19,6 +19,9 @@ can resume construction at a committed chunk. The `/verify-entries` option
 also resumes original checks from a signed progress record before publishing
 the v1 manifest. See the [command reference](COMMAND_REFERENCE.md#capability-reports-and-evidence-commands)
 and [bounded verification tests](VALIDATION.md#bounded-verification-of-legacy-inventory-originals-on-2026-11-24).
+The direct offline `evidence /inventory <index> /closure` command rereads a
+completed snapshot to reconcile global bundle counts and bytes with its
+collection ledgers. [Closure validation](VALIDATION.md#global-publication-closure-for-legacy-inventories-on-2026-11-24)
 
 ## Operation
 

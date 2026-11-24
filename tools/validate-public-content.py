@@ -149,11 +149,11 @@ IO_TIMING_MARKERS = (*IO_LIFETIME_SCHEMAS, '"tick_field"', '"start_tick_ms"', '"
                      '"pending_probe_line"', '"owner_pid"', '"ntstatus"', '"information_class"', '"completion_key"',
                      '"port_open_line"', '"port_handle"', '"returned_port"', '"directory_handle"', '"overlapped"', '"disputed_dequeue_lines"', '"joined_packets"')
 INVENTORY_WORK_SCHEMAS = ("kn.evidence_inventory_work.v1", "kn.evidence_inventory_window.v1", "kn.evidence_inventory_verification.v1",
-                          "kn.evidence_inventory_build.v1", "kn.evidence_inventory_build_resume.v1")
+                          "kn.evidence_inventory_build.v1", "kn.evidence_inventory_build_resume.v1", "kn.evidence_inventory_closure.v1")
 STORE_REPORT_MARKERS = (*INVENTORY_WORK_SCHEMAS, "kn.store_catalog_scan.v1", "kn.store_file_scan.v1", "kn.evidence_gc_result.v1", "kn.evidence_retirement_result.v1",
                         "kncs1.", "kncr1.", "knfs1.", "knfr1.")
 STORE_REPORT_RECORD = re.compile(r'"schema"\s*:\s*"kn\.store_(?:catalog|file)_scan\.v1"'
-                                 r'|"schema"\s*:\s*"kn\.evidence_inventory_(?:work|window|verification|build(?:_resume)?)\.v1"(?=\s*(?:[,}]|$))'
+                                 r'|"schema"\s*:\s*"kn\.evidence_inventory_(?:work|window|verification|closure|build(?:_resume)?)\.v1"(?=\s*(?:[,}]|$))'
                                  r'|"schema"\s*:\s*"kn\.evidence_(?:gc|retirement)_result\.v1"(?=\s*(?:[,}]|$))'
                                  r'|\bknc[sr]1\.[0-9]{1,5}\.[0-9a-f]{32,64}|\bknf[sr]1\.[0-9]{1,5}\.[0-9]{1,10}\.[0-9a-f]{32,64}',
                                  re.MULTILINE)
@@ -162,10 +162,11 @@ STORE_RETENTION_MARKERS = ('"output_id"', '"originals_sha256"', '"reused_entries
                            '"uncommitted_image_referrers"', '"image_catalog"', '"digest_basis"', '"irp_catalog"', '"irp_referrers"', '"root_committed"',
                            '"retired_original_matched"', '"retirement_sha256"', '"exclusive_nonledger"', '"exclusive_byte_limit"',
                            '"next_artifact_cursor"', '"artifact_page_status"', '"routine_paths"', '"routine_named_byte_target"',
-                           '"routine_named_bytes_before"', '"named_bytes"')
+                           '"routine_named_bytes_before"', '"named_bytes"', '"duplicate_case_files"', '"byte_mismatch_collections"')
 STORE_RETENTION_FIELDS = tuple(frozenset(fields) for fields in (
     ("source_id", "output_id", "catalog_sha256"), ("chunk_sha256", "originals_sha256"), ("reused_entries", "verified_entries"),
     ("verified_through", "verification_seal"), ("verified_through", "raw_witness_prefix"), ("raw_witness_prefix", "verification_seal"),
+    ("unique_bundles", "duplicate_case_files"), ("observed_canonical_bytes", "byte_mismatch_collections"),
     ("path", "sha256", "input_matched"), ("artifact", "uncommitted_approval_referrers"), ("artifact", "approval_catalog"),
     ("artifact", "uncommitted_image_referrers"), ("artifact", "image_catalog"), ("path", "expected_sha256", "digest_basis"),
     ("artifact", "irp_catalog"), ("artifact", "irp_referrers"), ("path", "expected_bytes", "root_committed"),
