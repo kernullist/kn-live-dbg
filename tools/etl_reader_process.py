@@ -70,13 +70,14 @@ class WindowsFiles:
                 self.close(handle)
 
     @contextmanager
-    def hold(self, path, directory=False):
+    def hold(self, path, directory=False, *, share_directory_writes=True):
         import msvcrt
-        # Share directory writes so children can be created and renamed, while
-        # denying rename of the directory itself. Files deny writes and renames.
+        # ETL readers share directory writes. Signature verification also denies
+        # directory writes while Windows reopens a path. Neither shares deletion.
         access = 0x81 if directory else 0x80000000
         flags = 0x00200000 | 0x00100000 | (0x02000000 if directory else 0)
-        handle = self.create(str(path), access, 3 if directory else 1, None, 3, flags, None)
+        share = 3 if directory and share_directory_writes else 1
+        handle = self.create(str(path), access, share, None, 3, flags, None)
         if handle == ctypes.c_void_p(-1).value:
             raise ctypes.WinError(ctypes.get_last_error())
         try:
@@ -96,11 +97,11 @@ class WindowsFiles:
             if handle is not None:
                 self.close(handle)
 
-    def parents(self, stack, directory, held):
+    def parents(self, stack, directory, held, *, share_directory_writes=True):
         check(self.drive(directory.anchor) == 3, "use a fixed local volume")
         for parent in (*reversed(directory.parents), directory):
             if parent != Path(directory.anchor) and parent not in held:
-                stack.enter_context(self.hold(parent, directory=True))
+                stack.enter_context(self.hold(parent, directory=True, share_directory_writes=share_directory_writes))
                 held.add(parent)
 
 

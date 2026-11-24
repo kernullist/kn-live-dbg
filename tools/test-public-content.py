@@ -674,6 +674,19 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Read native_policy_sha256 from the provisioning receipt."))
 
+    def test_windows_publisher_policy_and_receipts(self):
+        samples = (dict(schema="kn.image_approval_policy.v2"), dict(schema="kn.image_approval_provision.v2"),
+                   dict(windows_publisher={}), dict(reference_signature={}, issuer="team"),
+                   dict(signature_policy={}, started_utc="time"), dict(signer_certificate_sha256=None),
+                   dict(catalog_member_sha256="b"), dict(catalog_sha256="a", catalog_bytes=32),
+                   dict(wintrust_status="0x800b0100", status="wintrust_rejected"),
+                   dict(win32_status=33, finished_utc="time"))
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16", "utf-16-le", "utf-16-be"):
+                data = ("receipt\n" + json.dumps({"nested": [sample]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("detached.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"The signer_certificate_sha256 field names the Windows publisher."))
+
     def test_window_message_wait_exports(self):
         for row in (dict(schema="kn.wait_message_fixture.v1"), dict(receiver_tid=17, receiver_created="20"),
                     dict(send_return_tick=200, handler_entry_tick=100, handler_leave_tick=200)):

@@ -6,10 +6,12 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 TOOLS = Path(__file__).resolve().parent
@@ -22,9 +24,10 @@ AT = "20240201T000000Z"
 AT_TICKS = 133512192000000000  # 2024-02-01 UTC in Windows FILETIME.
 FUTURE = "18446744073709551615"
 native_exe, native_cases = None, []
+embedded_sample, catalog_sample, signed_native_cases = None, None, []
 
 
-class ApprovalTests(unittest.TestCase):
+class ApprovalFixture(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.repository = T["Repository"]()
@@ -62,19 +65,20 @@ class ApprovalTests(unittest.TestCase):
         self.env.write_bytes(T["bundle"](files))
         self.root_pin = sha(files["root"])
 
-    def command(self, **overrides):
+    def command(self, require_windows_publisher=False, **overrides):
         args = dict(publisher_reference=self.env, trusted_root_sha256=self.root_pin, verification_time=AT,
                     policy_target=NAME, policy=self.source, manifest=self.change, reference=self.image, out=self.out)
         args.update(overrides)
-        return [sys.executable, "-B", str(CLI), *["--" + k.replace("_", "-") + "=" + str(v) for k, v in args.items()]]
+        command = [sys.executable, "-B", str(CLI), *["--" + k.replace("_", "-") + "=" + str(v) for k, v in args.items()]]
+        return command + (["--require-windows-publisher"] if require_windows_publisher else [])
 
-    def call(self, code, **overrides):
+    def call(self, code, *, version=1, **overrides):
         result = subprocess.run(self.command(**overrides), capture_output=True, timeout=30)
         self.assertEqual(result.returncode, code, (result.stdout, result.stderr))
         if code == 2:
             return
         receipt = json.loads(result.stdout)
-        self.assertEqual(receipt["schema"], "kn.image_approval_provision.v1")
+        self.assertEqual(receipt["schema"], f"kn.image_approval_provision.v{version}")
         if code == 1:
             self.assertEqual(receipt["status"], "rejected")
             self.assertIsNone(receipt["native_policy_sha256"])
@@ -84,6 +88,7 @@ class ApprovalTests(unittest.TestCase):
             self.assertEqual(receipt["native_policy_sha256"], sha(Path(overrides.get("out", self.out)).read_bytes()))
         return receipt
 
+class ApprovalTests(ApprovalFixture):
     def test_projection_and_preservation(self):
         frozen = {p: p.read_bytes() for p in (self.source, self.change, self.image, self.env)}
         receipt = self.call(0)
@@ -254,7 +259,7 @@ class ApprovalTests(unittest.TestCase):
         self.call(2)
 
     def test_native_assess_image(self):
-        if native_exe is None:
+        if not native_cases:
             self.skipTest("supply --native-exe and --native-case CAPTURE MANIFEST REFERENCE for retained PE replay")
         rows = []
         for _, manifest, reference in native_cases:
@@ -285,12 +290,204 @@ class ApprovalTests(unittest.TestCase):
                     self.assertFalse(json.loads(result.stdout)["reference_approved"])
 
 
+class WindowsApprovalTests(ApprovalFixture):
+    def policy_for(self, signature, *, manifest=None, current=True):
+        pin = sha(self.image.read_bytes())
+        if manifest is None:
+            self.change.write_bytes(raw(dict(self.manifest, image_sha256=pin)))
+        else:
+            self.change.write_bytes(manifest.read_bytes())
+        definition = json.loads(self.change.read_bytes())
+        self.assertEqual(definition["image_sha256"], pin)
+        row = dict(image_sha256=pin, manifest_sha256=sha(self.change.read_bytes()), issuer=definition["issuer"],
+                   reference_signature=signature)
+        source = dict(self.policy, schema="kn.image_approval_policy.v2", policy_epoch=definition["policy_epoch"], approvals=[row])
+        now = datetime.now(timezone.utc)
+        expiry = (now + timedelta(days=7)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        self.sign(raw(source), roles={k: dict(expires=expiry) for k in self.repository.base} if current else None)
+        return dict(version=2, verification_time=now.strftime("%Y%m%dT%H%M%SZ") if current else AT,
+                    require_windows_publisher=True)
+
+    def sample(self, kind):
+        sample = embedded_sample if kind == "embedded" else catalog_sample
+        if sample is None or os.name != "nt":
+            self.skipTest(f"supply a retained Windows {kind} fixture and independent signer pin")
+        shutil.copyfile(sample[0], self.image)
+        policy = dict(kind=kind, revocation="none", signer_certificate_sha256=sample[-1])
+        options = {}
+        if kind == "catalog":
+            catalog = self.root / "retained.cat"
+            shutil.copyfile(sample[1], catalog)
+            policy["catalog_sha256"] = sha(catalog.read_bytes())
+            options["catalog"] = catalog
+        return policy, options
+
+    def test_required_policy_and_invalid_unselected_signature(self):
+        self.assertEqual(self.call(1, require_windows_publisher=True)["reason"], "windows_publisher_policy_required")
+        self.assertEqual(self.call(1, catalog=self.env)["reason"], "unexpected_catalog")
+        signature = dict(kind="embedded", revocation="none", signer_certificate_sha256=sha(b"cert"))
+        signed = dict(self.selected, reference_signature=signature)
+        for invalid in (None, {}, dict(signature, kind="other"), dict(signature, path="file"),
+                        dict(signature, signer_certificate_sha256="bad"), dict(signature, revocation="allow_unknown"),
+                        dict(signature, kind="catalog"), dict(signature, catalog_sha256=sha(b"catalog"))):
+            other = dict(self.policy["approvals"][0], reference_signature=invalid)
+            self.sign(raw(dict(self.policy, schema="kn.image_approval_policy.v2", approvals=[other, signed])))
+            self.assertEqual(self.call(1)["reason"], "invalid_source_policy")
+        self.sign(raw(dict(self.policy, approvals=[signed])))
+        self.assertEqual(self.call(1)["reason"], "invalid_source_policy")
+
+    def test_embedded_publisher_and_wrong_verified_signer(self):
+        policy, _ = self.sample("embedded")
+        args = self.policy_for(policy)
+        receipt = self.call(0, out=self.root / "good.knapproval", **args)
+        sig = receipt["windows_publisher"]
+        self.assertEqual((sig["status"], sig["wintrust_status"], sig["signer_certificate_sha256"]),
+                         ("verified", "0x00000000", embedded_sample[-1]))
+        self.assertEqual(receipt["reference_sha256"], sha(self.image.read_bytes()))
+        self.assertEqual(self.call(1, catalog=self.env, **args)["reason"], "unexpected_catalog")
+        args = self.policy_for(dict(policy, signer_certificate_sha256=sha(b"unrelated signer")))
+        denied = self.call(1, **args)
+        self.assertEqual(denied["reason"], "signer_certificate_mismatch")
+        self.assertEqual(denied["windows_publisher"]["signer_certificate_sha256"], embedded_sample[-1])
+
+    def test_catalog_requires_the_exact_catalog_member_and_signer(self):
+        policy, opts = self.sample("catalog")
+        args = self.policy_for(policy)
+        receipt = self.call(0, out=self.root / "accepted", **opts, **args)
+        sig = receipt["windows_publisher"]
+        self.assertEqual((sig["catalog_sha256"], sig["signer_certificate_sha256"]), (policy["catalog_sha256"], catalog_sample[-1]))
+        self.assertEqual(len(sig["catalog_member_sha256"]), 64)
+        self.assertEqual(self.call(1, **args)["reason"], "catalog_required")
+        self.assertEqual(self.call(1, **self.policy_for(dict(policy, catalog_sha256=sha(b"other"))), **opts)["reason"],
+                         "catalog_digest_mismatch")
+        self.assertEqual(self.call(1, **self.policy_for(dict(policy, signer_certificate_sha256=sha(b"unknown"))), **opts)["reason"],
+                         "signer_certificate_mismatch")
+        if embedded_sample:
+            shutil.copyfile(embedded_sample[0], self.image)
+            self.assertEqual(self.call(1, **self.policy_for(policy), **opts)["reason"], "wintrust_rejected")
+
+    def test_retained_file_must_pass_both_whole_file_and_windows_checks(self):
+        policy, _ = self.sample("embedded")
+        args = self.policy_for(policy)
+        with self.image.open("r+b") as stream:
+            stream.truncate(self.image.stat().st_size // 2)
+        self.assertEqual(self.call(1, **args)["reason"], "reference_mismatch")
+        self.assertEqual(self.call(1, **self.policy_for(policy))["reason"], "wintrust_rejected")
+        self.image.write_bytes(b"ordinary signed-policy target")
+        self.assertEqual(self.call(1, **self.policy_for(policy))["reason"], "invalid_pe_reference")
+
+    def test_windows_host_time_and_signed_revocation_policy(self):
+        policy, _ = self.sample("embedded")
+        self.assertEqual(self.call(1, **self.policy_for(policy, current=False))["reason"], "outside_windows_verification_window")
+        policy["revocation"] = "cached_chain"
+        options = self.policy_for(policy)
+        options.pop("version")
+        run = subprocess.run(self.command(**options), capture_output=True, timeout=30)
+        receipt = json.loads(run.stdout)
+        sig = receipt["windows_publisher"]
+        self.assertEqual(sig["signature_policy"]["revocation"], "cached_chain")
+        if sig["wintrust_status"] == "0x00000000":
+            self.assertEqual(run.returncode, 0)
+            self.assertEqual(sig["signer_certificate_sha256"], embedded_sample[-1])
+        else:
+            self.assertEqual((run.returncode, receipt["reason"]), (1, "wintrust_rejected"))
+            self.assertFalse(self.out.exists())
+
+    def test_files_and_ancestors_remain_leased_during_windows_verification(self):
+        import windows_pe_trust as win
+        policy, opts = self.sample("catalog")
+        real_verify = win.WinTrust.verify_signature
+        entered = []
+        def observe(trust, info, embedded, revocation, proof):
+            for file in (self.image, opts["catalog"]):
+                with self.assertRaises(PermissionError):
+                    with file.open("r+b"):
+                        pass
+                with self.assertRaises(PermissionError):
+                    file.rename(file.with_suffix(".replaced"))
+            with self.assertRaises(PermissionError):
+                self.root.rename(self.root.with_name(self.root.name + "-renamed"))
+            entered.append(True)
+            return real_verify(trust, info, embedded, revocation, proof)
+        with mock.patch.object(win.WinTrust, "verify_signature", observe):
+            proof = win.verify_reference(self.image, sha(self.image.read_bytes()), 64 << 20, opts["catalog"], policy)
+        self.assertEqual((entered, proof["status"]), ([True], "verified"))
+        with opts["catalog"].open("r+b"):
+            self.assertEqual(self.call(1, **self.policy_for(policy), **opts)["reason"], "windows_signature_input_or_provider_unavailable")
+        self.call(0, **self.policy_for(policy), **opts)
+
+    def test_catalog_diagnostic_output_cannot_append_to_an_input(self):
+        original = self.env.read_bytes()
+        alias = self.root / "catalog-copy"
+        os.link(self.env, alias)
+        for opts in (["--catalog", str(alias)], ["--catalog=" + str(alias)]):
+            with self.env.open("ab") as target:
+                proc = subprocess.run([sys.executable, "-B", str(CLI), "--help", *opts], stdout=target, stderr=target, timeout=30)
+            self.assertEqual((proc.returncode, self.env.read_bytes()), (2, original))
+
+    def test_catalog_quota_and_platform(self):
+        import windows_pe_trust as win
+        with mock.patch.object(win.os, "name", "posix"):
+            result = win.verify_reference(self.image, sha(b"file"), 16, None, {})
+        self.assertEqual(result["status"], "windows_trust_unavailable")
+        policy, opts = self.sample("catalog")
+        with opts["catalog"].open("r+b") as stream:
+            stream.truncate(win.CATALOG_LIMIT + 1)
+        self.assertEqual(self.call(1, **self.policy_for(policy), **opts)["reason"], "signature_input_size_outside_limit")
+
+    @unittest.skipUnless(os.name == "nt", "Windows trust provider")
+    def test_revocation_failure_closes_provider_state_without_retry(self):
+        import windows_pe_trust as win
+        trust = win.WinTrust()
+        for status in (1, -2146885613):  # Any nonzero LONG, including CRYPT_E_REVOCATION_OFFLINE.
+            actions = []
+            def refuse(_, __, pointer):
+                data = win.c.cast(pointer, win.c.POINTER(win.TrustData)).contents
+                actions.append(data.action)
+                self.assertTrue(data.flags & win.WTD_CACHE_ONLY_URL_RETRIEVAL)
+                self.assertTrue(data.flags & win.WTD_REVOCATION_CHECK_CHAIN)
+                self.assertFalse(data.flags & win.WTD_REVOCATION_CHECK_NONE)
+                if data.action == win.WTD_STATEACTION_VERIFY:
+                    data.state = 17
+                    return status
+                return 0
+            proof = {}
+            with mock.patch.object(trust, "verify", refuse):
+                result = trust.verify_signature(win.FileInfo(), True, "cached_chain", proof)
+            self.assertEqual((result, actions), ("wintrust_rejected", [win.WTD_STATEACTION_VERIFY, win.WTD_STATEACTION_CLOSE]))
+            self.assertEqual(proof["wintrust_status"], f"0x{status & 0xffffffff:08x}")
+            self.assertNotIn("signer_certificate_sha256", proof)
+
+    def test_native_replay_with_windows_publisher(self):
+        if not signed_native_cases:
+            self.skipTest("supply --windows-native-case KIND CAPTURE MANIFEST and matching publisher samples")
+        for index, (kind, case, manifest) in enumerate(signed_native_cases):
+            policy, opts = self.sample(kind)
+            out = self.root / f"{kind}-{index}.knapproval"
+            receipt = self.call(0, **opts, **self.policy_for(policy, manifest=Path(manifest)), out=out)
+            native = json.loads(out.read_bytes())
+            self.assertEqual(native["schema"], "kn.image_approval_policy.v1")
+            self.assertEqual(set(native["approvals"][0]), {"image_sha256", "manifest_sha256", "issuer"})
+            run = subprocess.run([str(native_exe), "--offline", "!kmon", "assess-image", case, manifest, str(out),
+                                  receipt["native_policy_sha256"], "/json"], capture_output=True, timeout=60)
+            report = json.loads(run.stdout)
+            self.assertEqual((run.returncode, report["reference_approved"], report["issuer_signature_verified"]), (0, True, False))
+            self.assertEqual(report["decision"], "no_observed_change")
+
+
 if __name__ == "__main__":
     options = argparse.ArgumentParser(add_help=False)
     options.add_argument("--native-exe", type=Path)
     options.add_argument("--native-case", type=Path, nargs=3, action="append", metavar=("CAPTURE", "MANIFEST", "REFERENCE"))
+    options.add_argument("--windows-embedded", nargs=2, metavar=("PE", "SIGNER_SHA256"))
+    options.add_argument("--windows-catalog", nargs=3, metavar=("PE", "CATALOG", "SIGNER_SHA256"))
+    options.add_argument("--windows-native-case", nargs=3, action="append", metavar=("KIND", "CAPTURE", "MANIFEST"))
     args, remaining = options.parse_known_args()
-    if bool(args.native_exe) != bool(args.native_case):
+    if bool(args.native_exe) != bool(args.native_case or args.windows_native_case):
         options.error("provide the native binary and at least one case together")
+    for kind, _, _ in args.windows_native_case or []:
+        if kind not in ("embedded", "catalog") or not getattr(args, "windows_" + kind):
+            options.error("each Windows native case needs the corresponding embedded or catalog fixture")
     native_exe, native_cases = args.native_exe, args.native_case or []
+    embedded_sample, catalog_sample, signed_native_cases = args.windows_embedded, args.windows_catalog, args.windows_native_case or []
     unittest.main(argv=[sys.argv[0], *remaining])

@@ -586,23 +586,47 @@ and case-sensitive `$policyTarget`. Supply `$verificationTime` as UTC in
 `YYYYMMDDTHHMMSSZ` form, `$selectedPolicy` as a new filename in a private
 directory and `$capture` as the retained native capture to assess.
 
+Set `$requireWindowsPublisher` to `$true` to require a v2 source policy, or
+`$false` to allow v1. A signed v2 policy always enforces its Windows checks.
+Set `$catalog` to the retained catalog file for a catalog row and to `$null`
+for an embedded or v1 row. The reference and catalog each have a 64 MiB limit.
+
 ```powershell
+$windowsOptions = @()
+if ($requireWindowsPublisher) { $windowsOptions += '--require-windows-publisher' }
+if ($catalog) { $windowsOptions += @('--catalog', $catalog) }
 $receiptJson = & $python -B tools/provision-image-approval.py --publisher-reference $publisherReference `
     --trusted-root-sha256 $trustedRootSha256 --verification-time $verificationTime --policy-target $policyTarget `
-    --policy $sourcePolicy --manifest $manifest --reference $reference --out $selectedPolicy
+    --policy $sourcePolicy --manifest $manifest --reference $reference --out $selectedPolicy @windowsOptions
 if ($LASTEXITCODE -ne 0) { throw 'Image approval provisioning failed' }
 $receipt = $receiptJson | ConvertFrom-Json
 & $debugger --offline '!kmon' assess-image $capture $manifest $selectedPolicy $receipt.native_policy_sha256 /json
 if ($LASTEXITCODE -ne 0) { throw 'Image assessment failed' }
 ```
 
+The TUF target can use `kn.image_approval_policy.v2` with the v1 policy fields
+and one additional `reference_signature` object on **every** approval row.
+
+| Field in `reference_signature` | Signed value |
+| --- | --- |
+| `kind` | `embedded` or `catalog` |
+| `signer_certificate_sha256` | Lower-case SHA-256 of the file signer's DER certificate |
+| `revocation` | `none` or `cached_chain` |
+| `catalog_sha256` | Lower-case whole-file SHA-256, required only for `catalog` |
+
 Provisioning exits 0 after publishing one policy row and writing its private
 JSON receipt. A signature, target, document or approval mismatch exits 1 with
-a rejection reason and a null policy pin. Invalid arguments, an occupied
-destination, a file outside the input limits, or an I/O failure exit 2. The
-output file is created before its receipt is delivered. Preserve the signed
-source policy and reference envelope to reproduce the publisher check. See
-[publisher-signed image approval policies](ARCHITECTURE.md#publisher-signed-image-approval-policies).
+a rejection reason and a null policy pin. The v2 receipt includes the Windows
+check under `windows_publisher`. A missing catalog, unavailable file lease,
+over-limit Windows input or failed WinTrust check also exits 1. The receipt
+records the WinTrust status in hexadecimal when Windows performed the check.
+Use the top-level `provisioned` status and returned policy digest to continue
+to native assessment. Invalid arguments, an occupied destination and ordinary
+document I/O errors exit 2. The output file is created
+before its receipt is delivered. Preserve the signed source policy, reference
+envelope and any catalog to reproduce the publisher check. See the
+[approval policy design](ARCHITECTURE.md#publisher-signed-image-approval-policies)
+and the [Windows publisher validation results](VALIDATION.md#windows-publisher-verification-for-retained-pe-files-on-2026-11-24).
 
 `KnLiveDbg.exe --offline !kmon journal-image-approval <directory|managed.kncapture|slice.knslice|sweep.knsweep|assessment.knscopeapproval> <changes.knchange> <policy.knapproval> <policy-sha256> <private-store> <collection-id> /json`
 archives one assessment and its exact inputs into an `init-store` private

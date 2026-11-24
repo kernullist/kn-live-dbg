@@ -7,6 +7,38 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Windows publisher verification for retained PE files on 2026-11-24
+
+On Windows build 28000.3501, the native verifier captured a 64-byte executable
+range from each of two unmodified DLLs in an owned Python process. After the
+process exited, an offline test authority published one TUF policy naming
+both full-file hashes, exact change manifests and Windows signers. The signer
+certificate pins came from different, independently verified files. The
+Windows SDK 10.0.26100.0 SignTool checked the captured reference blobs.
+
+| Captured reference | Original size | Windows signature evidence | Independent signer source |
+| --- | ---: | --- | --- |
+| CPython 3.12.10 `python312.dll` | 6,945,272 bytes | Embedded signature from the Python Software Foundation | Installed `python.exe` |
+| Windows `version.dll` | 65,888 bytes | SHA-256 member of an explicitly retained 522,301-byte Microsoft Windows catalog | Installed `powershell.exe` |
+
+The host accepted both signer chains with cached revocation checks. Specifying
+the wrong signing certificate or catalog digest, omitting the catalog, and
+presenting a different signed PE as a catalog member each prevented issuance.
+The fixture also tested a nonzero WinTrust return and an offline revocation
+error, checking that verification closed the provider state after the failure.
+Readers held the file and directory leases during the actual Windows operation.
+
+Both native assessments returned `no_observed_change` and marked the proposed
+range `not_applied`. Each archived assessment reproduced after the input
+manifest and policy used for archival were removed. The earlier v1 source
+produced byte-identical policy and receipt files. All 23 provisioning tests
+passed. The documented commands reproduced all three examples under both
+Windows PowerShell 5.1 and PowerShell 7.6. The Windows distributors
+signed the PE or catalog. Approval of the test change manifests came from the
+test authority. Cache contents, OS trust settings and verification time are
+host-specific. SHA-1 catalog membership, selection of additional embedded
+signatures, and other Windows builds remain outside these observations.
+
 ## Publisher-provisioned native image approvals on 2026-11-24
 
 On development `main`, a test approval authority signed a two-row policy

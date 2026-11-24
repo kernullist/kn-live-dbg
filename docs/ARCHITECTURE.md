@@ -3787,10 +3787,39 @@ publisher to endorse an earlier capture within its stated window. The native
 assessment independently checks the capture and evaluation times, reopens the
 retained reference and reproduces the observed changes.
 
-The publisher endorses the file and manifest digests with the issuer label in
-that row. A separate signature by the named issuer, Windows catalog or
-Authenticode trust, and collector authentication each require their own
-evidence. This verification covers one pinned metadata revision. Discovering
+The approval authority endorses the file and manifest digests with the issuer
+label in that row. Version 2 of the source policy also requires a Windows
+publisher check for the selected PE. Each row names a signing certificate by
+SHA-256 of its DER bytes, a signature source and a revocation policy. An
+embedded row uses the PE's Authenticode signature. A catalog row pins the
+entire catalog file and requires the PE's SHA-256 member digest to verify
+against that catalog. The operator supplies the catalog path. The signed row
+contains identities only.
+
+The verifier holds the reference, catalog and their parent directories on a
+fixed local volume. It checks the volume and file IDs at the canonical paths
+used by Windows, hashes the complete files and obtains the signing certificate
+from the successful WinTrust operation. The embedded check requests signature
+index zero. Both sources use the file signer from the verified chain. Signing
+timestamps and other certificates in the file cannot supply the signer pin.
+The whole-file digest remains part of the signed approval even for PE bytes
+outside the Authenticode image digest. See the [Windows PE signature format](https://learn.microsoft.com/en-us/windows/win32/secbp/understanding-pe-signatures)
+and [Windows catalog member verification](https://learn.microsoft.com/en-us/windows/win32/api/wintrust/ns-wintrust-wintrust_catalog_info).
+
+Windows evaluates code-signing trust on the verifier host. The signed policy
+chooses either `none` for revocation checks or `cached_chain` to require chain
+revocation checks using the host cache. Both disable network retrieval. A
+cache or trust error records the provider status and prevents publication.
+The Windows check must begin and finish within the effective approval window.
+Its receipt records those host times separately from the operator's TUF
+verification instant. Native replay consumes the derived v1 policy. Keep the
+Windows receipt, original PE and any catalog for a fresh publisher check on
+another host or at another time. See [WinTrust verification flags](https://learn.microsoft.com/en-us/windows/win32/api/wintrust/ns-wintrust-wintrust_data).
+
+The PE distributor signs the image or its catalog membership. The TUF
+authority approves the precise change manifest. A personal signature by the
+manifest issuer and collector authentication each require separate evidence.
+TUF verification covers one pinned metadata revision. Discovering
 newer revisions, root rotation, delegated targets and revocation between
 revisions remain open. Retain the source policy, four original metadata files,
 independent trust configuration and private provisioning receipt alongside the

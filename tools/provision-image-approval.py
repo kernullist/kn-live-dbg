@@ -15,7 +15,7 @@ from saved_etl_comparison import digest, local_path, outputs_safe, write_result
 
 
 DECODE = runpy.run_path(str(Path(__file__).with_name("evaluate-corpus.py")))["decode_document"]
-PATH_OPTIONS = ("--publisher-reference", "--policy", "--manifest", "--reference", "--out")
+PATH_OPTIONS = ("--publisher-reference", "--policy", "--manifest", "--reference", "--catalog", "--out")
 COMPARISONS = {"kn.executable_page.direct.v1", "kn.executable_slice.direct.v1",
                "kn.executable_slice.secondary.v1", "kn.executable_sweep.temporal.v1"}
 NATIVE_LIMIT = 64 << 10
@@ -67,17 +67,32 @@ def rows(value):
     return type(value) is list and 1 <= len(value) <= 128
 
 
+def signature_policy(value):
+    if type(value) is not dict or value.get("kind") not in ("embedded", "catalog"):
+        return False
+    keys = "kind revocation signer_certificate_sha256"
+    if value["kind"] == "catalog":
+        keys += " catalog_sha256"
+    return (fields(value, keys) and value["revocation"] in ("none", "cached_chain") and
+            hash_field(value["signer_certificate_sha256"]) and
+            (value["kind"] != "catalog" or hash_field(value["catalog_sha256"])))
+
+
 def parse_policy(raw):
     try:
         obj = DECODE(raw)
         if not (fields(obj, "schema policy_id policy_epoch not_before_filetime not_after_filetime approvals") and
-                obj["schema"] == "kn.image_approval_policy.v1" and identifier(obj["policy_id"]) and rows(obj["approvals"])):
+                obj["schema"] in ("kn.image_approval_policy.v1", "kn.image_approval_policy.v2") and
+                identifier(obj["policy_id"]) and rows(obj["approvals"])):
             raise ValueError
         bounds = window(obj)
         seen = set()
+        windows = obj["schema"] == "kn.image_approval_policy.v2"
+        keys = "image_sha256 manifest_sha256 issuer" + (" reference_signature" if windows else "")
         for row in obj["approvals"]:
-            if not (fields(row, "image_sha256 manifest_sha256 issuer") and hash_field(row["image_sha256"]) and
-                    hash_field(row["manifest_sha256"]) and identifier(row["issuer"]) and row["manifest_sha256"] not in seen):
+            if not (fields(row, keys) and hash_field(row["image_sha256"]) and hash_field(row["manifest_sha256"]) and
+                    identifier(row["issuer"]) and row["manifest_sha256"] not in seen and
+                    (not windows or signature_policy(row["reference_signature"]))):
                 raise ValueError
             seen.add(row["manifest_sha256"])
         return obj, bounds
@@ -162,21 +177,39 @@ def provision(args, receipt, publisher):
     receipt.update(source_policy_sha256=pin, policy_target_comparison=descriptor)
     require(verdict == "positive", reason)
     policy, (epoch, start, stop) = parse_policy(source)
+    windows = policy["schema"] == "kn.image_approval_policy.v2"
+    require(windows or not args.require_windows_publisher, "windows_publisher_policy_required")
+    require(windows or args.catalog is None, "unexpected_catalog")
+    if windows:
+        receipt["schema"] = "kn.image_approval_provision.v2"
     raw_manifest = read_document(args.manifest, NATIVE_LIMIT)
     manifest, (manifest_epoch, lower, upper) = parse_manifest(raw_manifest)
     manifest_pin = sha(raw_manifest)
-    image_pin, size = image_identity(args.reference)
-    receipt.update(source_approval_count=len(policy["approvals"]), manifest_sha256=manifest_pin,
-                   reference_sha256=image_pin, reference_bytes=size)
-    require(manifest["image_sha256"] == image_pin, "reference_mismatch")
+    receipt.update(source_approval_count=len(policy["approvals"]), manifest_sha256=manifest_pin)
+    if not windows:
+        image_pin, size = image_identity(args.reference)
+        receipt.update(reference_sha256=image_pin, reference_bytes=size)
+        require(manifest["image_sha256"] == image_pin, "reference_mismatch")
     require(epoch == manifest_epoch, "epoch_mismatch")
-    selected = dict(image_sha256=image_pin, manifest_sha256=manifest_pin, issuer=manifest["issuer"])
-    require(selected in policy["approvals"], "approval_tuple_missing")
+    selected = dict(image_sha256=manifest["image_sha256"], manifest_sha256=manifest_pin, issuer=manifest["issuer"])
+    approved = next((row for row in policy["approvals"] if all(row[k] == v for k, v in selected.items())), None)
+    require(approved is not None, "approval_tuple_missing")
     # Both the captured observation and the assessment must fit the resulting native half-open window.
     role_expiry = min(filetime(datetime.fromisoformat(v["expires"])) for v in proof["roles"].values())
     start, stop = max(start, lower), min(stop, upper, role_expiry)
     require(start <= at < stop, "outside_approval_window")
-    projected = dict(policy, not_before_filetime=str(start), not_after_filetime=str(stop), approvals=[selected])
+    if windows:
+        from windows_pe_trust import verify_reference
+        signature = verify_reference(args.reference, selected["image_sha256"], IMAGE_LIMIT, args.catalog,
+                                     approved["reference_signature"])
+        receipt["windows_publisher"] = signature
+        require(signature["status"] == "verified", signature["status"])
+        checked = filetime(datetime.fromisoformat(signature["started_utc"]))
+        finished = filetime(datetime.fromisoformat(signature["finished_utc"]))
+        require(start <= checked <= finished < stop, "outside_windows_verification_window")
+        receipt.update(reference_sha256=signature["reference_sha256"], reference_bytes=signature["reference_bytes"])
+    projected = dict(policy, schema="kn.image_approval_policy.v1", not_before_filetime=str(start),
+                     not_after_filetime=str(stop), approvals=[selected])
     policy_data = encoded(projected)
     policy_pin = publish_new(destination, lambda stream: stream.write(policy_data))
     receipt.update(status="provisioned", issuer=manifest["issuer"], policy_epoch=str(epoch),
@@ -207,6 +240,9 @@ def main(argv):
             ("--reference", "complete retained PE reference bytes"),
             ("--out", "new filename for the selected native policy")):
         parser.add_argument(flag, required=True, help=help_text)
+    parser.add_argument("--catalog", help="exact retained Windows catalog required by the signed catalog row")
+    parser.add_argument("--require-windows-publisher", action="store_true",
+                        help="require a signed v2 policy and a matching Windows PE publisher")
     args = parser.parse_args(argv)
     receipt = dict(schema="kn.image_approval_provision.v1", status="rejected", native_policy_sha256=None)
     try:
