@@ -56,6 +56,7 @@ namespace
     struct ImportEntry
     {
         uint32_t DescriptorRva = 0, LookupRva = 0;
+        uint32_t ModuleNameRva = 0, HintNameRva = 0;
         std::string Module;
         KmonImportSymbol Symbol;
     };
@@ -96,6 +97,7 @@ namespace
                     !KmonReadImportString(read, descriptor.Name, &entry.Module)) { return false; }
                 entry.DescriptorRva = descriptorRva;
                 entry.LookupRva = static_cast<uint32_t>(lookup + offset);
+                entry.ModuleNameRva = descriptor.Name;
                 if (IMAGE_SNAP_BY_ORDINAL64(symbol))
                 {
                     if (symbol & ~(IMAGE_ORDINAL_FLAG64 | uint64_t{0xffff})) { return false; }
@@ -107,6 +109,7 @@ namespace
                     uint16_t hint = 0;
                     if (symbol > INT32_MAX || !ReadValue(read, symbol, hint) ||
                         !KmonReadImportString(read, static_cast<uint32_t>(symbol + 2), &entry.Symbol.Name)) { return false; }
+                    entry.HintNameRva = static_cast<uint32_t>(symbol);
                 }
             }
         }
@@ -170,7 +173,7 @@ const wchar_t* InspectImageIatDeclaration(const std::wstring& exportName, const 
         { return L"declared_import_slot_unavailable"; }
     declaration = {rva, static_cast<uint32_t>(slot), entry.DescriptorRva, entry.LookupRva,
         mcpjson::Utf8ToWide(entry.Module), mcpjson::Utf8ToWide(entry.Symbol.Name), entry.Symbol.ByOrdinal,
-        entry.Symbol.Ordinal, std::move(instruction)};
+        entry.Symbol.Ordinal, std::move(instruction), entry.ModuleNameRva, entry.HintNameRva};
     return nullptr;
 }
 

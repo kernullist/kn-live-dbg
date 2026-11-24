@@ -106,6 +106,17 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("report.txt", data)})
         self.assertFalse(AUDIT.inspect("reference.md", b"Read the kn.minidump_iat_observation.v1 report."))
 
+    def test_minidump_import_declaration(self):
+        records = (dict(schema="kn.minidump_import_declaration.v1"), dict(declaration_fields=[]),
+                   dict(declaration_spans=[]), dict(reference_field_sha256="a" * 64),
+                   dict(field_offset="0", state="different", bytes="1"),
+                   dict(reference_import_name="Sample", reference_module="owned.dll", reference_ordinal=None),
+                   dict(different_bytes="1", excluded_bytes="0", read_error_bytes="0"))
+        for record in records:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", json.dumps(record).encode(encoding))})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Compare a kn.minidump_import_declaration.v1 result."))
+
     def test_store_file_ranges_and_positions(self):
         samples = [json.dumps(dict(schema="kn.store_file_scan.v1")), json.dumps(dict(next_file_cursor="", file_receipt="held")),
                    json.dumps(dict(file_offset="0", block_sha256="held")), json.dumps(dict(file_namespace_sha256="held", namespace_entries="3")),

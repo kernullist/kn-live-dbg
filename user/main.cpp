@@ -23133,7 +23133,7 @@ static void PrintKmonHelp()
     std::wcout << L"  !kmon trace <local.log> /v8 <sha256> [/code-log <local.log.ll> <sha256>] [/limit N] [/cursor token] [/json]  saved V8 CPU samples\n";
     std::wcout << L"  !kmon graph <file.kncase|sweep.knsweep> [/node id] [/depth 0..8] [/limit 1..128] [/cursor token] [/budget-ms 0..5000] [/json]\n";
     std::wcout << L"  !kmon dump-read <file.dmp> <hex-address> <length 1..4096> [/receipts | /init-receipts] [/json]\n";
-    std::wcout << L"  !kmon dump-image-iat <user-minidump> <dump-sha256> <reference-pe> <pe-sha256> <export-name> [/json]\n";
+    std::wcout << L"  !kmon dump-image-iat <user-minidump> <dump-sha256> <reference-pe> <pe-sha256> <export-name> [/declaration] [/json]\n";
     std::wcout << L"  !kmon verify-image <reference> <dump> <hex-base> <hex-rva> <length 1..4096> <new-directory> [/json]\n";
     std::wcout << L"  !kmon replay-image-source <capture-report> <report-sha256> [directory|capture.kncapture] [/iat:export-name] [/json]\n";
     std::wcout << L"  !kmon replay-image <directory|capture.kncapture|slice.knslice|sweep.knsweep> [/current] [/json]\n";

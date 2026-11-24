@@ -7,6 +7,39 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Import declaration bytes in user minidumps
+
+On 2026-11-25 the x64 Release reader compared three import declarations from
+an owned test DLL with two DbgHelp dumps after the child exited. The full dump
+retained all 58 and 63 bytes of the two named declarations and all 45 bytes
+of the ordinal declaration. The regular dump retained only the 20-byte
+descriptor for each. All six loaded slots remained observable.
+
+In edited copies of the full dump, changing one byte in a DLL name, hint,
+function name or terminator contradicted the declaration while the slot still
+matched the child's observation. A sparse copy retained a complete declaration while
+missing a slot byte. Other controls covered a contradictory byte beside a gap,
+discontiguous file ranges, pooled names and a lookup cell shared with the
+loaded IAT. An independent reader checked field lengths, exact file spans,
+digests and byte counts against both original files. In a separate native
+file-read test, a locked range returned Win32 error 33. A second range in the
+same file remained readable, and unlocking restored the original contents.
+
+The minidump suite passed 520 checks. Across eight retained dumps, the 24
+default slot reports matched the preceding build at `4662917` byte for byte.
+With `/declaration`, 12 full-dump checks returned `supported` and 12
+regular-dump checks returned `unfulfilled`. These observations cover the
+saved declaration bytes. Actual calls, writers and uninterrupted module
+lifetime require separate evidence. Run the test from an x64 Native Tools
+command prompt with `python -B tools/test-minidump-iat.py --exe <release-exe>`.
+The command and completion suite accepts `-OutputDirectory` to keep compiled
+helpers in a chosen directory.
+[User-minidump command](COMMAND_REFERENCE.md#read-a-loaded-import-slot-from-a-user-minidump)
+
+```powershell
+tools/validate-command-audit.ps1 -Executable $exe -OutputDirectory .build/command-tests
+```
+
 ## Loaded import slots in user minidumps
 
 On 2026-11-25 the x64 Release build replayed two Windows user-mode dumps of

@@ -16,6 +16,7 @@ struct ImageIatDeclaration
     bool ByOrdinal = false;
     uint16_t Ordinal = 0;
     std::vector<uint8_t> Instruction;
+    uint32_t ModuleNameRva = 0, HintNameRva = 0;
 };
 
 // Confirm the original instruction through the caller's source before accepting

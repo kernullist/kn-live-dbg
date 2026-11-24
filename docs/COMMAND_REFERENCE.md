@@ -1073,6 +1073,27 @@ dump. A null slot or a value outside the module list yields an observed slot
 with an empty target. Missing bytes, ambiguous records or an identity mismatch
 return exit code 1 and a reason. Invalid arguments return 2.
 
+Add `/declaration` before `/json` to check the import declaration in the dump.
+The nested `declaration_check` compares the descriptor, the terminated DLL
+name and the lookup cell with the pinned PE. A named import also includes
+the two-byte hint and the terminated function name. An ordinal is encoded
+in the lookup cell. All locations come from the reference PE.
+
+```powershell
+$page = & $exe --offline '!kmon' dump-image-iat $dump $dumpPin $reference $pePin $exportName /declaration /json | ConvertFrom-Json
+$page.declaration_check | Select-Object status, reason, coverage
+```
+
+`supported` means every requested declaration byte matched. A captured
+difference yields `contradicted` even if other bytes are missing. Unreadable
+or missing bytes and a lookup cell reused for the loaded IAT can leave the
+check `unfulfilled`. Each field includes its PE file offset and digest. The
+dump spans identify the exact matching, differing and missing portions.
+The command's exit code still describes the slot observation. Inspect
+`declaration_check.status` even when the slot could not be read. A complete
+declaration can survive that gap, and a readable slot can coexist with a
+contradictory declaration.
+
 ### Archive a process image acquisition
 
 Use an initialized private store and a new collection ID. Supply the

@@ -168,22 +168,127 @@ def replace_ranges(data, layout, ranges):
     return data
 
 
-def lookup_coverage(layout, address, fragment):
+def field_coverage(layout, address, length, fragments):
     data = bytearray(layout.data)
     ranges = []
     for va, size, offset in layout.ranges:
         end = va + size
-        if end <= address or va >= address + 8:
+        if end <= address or va >= address + length:
             ranges.append((va, size, offset))
             continue
         if va < address:
             ranges.append((va, address - va, offset))
-        if end > address + 8:
-            ranges.append((address + 8, end - address - 8, offset + address + 8 - va))
-    if fragment:
-        ranges.append((address, len(fragment), len(data)))
-        data.extend(fragment)
+        if end > address + length:
+            ranges.append((address + length, end - address - length, offset + address + length - va))
+    for delta, raw in fragments:
+        assert raw and 0 <= delta <= length - len(raw)
+        ranges.append((address + delta, len(raw), len(data)))
+        data.extend(raw)
     return replace_ranges(data, layout, ranges)
+
+
+def declaration_fields(pe, slot):
+    nt, = struct.unpack_from("<I", pe, 60)
+    count, = struct.unpack_from("<H", pe, nt + 6)
+    opt_size, = struct.unpack_from("<H", pe, nt + 20)
+    sections = [struct.unpack_from("<IIII", pe, nt + 24 + opt_size + 40 * i + 8) for i in range(count)]
+
+    def file_offset(rva):
+        off, = [raw + rva - start for vs, start, size, raw in sections if start <= rva < start + min(size, vs)]
+        return off
+
+    def end_of_name(rva):
+        return pe.index(0, file_offset(rva)) + 1 - file_offset(rva)
+
+    imports, size = struct.unpack_from("<II", pe, nt + 24 + 112 + 8)
+    for step in range(0, size - 19, 20):
+        descriptor = imports + step
+        lookup, _, _, module, first = struct.unpack_from("<IIIII", pe, file_offset(descriptor))
+        if not first:
+            break
+        for i in range(0, 1 << 17, 8):
+            cell = (lookup or first) + i
+            symbol, = struct.unpack_from("<Q", pe, file_offset(cell))
+            if not symbol:
+                break
+            if first + i != slot:
+                continue
+            fields = [("import_descriptor", descriptor, 20), ("dll_name", module, end_of_name(module)), ("lookup_cell", cell, 8)]
+            if not symbol >> 63:
+                fields.append(("hint_and_name", symbol, 2 + end_of_name(symbol + 2)))
+            return {name: (rva, file_offset(rva), length) for name, rva, length in fields}
+    raise AssertionError("owned slot missing from reference import table")
+
+
+def verify_declaration(report, layout, pe, own, name, pin, check):
+    proof = report["declaration_check"]
+    check(proof["claim"] == "saved_declaration_bytes_match_reference" and
+          (proof["expected_dump_sha256"], proof["expected_reference_sha256"], proof["export"]) == (pin, digest(pe), name),
+          "declaration claim and independently supplied inputs")
+    specs = declaration_fields(pe, own["slot"])
+    _, start, length = specs["dll_name"]
+    module = pe[start:start + length - 1].decode("ascii")
+    function, ordinal = None, None
+    if "hint_and_name" in specs:
+        _, start, length = specs["hint_and_name"]
+        function = pe[start + 2:start + length - 1].decode("ascii")
+    else:
+        ordinal = str(struct.unpack_from("<H", pe, specs["lookup_cell"][1])[0])
+    _, base, _, _, _, basename = layout.modules[int(proof["module_list_index"])]
+    check(basename == "iat-test.dll" and int(proof["iat_slot_rva"]) == own["slot"] and
+          (proof["reference_module"], proof["reference_import_name"], proof["reference_ordinal"]) ==
+          (module, function, ordinal), "PE declaration and importing image")
+    check(int(proof["instruction_rva"]) == own["rva"] and
+          layout.receipt(proof["instruction_file_spans"], base + own["rva"], 6).hex() == own["code"], "bound original instruction")
+    rows = proof["declaration_fields"]
+    check([row["field"] for row in rows] == list(specs), "complete named or ordinal declaration")
+    def coverage(states):
+        return dict(requested_bytes=len(states), captured_bytes=states.count("matched") + states.count("different"),
+                    matched_bytes=states.count("matched"), different_bytes=states.count("different"),
+                    missing_bytes=states.count("not_retained"), excluded_bytes=states.count("loaded_iat"), read_error_bytes=0)
+    by_rva = {}
+    reference_offsets = set()
+    field_bytes = 0
+    for row in rows:
+        rva, offset, length = specs[row["field"]]
+        expected = pe[offset:offset + length]
+        check((int(row["rva"]), int(row["reference_file_offset"]), row["reference_field_sha256"]) ==
+              (rva, offset, digest(expected)), "reference file range and digest")
+        states = []
+        for i, ref_byte in enumerate(expected):
+            address = base + rva + i
+            saved = [off + address - va for va, n, off in layout.ranges if va <= address < va + n]
+            assert len(saved) <= 1
+            if own["slot"] <= rva + i < own["slot"] + 8:
+                state = "loaded_iat"
+            elif saved:
+                state = "matched" if layout.data[saved[0]] == ref_byte else "different"
+            else:
+                state = "not_retained"
+            states.append(state)
+            assert by_rva.setdefault(rva + i, state) == state
+            reference_offsets.add(offset + i)
+        position = 0
+        for span in row["declaration_spans"]:
+            start, count = int(span["field_offset"]), int(span["bytes"])
+            assert start == position and 0 < count <= length - start
+            assert all(state == span["state"] for state in states[start:start + count])
+            if span["state"] in ("matched", "different"):
+                raw = layout.receipt([span], base + rva + start, count)
+                assert digest(raw) == span["captured_sha256"]
+            else:
+                assert not {"range_index", "file_offset", "captured_sha256"}.intersection(span)
+            position += count
+        check(position == length, "field spans partition the original request")
+        check({k: int(v) for k, v in row["coverage"].items()} == coverage(states), "independent byte counts")
+        field_bytes += length
+    total = coverage(list(by_rva.values()))
+    check({k: int(v) for k, v in proof["coverage"].items()} == total and
+          int(proof["field_bytes"]) == field_bytes and int(proof["unique_reference_bytes"]) == len(reference_offsets),
+          "logical fields, unique image bytes and unique reference bytes")
+    status = ("contradicted" if total["different_bytes"] else "unfulfilled" if
+              total["missing_bytes"] or total["excluded_bytes"] else "supported")
+    check(proof["status"] == status, "byte contradiction remains visible with incomplete coverage")
 
 
 def exercise(exe, root, link):
@@ -209,8 +314,9 @@ def exercise(exe, root, link):
         observed, pid, birth = capture(root, fixtures)
     ref_pin = digest(ref.read_bytes())
 
-    def observe(path, pin, name="FixtureTick", pe_pin=ref_pin, code=0):
-        return offline("dump-image-iat", path, pin, ref, pe_pin, name, "/json", code=code)
+    def observe(path, pin, name="FixtureTick", pe_pin=ref_pin, code=0, declaration=False):
+        options = ["/declaration"] if declaration else []
+        return offline("dump-image-iat", path, pin, ref, pe_pin, name, *options, "/json", code=code)
 
     for kind in DUMPS:
         path = root / (kind + ".dmp")
@@ -246,6 +352,10 @@ def exercise(exe, root, link):
             _, start, size, _, _, basename = layout.modules[int(target["module_list_index"])]
             check(start <= value < start + size and basename.lower() == target["basename"].lower() == own["owner"].lower() and
                   report["owner_status"] == "within_reported_module_extent", "module containing the resolved pointer")
+            detailed = observe(path, pin, name, declaration=True)
+            verify_declaration(detailed, layout, ref.read_bytes(), own, name, pin, check)
+            proof = detailed.pop("declaration_check")
+            check(detailed == report and (kind != "full" or proof["status"] == "supported"), "original slot preserved with independent declaration")
         if kind == "regular":
             controls(exe, root, path, layout, observe, observed["FixtureTick"], ref, ref_pin, check)
         else:
@@ -261,7 +371,59 @@ def exercise(exe, root, link):
                     copy.write_bytes(edited)
                     failure = observe(copy, digest(edited), code=1)
                     check(failure["reason"] == reason and not failure["slot_value_observed"], "64-bit descriptor bounds")
+        declaration_controls(kind, root, layout, ref.read_bytes(), observed, observe, check)
     print(f"minidump IAT: {checks} checks passed after owned target exit")
+
+
+def declaration_controls(kind, root, layout, pe, observed, observe, check):
+    own = observed["FixtureTick"]
+    base, = [m[1] for m in layout.modules if m[-1] == "iat-test.dll"]
+    specs = declaration_fields(pe, own["slot"])
+    with tempfile.TemporaryDirectory(dir=root) as directory:
+        path = Path(directory) / "edited.dmp"
+
+        def replay(data, name="FixtureTick", code=0):
+            pin = digest(data)
+            path.write_bytes(data)
+            page = observe(path, pin, name, code=code, declaration=True)
+            verify_declaration(page, Layout(data), pe, observed[name], name, pin, check)
+            return page
+
+        if kind == "full":
+            for name, field, index, code in (("FixtureTick", "dll_name", 0, 0), ("FixtureTick", "dll_name", -1, 0),
+                                             ("FixtureTick", "hint_and_name", 0, 0), ("FixtureTick", "hint_and_name", 2, 0),
+                                             ("FixtureTick", "hint_and_name", -1, 0), ("FixtureTick", "import_descriptor", 12, 1),
+                                             ("FixtureOrdinal", "lookup_cell", 0, 1)):
+                rva, _, length = declaration_fields(pe, observed[name]["slot"])[field]
+                data = bytearray(layout.data)
+                data[layout.offset(base + rva + index % length, 1)] ^= 1
+                page = replay(data, name, code)
+                proof = page["declaration_check"]
+                check(proof["status"] == "contradicted" and proof["coverage"]["different_bytes"] == "1" and
+                      page["slot_value_observed"] == (code == 0), "single changed declaration byte and independent slot evidence")
+            return
+
+        # These disposable sparse files exercise coverage combinations independent
+        # of which optional pages the host's copy of DbgHelp selected.
+        complete = layout.data
+        for rva, offset, length in specs.values():
+            complete = field_coverage(Layout(complete), base + rva, length, [(0, pe[offset:offset + length])])
+        gap = replay(split_slot(Layout(complete), base + own["slot"], True), code=1)
+        check(gap["reason"] == "slot_bytes_unavailable" and gap["declaration_check"]["status"] == "supported",
+              "missing loaded slot does not erase a complete declaration")
+        rva, offset, length = specs["dll_name"]
+        raw = pe[offset:offset + length]
+        partial = field_coverage(Layout(complete), base + rva, length, [(length - 1, raw[-1:]), (0, raw[:4])])
+        proof = replay(partial)["declaration_check"]
+        check(proof["status"] == "unfulfilled" and int(proof["coverage"]["missing_bytes"]) == length - 5, "interior gap with retained terminator")
+        different = field_coverage(Layout(complete), base + rva, length, [(length - 1, b"!"), (0, raw[:4])])
+        proof = replay(different)["declaration_check"]
+        check(proof["status"] == "contradicted" and proof["coverage"]["different_bytes"] == "1" and
+              int(proof["coverage"]["missing_bytes"]) == length - 5, "contradiction alongside an interior gap")
+        divided = field_coverage(Layout(complete), base + rva, length, [(4, raw[4:]), (0, raw[:4])])
+        proof = replay(divided)["declaration_check"]
+        dll, = [field for field in proof["declaration_fields"] if field["field"] == "dll_name"]
+        check(proof["status"] == "supported" and len(dll["declaration_spans"]) == 2, "logical bytes from discontiguous dump offsets")
 
 
 def controls(exe, root, path, layout, observe, own, ref, ref_pin, check):
@@ -282,6 +444,12 @@ def controls(exe, root, path, layout, observe, own, ref, ref_pin, check):
     for name in ("FixtureForward", "fixturetick", "Absent"):
         denied(observe(path, pin, name, code=1), "export_instruction_unavailable")
     denied(observe(path, pin, "FixtureAnchor", code=1), "unsupported_export_instruction")
+    for dump_pin, pe_digest, name, reason in (("0" * 64, ref_pin, "FixtureTick", "dump_pin_unavailable"),
+                                               (pin, "0" * 64, "FixtureTick", "reference_pin_unavailable"),
+                                               (pin, ref_pin, "FixtureForward", "export_instruction_unavailable")):
+        proof = observe(path, dump_pin, name, pe_digest, code=1, declaration=True)["declaration_check"]
+        check(proof["status"] == "unfulfilled" and proof["reason"] == reason and
+              "coverage" not in proof and "declaration_fields" not in proof, "qualification before field comparison")
     with tempfile.TemporaryDirectory(dir=root) as directory:
         scratch = Path(directory) / "control.dmp"
 
@@ -314,9 +482,9 @@ def controls(exe, root, path, layout, observe, own, ref, ref_pin, check):
         at = full.offset(lookup, 8)
         raw = full.data[at:at + 8]
         for n, basis in ((0, "separate_lookup_reference_only"), (3, "separate_lookup_partially_retained"), (8, "separate_lookup_matched")):
-            page = changed(lookup_coverage(layout, lookup, raw[:n]), 0)
+            page = changed(field_coverage(layout, lookup, 8, [(0, raw[:n])] if n else []), 0)
             check(page["lookup_basis"] == basis and int(page["lookup_bytes_matched"]) == n, "actual separate lookup coverage")
-        denied(changed(lookup_coverage(layout, lookup, bytes([raw[0] ^ 1])), 1), "captured_import_lookup_unqualified")
+        denied(changed(field_coverage(layout, lookup, 8, [(0, bytes([raw[0] ^ 1]))]), 1), "captured_import_lookup_unqualified")
         pe = bytearray(ref.read_bytes())
         nt, = struct.unpack_from("<I", pe, 60)
         sections, = struct.unpack_from("<H", pe, nt + 6)
@@ -336,11 +504,29 @@ def controls(exe, root, path, layout, observe, own, ref, ref_pin, check):
         struct.pack_into("<I", shared, layout.offset(base + descriptor, 4), 0)
         scratch.write_bytes(shared)
         result = subprocess.run([str(exe), "--offline", "!kmon", "dump-image-iat", str(scratch), digest(shared),
-                                 str(shared_ref), digest(pe), "FixtureTick", "/json"], capture_output=True, timeout=60)
+                                 str(shared_ref), digest(pe), "FixtureTick", "/declaration", "/json"], capture_output=True, timeout=60)
         shared_result = json.loads(result.stdout)
         check(result.returncode == 0 and shared_result["lookup_basis"] == "shared_iat_reference_only" and
               shared_result["lookup_bytes_matched"] == "0" and shared_result["slot_value_sha256"] == own["sha256"],
               "shared IAT preserves file declaration and independently observed slot")
+        verify_declaration(shared_result, Layout(shared), pe, own, "FixtureTick", digest(shared), check)
+        proof = shared_result["declaration_check"]
+        check(proof["reason"] == "lookup_replaced_by_loader" and proof["coverage"]["excluded_bytes"] == "8",
+              "loader-replaced lookup stays outside the byte comparison")
+        pe = bytearray(ref.read_bytes())
+        alias = bytearray(original)
+        specs = declaration_fields(pe, own["slot"])
+        target = specs["hint_and_name"][0] + 2
+        struct.pack_into("<I", pe, specs["import_descriptor"][1] + 12, target)
+        struct.pack_into("<I", alias, layout.offset(base + descriptor + 12, 4), target)
+        shared_ref.write_bytes(pe)
+        scratch.write_bytes(alias)
+        result = subprocess.run([str(exe), "--offline", "!kmon", "dump-image-iat", str(scratch), digest(alias),
+                                 str(shared_ref), digest(pe), "FixtureTick", "/declaration", "/json"], capture_output=True, timeout=60)
+        proof = json.loads(result.stdout)["declaration_check"]
+        check(result.returncode == 0 and int(proof["field_bytes"]) - int(proof["coverage"]["requested_bytes"]) ==
+              len(proof["reference_module"]) + 1, "pooled names share one byte denominator")
+        verify_declaration(json.loads(result.stdout), Layout(alias), pe, own, "FixtureTick", digest(alias), check)
         patch("captured_importer_identity_unqualified", layout.offset(base, 1), b"Z")
         patch("captured_image_directories_unqualified", layout.offset(base + nt + 24 + 112 + 8, 8), bytes(8))
         _, cv = struct.unpack_from("<II", original, row + 76)
@@ -376,7 +562,9 @@ def controls(exe, root, path, layout, observe, own, ref, ref_pin, check):
             alias = Path(directory) / ("alias" + str(n))
             os.link(evidence, alias)
             before = digest(evidence.read_bytes())
-            for channel, args in (("stdout", cmd), ("stderr", cmd + ["surplus"]), ("stdout", cmd + ["--mode", "offline"])):
+            for channel, args in (("stdout", cmd), ("stderr", cmd + ["surplus"]), ("stdout", cmd + ["--mode", "offline"]),
+                                  ("stdout", [*cmd[:-1], "/declaration", "/json"]),
+                                  ("stderr", [*cmd[:-1], "/declaration", "/declaration"])):
                 with alias.open("r+b") as stream:
                     result = subprocess.run(args, timeout=30, **{channel: stream,
                                             ("stderr" if channel == "stdout" else "stdout"): subprocess.PIPE})

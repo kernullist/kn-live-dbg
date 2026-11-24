@@ -702,6 +702,23 @@ actual execution and module lifetime require separate evidence.
 [Memory64 lists](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_memory64_list) and
 [module records](https://learn.microsoft.com/en-us/windows/win32/api/minidumpapiset/ns-minidumpapiset-minidump_module)
 
+The optional declaration check uses the source instruction and the selected
+ordinary import to locate up to four fields in the pinned PE. Each field must
+have one file-backed mapping. The reader compares the descriptor, terminated
+DLL name and lookup cell. For a named import it also compares the hint and
+function name including its terminator. A shared lookup/IAT cell contributes eight
+excluded bytes because binding replaces the on-disk entry.
+[PE import tables](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#the-idata-section)
+
+The check partitions each field by its original dump descriptors and byte
+equality. A captured span identifies its descriptor index, file offset,
+length and SHA-256. Gaps retain their lengths and field offsets. The byte
+totals cover distinct image bytes in the selected declaration. Pooled names
+can share an original span. The report gives both the sum of the field lengths
+and the number of distinct reference file bytes. Header qualification, the
+export instruction and the loaded slot have separate roles. Resolving the final
+function, observing its execution and identifying a writer require further evidence.
+
 Each active named path is charged once across the store. A path shared by
 collections takes their strongest protection in the order first observation,
 observation gap, unclassified, routine and empty. Failure ledgers have a

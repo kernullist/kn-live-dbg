@@ -8,8 +8,11 @@
 #include "SavedEtlInput.h"
 #include <DbgHelp.h>
 #include <algorithm>
+#include <array>
 #include <iostream>
+#include <iterator>
 #include <map>
+#include <set>
 
 namespace
 {
@@ -20,6 +23,50 @@ namespace
     struct Extent { uint64_t Start = 0, End = 0; };
     struct Memory { uint64_t Address, Size, Offset; uint32_t Index; };
     struct Part { uint64_t Offset, Size; uint32_t Index; };
+    enum class ByteState : size_t { Matched, Different, Missing, ReadError, Excluded, Count };
+    using ByteCounts = std::array<uint32_t, static_cast<size_t>(ByteState::Count)>;
+    struct DeclarationByte
+    {
+        uint64_t ReferenceOffset;
+        ByteState State;
+        const Memory* Source = nullptr;
+        uint64_t FileOffset = 0;
+        uint8_t Value = 0;
+        DWORD Win32 = ERROR_SUCCESS;
+    };
+    using DeclarationBytes = std::map<uint32_t, DeclarationByte>;
+
+    std::wstring ByteDigest(const uint8_t* bytes, size_t size)
+    {
+        ContentHash hash;
+        return hash.Add(bytes, size) ? hash.Finish() : std::wstring{};
+    }
+
+    struct FieldComparison
+    {
+        ByteCounts Counts{};
+        std::wstring Spans;
+
+        bool Record(uint32_t offset, uint32_t length, ByteState state, const Memory* source = nullptr,
+            uint64_t fileOffset = 0, const uint8_t* captured = nullptr, DWORD win32Status = ERROR_SUCCESS)
+        {
+            static constexpr const wchar_t* labels[]{L"matched", L"different", L"not_retained", L"read_error", L"loaded_iat"};
+            const auto index = static_cast<size_t>(state);
+            std::wstring row = L"{\"field_offset\":" + N(offset) + L",\"bytes\":" + N(length) + L",\"state\":" + Quote(labels[index]);
+            if (source) { row += L",\"range_index\":" + N(source->Index) + L",\"file_offset\":" + N(fileOffset); }
+            if (state == ByteState::ReadError) { row += L",\"win32_status\":" + N(win32Status); }
+            if (captured)
+            {
+                const auto digest = ByteDigest(captured, length);
+                if (digest.empty()) { return false; }
+                row += L",\"captured_sha256\":" + Quote(digest);
+            }
+            Counts[index] += length;
+            if (!Spans.empty()) { Spans += L","; }
+            Spans += row + L"}";
+            return true;
+        }
+    };
     bool Fits(uint64_t offset, uint64_t size, uint64_t limit) { return offset <= limit && size <= limit - offset; }
     bool ReadAt(const SchemaArtifact& file, uint64_t offset, void* data, uint32_t size)
     {
@@ -40,6 +87,7 @@ namespace
         const wchar_t* Parse();
         bool Copy(uint64_t address, size_t length, std::vector<uint8_t>& bytes, std::vector<Part>* parts = nullptr) const;
         bool CompareLookup(uint64_t address, const uint8_t* expected, size_t& retained) const;
+        void CompareDeclaration(uint64_t base, const std::vector<uint8_t>& reference, DeclarationBytes& locations) const;
         std::wstring ModuleJson(size_t index) const;
         bool SameBuild(const MINIDUMP_MODULE& module, const executable_image::DiskPeMetadata& pe) const;
         std::vector<MINIDUMP_MODULE> Modules;
@@ -228,6 +276,38 @@ namespace
         return true;
     }
 
+    void Minidump::CompareDeclaration(uint64_t base, const std::vector<uint8_t>& reference, DeclarationBytes& locations) const
+    {
+        // A pooled name can serve several fields. Read each selected RVA once,
+        // keeping physical reads inside their original minidump descriptor.
+        for (auto it = locations.begin(); it != locations.end();)
+        {
+            if (it->second.State == ByteState::Excluded) { ++it; continue; }
+            const uint64_t address = base + it->first;
+            const auto* source = Locate(address);
+            if (!source) { ++it; continue; }
+            const auto delta = address - source->Address;
+            auto end = std::next(it);
+            DWORD size = 1;
+            while (end != locations.end() && end->first == uint64_t(it->first) + size &&
+                size < source->Size - delta && end->second.State != ByteState::Excluded) { ++size; ++end; }
+            std::vector<uint8_t> saved(size);
+            DWORD received = 0;
+            const uint64_t fileOffset = source->Offset + delta;
+            const auto ok = approved_file::ReadAt(File.Handle(), fileOffset, saved.data(), size, &received);
+            const auto error = ok ? ERROR_SUCCESS : GetLastError();
+            for (DWORD i = 0; it != end; ++it, ++i)
+            {
+                auto& b = it->second;
+                b.Source = source;
+                b.FileOffset = fileOffset + i;
+                if (i >= received) { b.State = ByteState::ReadError; b.Win32 = error; continue; }
+                b.Value = saved[i];
+                b.State = b.Value == reference[b.ReferenceOffset] ? ByteState::Matched : ByteState::Different;
+            }
+        }
+    }
+
     bool Minidump::SameBuild(const MINIDUMP_MODULE& module, const executable_image::DiskPeMetadata& pe) const
     {
         uint8_t rsds[24]{};
@@ -260,6 +340,129 @@ namespace
             out += L"{\"range_index\":" + N(p.Index) + L",\"file_offset\":" + N(p.Offset) + L",\"bytes\":" + N(p.Size) + L"}";
         }
         return out + L"]";
+    }
+
+    std::wstring DeclarationFields(const wchar_t* status, const wchar_t* reason, const std::wstring& evidence = {})
+    {
+        return L",\"claim\":\"saved_declaration_bytes_match_reference\",\"status\":" + Quote(status) +
+            L",\"reason\":" + Quote(reason) + evidence;
+    }
+
+    std::wstring CountsJson(const ByteCounts& counts)
+    {
+        const auto [matched, different, missing, failed, excluded] = counts;
+        return L"{\"requested_bytes\":" + N(matched + different + missing + failed + excluded) +
+            L",\"captured_bytes\":" + N(matched + different) + L",\"matched_bytes\":" + N(matched) +
+            L",\"different_bytes\":" + N(different) + L",\"missing_bytes\":" + N(missing) +
+            L",\"read_error_bytes\":" + N(failed) + L",\"excluded_bytes\":" + N(excluded) + L"}";
+    }
+
+    struct DeclarationField
+    {
+        const wchar_t* Name;
+        uint32_t Rva, Size;
+        uint64_t FileOffset = 0;
+    };
+
+    const wchar_t* LocateDeclarationFields(const executable_image::DiskPeMetadata& pe, size_t fileSize, uint32_t slotRva,
+        std::vector<DeclarationField>& fields, DeclarationBytes& locations)
+    {
+        const ObservationRange loadedSlot{slotRva, sizeof(uint64_t)};
+        for (auto& field : fields)
+        {
+            if (!FileBackedRvaRange(pe, field.Rva, field.Size, field.FileOffset) || !Fits(field.FileOffset, field.Size, fileSize))
+                { return L"reference_field_not_file_backed"; }
+            const ObservationRange mapped{field.Rva, field.Size};
+            size_t mappings = mapped.Overlaps({0, pe.SizeOfHeaders}) ? 1 : 0;
+            for (const auto& section : pe.Sections)
+            {
+                if (mapped.Overlaps({section.VirtualAddress, (std::max)(section.VirtualSize, section.SizeOfRawData)})) { ++mappings; }
+            }
+            if (mappings != 1) { return L"ambiguous_reference_mapping"; }
+            for (uint32_t i = 0; i < field.Size; ++i)
+            {
+                const auto state = loadedSlot.Contains(field.Rva + i) ? ByteState::Excluded : ByteState::Missing;
+                const auto [it, inserted] = locations.emplace(field.Rva + i, DeclarationByte{field.FileOffset + i, state});
+                if (!inserted && it->second.ReferenceOffset != field.FileOffset + i)
+                    { return L"ambiguous_reference_mapping"; }
+            }
+        }
+        return nullptr;
+    }
+
+    bool RenderFieldSpans(const DeclarationBytes& locations, const DeclarationField& field, FieldComparison& result)
+    {
+        for (uint32_t start = 0; start < field.Size;)
+        {
+            auto it = locations.find(field.Rva + start);
+            const auto& first = it->second;
+            const bool captured = first.State == ByteState::Matched || first.State == ByteState::Different;
+            std::vector<uint8_t> bytes;
+            uint32_t end = start;
+            do
+            {
+                if (captured) { bytes.push_back(it->second.Value); }
+                ++it; ++end;
+            } while (end < field.Size && it->second.State == first.State && it->second.Source == first.Source &&
+                it->second.Win32 == first.Win32);
+            if (!result.Record(start, end - start, first.State, first.Source, first.FileOffset,
+                captured ? bytes.data() : nullptr, first.Win32)) { return false; }
+            start = end;
+        }
+        return true;
+    }
+
+    std::wstring CheckDeclaration(const Minidump& dump, size_t importer, const ImageIatDeclaration& entry,
+        const executable_image::DiskPeMetadata& pe, const std::vector<uint8_t>& reference, const std::vector<Part>& instructionParts)
+    {
+        std::vector<DeclarationField> fields{
+            {L"import_descriptor", entry.DescriptorRva, sizeof(IMAGE_IMPORT_DESCRIPTOR)},
+            {L"dll_name", entry.ModuleNameRva, static_cast<uint32_t>(entry.Module.size() + 1)},
+            {L"lookup_cell", entry.LookupRva, sizeof(uint64_t)}
+        };
+        if (!entry.ByOrdinal)
+        {
+            fields.push_back({L"hint_and_name", entry.HintNameRva, static_cast<uint32_t>(sizeof(uint16_t) + entry.Name.size() + 1)});
+        }
+        DeclarationBytes locations;
+        if (const auto issue = LocateDeclarationFields(pe, reference.size(), entry.SlotRva, fields, locations))
+            { return DeclarationFields(L"unfulfilled", issue); }
+        dump.CompareDeclaration(dump.Modules[importer].BaseOfImage, reference, locations);
+        ByteCounts total{};
+        std::set<uint64_t> referenceOffsets;
+        for (const auto& item : locations)
+        {
+            ++total[static_cast<size_t>(item.second.State)];
+            referenceOffsets.insert(item.second.ReferenceOffset);
+        }
+        uint32_t fieldBytes = 0;
+        std::wstring records;
+        for (const auto& field : fields)
+        {
+            const auto* expected = reference.data() + field.FileOffset;
+            const auto refHash = ByteDigest(expected, field.Size);
+            if (refHash.empty()) { return DeclarationFields(L"unfulfilled", L"field_hash_unavailable"); }
+            FieldComparison result;
+            if (!RenderFieldSpans(locations, field, result)) { return DeclarationFields(L"unfulfilled", L"field_hash_unavailable"); }
+            fieldBytes += field.Size;
+            if (!records.empty()) { records += L","; }
+            records += L"{\"field\":" + Quote(field.Name) + L",\"rva\":" + N(field.Rva) +
+                L",\"reference_file_offset\":" + N(field.FileOffset) + L",\"reference_field_sha256\":" + Quote(refHash) +
+                L",\"coverage\":" + CountsJson(result.Counts) + L",\"declaration_spans\":[" + result.Spans + L"]}";
+        }
+        const auto [matched, different, missing, failed, excluded] = total;
+        const auto evidence = L",\"module_list_index\":" + N(importer) + L",\"iat_slot_rva\":" + N(entry.SlotRva) +
+            L",\"instruction_rva\":" + N(entry.InstructionRva) + L",\"instruction_file_spans\":" + PartsJson(instructionParts) +
+            L",\"reference_module\":" + Quote(entry.Module) + L",\"reference_import_name\":" + (entry.ByOrdinal ? L"null" : Quote(entry.Name)) +
+            L",\"reference_ordinal\":" + (entry.ByOrdinal ? N(entry.Ordinal) : L"null") +
+            L",\"field_bytes\":" + N(fieldBytes) + L",\"unique_reference_bytes\":" + N(referenceOffsets.size()) +
+            L",\"coverage\":" + CountsJson(total) + L",\"declaration_fields\":[" + records + L"]";
+        if (different) { return DeclarationFields(L"contradicted", L"captured_bytes_differ", evidence); }
+        if (failed) { return DeclarationFields(L"unfulfilled", L"dump_read_failed", evidence); }
+        if (excluded) { return DeclarationFields(L"unfulfilled", entry.LookupRva == entry.SlotRva ?
+            L"lookup_replaced_by_loader" : L"declaration_uses_loaded_slot_bytes", evidence); }
+        if (missing) { return DeclarationFields(L"unfulfilled", L"declaration_bytes_not_retained", evidence); }
+        return DeclarationFields(L"supported", L"complete_byte_match", evidence);
     }
 
     bool OriginalInstruction(const executable_image::DiskPeMetadata& pe, uint32_t rva, size_t size)
@@ -299,7 +502,7 @@ namespace
     }
 
     const wchar_t* Observe(const SchemaArtifact& source, const SchemaArtifact& reference,
-        const std::wstring& exportName, std::wstring& fields)
+        const std::wstring& exportName, std::wstring& fields, std::wstring* declaration)
     {
         using namespace executable_image;
         DiskPeMetadata pe;
@@ -337,6 +540,7 @@ namespace
         };
         ImageIatDeclaration entry;
         if (const auto reason = InspectImageIatDeclaration(exportName, pe, original, check, entry)) { return reason; }
+        if (declaration) { *declaration = CheckDeclaration(dump, importer, entry, pe, original, instructionParts); }
         const auto matches = [&](uint32_t rva, uint32_t size) {
             uint64_t offset = 0;
             std::vector<uint8_t> captured;
@@ -393,7 +597,10 @@ namespace
 int RunMinidumpIatCommand(const std::vector<std::wstring>& args, bool directJsonOutput)
 {
     std::wstring dumpPin, refPin;
-    const bool valid = (args.size() == 7 || (args.size() == 8 && !_wcsicmp(args[7].c_str(), L"/json"))) &&
+    const bool json = args.size() > 7 && !_wcsicmp(args.back().c_str(), L"/json");
+    const auto operands = args.size() - (json ? 1 : 0);
+    const bool checkDeclaration = operands == 8 && !_wcsicmp(args[7].c_str(), L"/declaration");
+    const bool valid = (operands == 7 || checkDeclaration) &&
         !args[2].empty() && !args[4].empty() && etl_profile::NormalizeDigest(args[3], dumpPin) &&
         etl_profile::NormalizeDigest(args[5], refPin) && !args[6].empty() && args[6].size() <= 255 &&
         std::all_of(args[6].begin(), args[6].end(), [](wchar_t c) { return c >= 0x21 && c <= 0x7e; });
@@ -411,21 +618,31 @@ int RunMinidumpIatCommand(const std::vector<std::wstring>& args, bool directJson
     if (!distinct()) { return 2; }
     if (!valid)
     {
-        std::wcerr << L"usage: !kmon dump-image-iat <user-minidump> <dump-sha256> <reference-pe> <pe-sha256> <export-name> [/json]\n";
+        std::wcerr << L"usage: !kmon dump-image-iat <user-minidump> <dump-sha256> <reference-pe> <pe-sha256> <export-name> [/declaration] [/json]\n";
         return 2;
     }
     etl_profile::SavedEtlInput dump, reference;
-    std::wstring fields;
+    std::wstring fields, declaration;
     const wchar_t* issue = nullptr;
     if (!dump.Open(args[2], MaxDumpBytes) || dump.File.Sha256 != dumpPin) { issue = L"dump_pin_unavailable"; }
     else if (!reference.Open(args[4], ReferenceArtifactMaxBytes) || reference.File.Sha256 != refPin ||
         !DistinctLocalFileHandles(dump.File.Handle(), reference.File.Handle())) { issue = L"reference_pin_unavailable"; }
     else
     {
-        issue = Observe(dump.File, reference.File, args[6], fields);
-        if (!dump.Revalidated() || !reference.Revalidated()) { issue = L"source_revalidation_failed"; }
+        issue = Observe(dump.File, reference.File, args[6], fields, checkDeclaration ? &declaration : nullptr);
+        if (!dump.Revalidated() || !reference.Revalidated())
+        {
+            issue = L"source_revalidation_failed";
+            declaration.clear();
+        }
     }
     if (issue) { fields = L",\"status\":\"unavailable\",\"slot_value_observed\":false,\"reason\":" + Quote(issue); }
+    if (checkDeclaration)
+    {
+        if (issue && declaration.empty()) { declaration = DeclarationFields(L"unfulfilled", issue); }
+        fields += L",\"declaration_check\":{\"schema\":\"kn.minidump_import_declaration.v1\",\"expected_dump_sha256\":" + Quote(dumpPin) +
+            L",\"expected_reference_sha256\":" + Quote(refPin) + L",\"export\":" + Quote(args[6]) + declaration + L"}";
+    }
     const auto output = L"{\"schema\":\"kn.minidump_iat_observation.v1\",\"source\":\"saved_user_minidump\",\"export\":" + Quote(args[6]) +
         L",\"expected_dump_sha256\":" + Quote(dumpPin) + L",\"expected_reference_sha256\":" + Quote(refPin) +
         L",\"collector_authenticated\":false,\"slot_reread\":false,\"execution_observed\":false,\"mapping_lifetime_bound\":false" +

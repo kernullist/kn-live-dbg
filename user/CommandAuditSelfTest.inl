@@ -505,6 +505,10 @@ static int RunCommandAuditSelfTest()
     check(!IsWriteLikeCommandLine(dumpIat) && run(dumpIat + L" /json").Output.find(L"dump_pin_unavailable") != std::wstring::npos &&
         !device.IsOpen(), L"user minidump IAT replay opens only offline inputs and preserves its transcript");
     check(run(dumpIat + L" /bad").Error.find(L"usage") != std::wstring::npos, L"user minidump IAT rejects malformed options");
+    check(run(dumpIat + L" /declaration /json").Output.find(L"kn.minidump_import_declaration.v1") != std::wstring::npos &&
+        !device.IsOpen(), L"missing dump has an unfulfilled offline import declaration");
+    check(run(dumpIat + L" /declaration /declaration").Error.find(L"usage") != std::wstring::npos,
+        L"duplicate import declaration selection is rejected");
     const auto sourceArchive = L"!kmon journal-image-source missing-source-report " + std::wstring(64, L'a') + L" store 7";
     check(IsWriteLikeCommandLine(sourceArchive) && run(sourceArchive + L" /json").Output.find(L"kn.image_source_collection.v1") != std::wstring::npos &&
         !device.IsOpen(), L"source archival requires write authorization and uses offline inputs");

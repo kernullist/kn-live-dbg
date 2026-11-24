@@ -17,11 +17,13 @@ sets of admitted references, not every scanner or every observation.
 VS1 source replay links captured AMD64 export instructions to named or ordinal
 imports using the original reads and the retained PE. A saved user-mode dump
 can also supply the slot bytes and the module extent containing their value.
+Its import declaration can be checked field by field against the retained PE,
+including name or ordinal evidence and an explicit count of missing bytes.
 The live capture recipe still needs its own slot reads. Callback and vtable
 bindings, the exact destination function and mapping lifetime remain open.
 See [source replay](COMMAND_REFERENCE.md#replay-a-process-image-source-receipt),
 [user-minidump replay](COMMAND_REFERENCE.md#read-a-loaded-import-slot-from-a-user-minidump)
-and [validation](VALIDATION.md#loaded-import-slots-in-user-minidumps).
+and [validation](VALIDATION.md#import-declaration-bytes-in-user-minidumps).
 
 | Implemented contract | Acceptance evidence |
 | --- | --- |
