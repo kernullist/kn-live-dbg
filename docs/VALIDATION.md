@@ -7,6 +7,39 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Saved dump and reboot event times on 2026-11-25
+
+The development x64 Release binary read four records from a saved Windows
+System log. Two Kernel-Power 41 records had a nonzero stop code and four
+parameters. One had a zero code and the fourth belonged to another provider.
+For each nonzero stop, controlled dumps placed the saved target time before,
+within and after the selected event's second. Windows Event Log returned the
+same 100 ns timestamp through its typed property and its XML rendering.
+All six comparisons produced the expected signed bounds and evidence links.
+
+One further dump reproduced all five stop fields and recorded a time 30
+seconds after the startup event. The report preserved the matching fields
+and the contrary ordering. A separate Windows SDK debugger session read the
+dump time and uptime to the displayed millisecond. A copy with a different
+NTFS write time produced the identical report. These were controlled dumps.
+Attribution of the original restarts still requires an incident-matched dump,
+host and boot provenance, and evidence of clock changes.
+
+The saved-event suite passed 11 tests, including source and output alias
+checks. The native parser passed 164 checks covering leap-day conversion,
+fractional precision, exact second boundaries and conflicting readers. The
+default MSVC AddressSanitizer stopped during runtime interception on this
+host. With its documented continuation setting the same 164 checks passed
+with reduced interception coverage. Crash, WHEA record and WHEA event suites
+passed 11, 9 and 10 tests respectively.
+
+Across 19 invocations the previous reader and the new one returned identical
+exit codes, stdout and stderr for report versions 1 through 3. Windows
+PowerShell 5.1 and PowerShell 7 both ran the documented success and
+digest-failure examples. The command self-test passed 3,097 checks and
+the restricted launch suite checked 94 results with zero remote accepts.
+[Command example](COMMAND_REFERENCE.md#compare-dump-and-reboot-times)
+
 ## Interrupted minidump publication
 
 On 2026-11-25 a Windows x64 publisher exited after flushing a 28,095,212-byte

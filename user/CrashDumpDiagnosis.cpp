@@ -117,7 +117,7 @@ namespace
     }
 
     void Inspect(HANDLE file, const CONTEXT& headerContext, bool hasContext, Engine& e,
-        const SavedCrashStop& headerStop, bool ordinaryDump, WheaRecord* record)
+        const SavedCrashStop& headerStop, bool ordinaryDump, WheaRecord* record, SavedCrashClock* clock)
     {
         const HRESULT initialized = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         e.Call(L"com_initialize", initialized);
@@ -184,6 +184,16 @@ namespace
                 }
                 if (e.initialStop)
                 {
+                    if (clock)
+                    {
+                        ComPtr<IDebugControl2> control2;
+                        if (e.Call(L"clock_interface", client.As(&control2)))
+                        {
+                            ULONG seconds = 0;
+                            if (e.Call(L"dump_time", control2->GetCurrentTimeDate(&seconds))) { clock->debuggerUnixSeconds = seconds; }
+                            if (e.Call(L"dump_uptime", control2->GetCurrentSystemUpTime(&seconds))) { clock->debuggerUptimeSeconds = seconds; }
+                        }
+                    }
                     ComPtr<IDebugRegisters> registers;
                     ULONG64 ip = 0, sp = 0;
                     if (e.Call(L"registers", client.As(&registers)))
@@ -223,7 +233,7 @@ namespace
 
     struct Options
     {
-        bool whea = false, wheaEvent = false;
+        bool whea = false, wheaEvent = false, compareTime = false;
         size_t rebootArg = 0;
         uint64_t recordId = 0;
     };
@@ -244,7 +254,8 @@ namespace
             }
         }
         if (i == args.size()) { return true; }
-        if (args.size() - i != 6 || args[i] != L"--reboot-log" || args[i + 2] != L"--log-sha256" ||
+        options.compareTime = args.size() - i == 7 && args.back() == L"--compare-time";
+        if (args.size() - i != (options.compareTime ? 7u : 6u) || args[i] != L"--reboot-log" || args[i + 2] != L"--log-sha256" ||
             !IsDigest(args[i + 3]) || args[i + 4] != L"--record-id") { return false; }
         const auto& decimal = args[i + 5];
         if (decimal.empty() || decimal.size() > 20) { return false; }
@@ -268,7 +279,7 @@ std::wstring SavedCrashStop::Json() const
 
 static int Diagnose(const std::vector<std::wstring>& args, const Options& options)
 {
-    const unsigned version = options.rebootArg ? 3 : options.whea ? 2 : 1;
+    const unsigned version = options.compareTime ? 4 : options.rebootArg ? 3 : options.whea ? 2 : 1;
     const auto expected = LowerDigest(args[2]);
     std::filesystem::path path;
     symbol_artifacts::Directories parents;
@@ -294,16 +305,20 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     Engine e;
     const bool ordinaryDump = knownAttributes && !h.Attributes.LiveDumpGeneratedDump && !h.Attributes.DumpIsGeneratedOffline;
     WheaRecord record;
-    Inspect(source.Handle(), context, hasContext, e, stop, ordinaryDump, options.whea ? &record : nullptr);
+    SavedCrashClock clock{h.SystemTime.QuadPart, h.SystemUpTime.QuadPart};
+    Inspect(source.Handle(), context, hasContext, e, stop, ordinaryDump, options.whea ? &record : nullptr,
+        options.compareTime ? &clock : nullptr);
     const auto event = options.wheaEvent ? CompareSavedWheaEvent(args[5], LowerDigest(args[7]), record) : WheaEventComparison{};
     const bool match = e.stop && *e.stop == stop;
     const bool stopEvidence = e.initialStop && ordinaryDump;
     std::optional<RebootEventComparison> reboot;
+    std::optional<RebootTimeline> timeline;
     if (options.rebootArg)
     {
         const auto i = options.rebootArg;
         reboot = CompareSavedRebootEvent(args[i + 1], LowerDigest(args[i + 3]), options.recordId,
-            match && stopEvidence && stop.code ? &stop : nullptr);
+            match && stopEvidence && stop.code ? &stop : nullptr, options.compareTime);
+        if (options.compareTime) { timeline = CompareRebootTime(clock, *reboot); }
     }
     if (!source.Unchanged()) { return Failure(version, L"source_changed_or_unreadable"); }
     const auto status = !e.stop ? L"header_only" : !match ? L"conflicting_stop_data" : L"matched_stop_data";
@@ -321,6 +336,7 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
     if (options.whea) { report += L",\"whea_record\":" + record.Json(); }
     if (options.wheaEvent) { report += L",\"whea_event\":" + event.report; }
     if (reboot) { report += L",\"reboot_event\":" + reboot->Json(); }
+    if (timeline) { report += L",\"reboot_timeline\":" + timeline->report; }
     report += L",\"assessment\":{\"header_context_matches_selected\":" +
         std::wstring(e.sameContext ? Bool(*e.sameContext) : L"null") +
         L",\"header_context_matches_stack_top\":" + (e.topMatches ? Bool(*e.topMatches) : L"null") +
@@ -336,7 +352,7 @@ static int Diagnose(const std::vector<std::wstring>& args, const Options& option
             L"inspect_the_corresponding_whea_error_record") + L"},";
     if (options.whea) { report += record.Hypothesis() + L","; }
     if (options.wheaEvent) { report += event.Hypothesis() + L","; }
-    if (reboot) { report += reboot->Hypothesis() + L","; }
+    if (reboot) { report += reboot->Hypothesis(timeline ? &*timeline : nullptr) + L","; }
     report += L"{\"candidate\":\"component_present_at_stop\",\"state\":" +
         Quote(located ? L"mapped_frame_observed" : L"unresolved") +
         L",\"support\":" + (located ?
@@ -359,7 +375,7 @@ int RunCrashDumpDiagnosis(const std::vector<std::wstring>& args)
             return WriteWithDistinctInput(STD_ERROR_HANDLE, args.empty() ? L"" : args.front(), [] {
                 std::wcerr << L"usage: KnLiveDbg.exe --crash-diagnose <local-kernel-dump> --sha256 <digest> "
                     L"[--whea [--event-xml <file> --event-sha256 <digest>]] "
-                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal>]\n";
+                    L"[--reboot-log <local.evtx> --log-sha256 <digest> --record-id <decimal> [--compare-time]]\n";
                 return 2;
             });
         };

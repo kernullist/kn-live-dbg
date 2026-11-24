@@ -2628,6 +2628,29 @@ The report leaves the cause and host/boot provenance open. WHEA options
 can precede `--reboot-log` when both types of evidence are available.
 [Reboot event evidence boundaries](ARCHITECTURE.md#saved-reboot-event-comparison)
 
+### Compare dump and reboot times
+
+Append `--compare-time` to the saved Event 41 command to request
+`kn.crash_diagnosis.v4`. Use the same dump, archive, pins and selected
+record as in the preceding example.
+
+```powershell
+$json = & KnLiveDbg.exe --crash-diagnose $dump.FullName --sha256 $dumpPin --reboot-log $log.FullName --log-sha256 $logPin --record-id $record.RecordId --compare-time
+if ($LASTEXITCODE -eq 2) { throw 'Could not read the diagnosis output.' }
+$report = $json | ConvertFrom-Json
+if ($null -eq $report.reboot_timeline) { throw $report.status }
+$report.reboot_timeline | Select-Object status, event_minus_dump_100ns, estimated_dump_boot_filetime
+$report.assessment.hypotheses | Where-Object candidate -eq 'same_recorded_stop_at_restart'
+```
+
+The signed interval `event_minus_dump_100ns` gives the earliest and latest
+possible difference between the recorded UTC times. Positive bounds place the
+dump before the event. Negative bounds place the dump after it. An event in
+the same debugger second leaves the order unresolved. The hypothesis retains
+both the matching stop fields and any contrary timing evidence. Check the
+host, boot and clock-change history before attributing the restart.
+[Clock sources and precision](ARCHITECTURE.md#saved-reboot-event-comparison)
+
 ## Callback control
 
 Inspection is available for external registrations. Mutation supports only the

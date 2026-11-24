@@ -1,6 +1,7 @@
 #include "../user/RebootEvent.h"
 #include <iostream>
 #include <stdexcept>
+#include <utility>
 
 namespace
 {
@@ -37,6 +38,44 @@ namespace
         Check(!result.sameStop, "parser made a dump comparison");
         return result;
     }
+
+    void CheckClock()
+    {
+        constexpr int64_t t = 133536816000000000LL, ticks = 10000000;
+        auto event = Parse(document, L"dump_stop_unqualified");
+        Check(event.xmlFileTime == static_cast<uint64_t>(t), "calendar conversion");
+        for (const auto& sample : {std::make_pair(L".1Z", 1000000u), std::make_pair(L".0000001Z", 1u),
+                std::make_pair(L".123456700Z", 1234567u), std::make_pair(L"Z", 0u)})
+        {
+            auto parsed = Parse(Replace(L".0000000Z", sample.first), L"dump_stop_unqualified");
+            Check(parsed.xmlFileTime == static_cast<uint64_t>(t) + sample.second, "100 ns fraction");
+        }
+        Check(!Parse(Replace(L".0000000Z", L".000000001Z"), L"dump_stop_unqualified").xmlFileTime, "precision beyond FILETIME");
+        event.dumpQualified = true;
+        SavedCrashClock clock{t + ticks - 1, 2 * ticks + 1, 1709208000ul, 2ul};
+        using Order = RebootTimeline::Order;
+        for (const auto& sample : {std::make_pair(t - 1, Order::AfterEvent), std::make_pair(t, Order::SameSecond),
+                std::make_pair(t + ticks - 1, Order::SameSecond), std::make_pair(t + ticks, Order::BeforeEvent)})
+        {
+            event.typedFileTime = event.xmlFileTime = sample.first;
+            Check(CompareRebootTime(clock, event).order == sample.second, "closed tick interval");
+        }
+        auto has = [&](const wchar_t* text) { return CompareRebootTime(clock, event).report.find(text) != std::wstring::npos; };
+        event.typedFileTime = t;
+        Check(has(L"\"status\":\"event_time_conflict\""), "different XML and typed timestamp");
+        event.xmlFileTime = event.typedFileTime = UINT64_MAX;
+        Check(has(L"\"status\":\"event_time_unavailable\""), "event outside signed FILETIME");
+        event.xmlFileTime = event.typedFileTime = t + ticks;
+        clock.debuggerUptimeSeconds = 3;
+        Check(has(L"\"dump_uptime_seconds_agree\":false") && has(L"\"estimated_dump_boot_filetime\":null") &&
+            CompareRebootTime(clock, event).order == Order::BeforeEvent, "uptime conflict independent of wall time");
+        clock.debuggerUnixSeconds = 1;
+        Check(has(L"\"status\":\"dump_time_conflict\"") && has(L"\"event_minus_dump_100ns\":null"), "conflicting dump clocks");
+        clock.debuggerUnixSeconds = 0;
+        Check(has(L"\"status\":\"dump_time_unavailable\""), "zero debugger clock");
+        event.dumpQualified = false;
+        Check(has(L"\"status\":\"dump_stop_unqualified\""), "unqualified stop");
+    }
 }
 
 int main()
@@ -72,6 +111,7 @@ int main()
         Check(!Parse(Replace(L">10</Version>", L">0</Version>"), L"event_stop_code_unavailable").eventCode, "version zero");
         Parse(Replace(L">10</Version>", L">11</Version>"), L"unsupported_event_template");
         Parse(L"<!DOCTYPE Event [<!ENTITY x '123'>]>" + document, L"malformed_event_xml");
+        CheckClock();
         std::cout << checked << " reboot event parser checks passed\n";
         return 0;
     }

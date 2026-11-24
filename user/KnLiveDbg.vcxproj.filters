@@ -151,6 +151,9 @@
     <ClCompile Include="WheaRecord.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="RebootTimeline.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="WheaEvent.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

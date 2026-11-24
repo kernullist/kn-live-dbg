@@ -403,13 +403,18 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-reboot-event", {f["rule"] for f in AUDIT.inspect("renamed.txt", export.encode(encoding))})
         for signature in (b"ElfFile\0", b"ElfChnk\0"):
             self.assertIn("private-windows-event-log", {f["rule"] for f in AUDIT.inspect("renamed.bin", signature + bytes(128))})
-        for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1"):
+        for schema in ("kn.crash_diagnosis.v3", "kn.reboot_event_comparison.v1", "kn.crash_diagnosis.v4", "kn.reboot_timeline.v1"):
             for text in (json.dumps({"status": "example", "schema": schema}),
                          "log\n" + json.dumps({"schema": schema, "status": "example"}, indent=2)[:-3],
                          "log\n" + json.dumps({"requested_record_id": "1", "log_sha256": "example", "same_stop_tuple": None})):
                 for encoding in ("utf-8", "utf-16", "utf-16-be"):
                     self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("capture.txt", text.encode(encoding))})
             self.assertFalse(AUDIT.inspect("guide.md", ("See " + schema).encode()))
+        for key in ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
+                    "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime"):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                cut = ("log\n" + json.dumps({"result": {key: "example"}}, indent=2)[:-4]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("excerpt.txt", cut)})
 
     def test_whea_export_and_event_comparison(self):
         name = "Microsoft-Windows-WHEA-Logger"

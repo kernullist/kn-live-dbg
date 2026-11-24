@@ -91,6 +91,12 @@ The direct process-image collector also preserves the
 needed to distinguish a denied open, a mismatched process generation and
 a reference failure after a successful open.
 
+In P13, comparing saved crash and reboot times can expose an event that
+precedes a dump even when the stop fields agree. Establishing a common
+host, boot and clock history remains open.
+[Command example](COMMAND_REFERENCE.md#compare-dump-and-reboot-times) and
+[validation results](VALIDATION.md#saved-dump-and-reboot-event-times-on-2026-11-25).
+
 The [source collection](COMMAND_REFERENCE.md#archive-a-process-image-acquisition)
 retains the original acquisition report and its image dependencies in one
 private journal. It also closes attempts that produced no image. The

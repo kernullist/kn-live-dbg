@@ -12,6 +12,8 @@ import unittest
 
 
 triage = runpy.run_path(str(Path(__file__).with_name("test-crash-diagnosis.py")))["triage"]
+TICKS = 10_000_000
+UNIX_EPOCH = 116_444_736_000_000_000
 
 
 def sha(data):
@@ -29,7 +31,7 @@ $rows = @(Get-WinEvent -Path $env:KN_REBOOT_TEST_INPUT -Oldest -MaxEvents 129 | 
     if ($_.ProviderName -ceq 'Microsoft-Windows-Kernel-Power' -and $_.Id -eq 41 -and $_.Version -in (2..10)) {
         $tuple = @($_.Properties[0..4] | ForEach-Object { [string][uint64]$_.Value })
     }
-    [pscustomobject]@{record=[string]$_.RecordId; id=$_.Id; version=$_.Version; tuple=$tuple; time=$xml.System.TimeCreated.SystemTime}
+    [pscustomobject]@{record=[string]$_.RecordId; id=$_.Id; version=$_.Version; tuple=$tuple; time=$xml.System.TimeCreated.SystemTime; filetime=[string]$_.TimeCreated.ToFileTimeUtc()}
 })
 ConvertTo-Json -InputObject $rows -Depth 4 -Compress
 """
@@ -67,11 +69,15 @@ class RebootComparison(unittest.TestCase):
         return [EXE, "--crash-diagnose", self.dump, "--sha256", sha(self.dump.read_bytes()), *before,
                 "--reboot-log", self.log, "--log-sha256", pin or sha(self.log.read_bytes()), "--record-id", str(record)]
 
-    def observe(self, *args, **kwargs):
-        c = subprocess.run(self.command(*args, **kwargs), capture_output=True, timeout=25)
+    def observe(self, *args, compare_time=False, **kwargs):
+        command = self.command(*args, **kwargs)
+        if compare_time:
+            command.append("--compare-time")
+        c = subprocess.run(command, capture_output=True, timeout=25)
         self.assertEqual((c.returncode, c.stderr), (0, b""))
         report = json.loads(c.stdout)
-        self.assertEqual(report["schema"], "kn.crash_diagnosis.v3")
+        self.assertEqual(report["schema"], "kn.crash_diagnosis.v4" if compare_time else "kn.crash_diagnosis.v3")
+        self.assertEqual("reboot_timeline" in report, compare_time)
         self.assertFalse(report["assessment"]["host_crash_verified"])
         self.assertIsNone(report["assessment"]["attributed_cause"])
         event = report["reboot_event"]
@@ -85,10 +91,101 @@ class RebootComparison(unittest.TestCase):
                 item = item[field]
         return event, hypothesis, report
 
-    def make_dump(self, values, attributes=0):
+    def make_dump(self, values, attributes=0, filetime=0, uptime=0):
         raw = triage(code=values[0], attributes=attributes)
         struct.pack_into("<4Q", raw, 0x40, *values[1:])
+        struct.pack_into("<q", raw, 0xfa8, filetime)
+        struct.pack_into("<q", raw, 0x1030, uptime)
         self.dump.write_bytes(raw)
+
+    def test_recorded_time_order_and_second_bounds(self):
+        self.row("nonzero")
+        duration = 3871 * TICKS + 2_500_000
+        for row in (r for r in ROWS if r["tuple"] and r["tuple"][0]):
+            event_time = int(row["filetime"])
+            base = event_time - event_time % TICKS
+            for shift, status, state in ((-2, "dump_before_event", "consistent_stop_and_recorded_order"),
+                                         (0, "same_recorded_second", "matching_stop_order_unresolved"),
+                                         (2, "dump_after_event", "conflicting_recorded_order")):
+                start = base + shift * TICKS
+                end = start + TICKS - 1
+                raw_time = start + (TICKS - 1 if event_time == start else 1)
+                self.make_dump(row["tuple"], filetime=raw_time, uptime=duration)
+                event, hypothesis, doc = self.observe(row["record"], compare_time=True)
+                timing = doc["reboot_timeline"]
+                self.assertEqual(timing["schema"], "kn.reboot_timeline.v1")
+                self.assertEqual((timing["status"], hypothesis["state"]), (status, state))
+                self.assertEqual(event, self.observe(row["record"])[0])
+                self.assertEqual(timing["header_system_filetime"], str(raw_time))
+                self.assertEqual(timing["header_uptime_100ns"], str(duration))
+                self.assertEqual(timing["dbgeng_unix_seconds"], str((start - UNIX_EPOCH) // TICKS))
+                self.assertEqual(timing["dbgeng_uptime_seconds"], str(duration // TICKS))
+                for k in ("dump_time_seconds_agree", "dump_uptime_seconds_agree", "event_time_fields_agree"):
+                    self.assertIs(timing[k], True)
+                for k in ("event_xml_filetime", "event_typed_filetime"):
+                    self.assertEqual(timing[k], row["filetime"])
+                self.assertIsNone(timing["event_time_win32_error"])
+                self.assertEqual(timing["event_minus_dump_100ns"], {"minimum": str(event_time - end),
+                                                                  "maximum": str(event_time - start)})
+                elapsed = duration // TICKS * TICKS
+                self.assertEqual(timing["estimated_dump_boot_filetime"], {"minimum": str(start - elapsed - TICKS + 1),
+                                                                         "maximum": str(end - elapsed)})
+                self.assertFalse(timing["clock_correspondence_verified"])
+                self.assertIn("/reboot_event/bugcheck", hypothesis["support"])
+                self.assertIn("/reboot_event/same_host_boot_verified", hypothesis["missing"])
+                if shift:
+                    self.assertIn("/reboot_timeline/event_minus_dump_100ns", hypothesis["contrary" if shift > 0 else "support"])
+                else:
+                    self.assertIn("/reboot_timeline/status", hypothesis["missing"])
+                self.assertEqual(doc, self.observe(row["record"], compare_time=True)[2])
+
+    def test_time_and_stop_are_distinct_evidence(self):
+        row = self.row("nonzero")
+        ft = int(row["filetime"])
+        other = row["tuple"].copy()
+        other[3] ^= 1
+        self.make_dump(other, filetime=ft + 2 * TICKS)
+        event, h, doc = self.observe(row["record"], before=("--whea",), compare_time=True)
+        self.assertIn("whea_record", doc)
+        self.assertIs(event["same_stop_tuple"], False)
+        self.assertEqual(h["state"], "conflicting_stop_and_recorded_order")
+        self.assertIn("/reboot_event/bugcheck", h["contrary"])
+        self.assertIn("/reboot_timeline/event_minus_dump_100ns", h["contrary"])
+        self.assertIsNone(doc["reboot_timeline"]["estimated_dump_boot_filetime"])
+        self.make_dump(other, filetime=ft - 2 * TICKS)
+        _, h, doc = self.observe(row["record"], compare_time=True)
+        self.assertEqual((h["state"], doc["reboot_timeline"]["status"]), ("conflicting_stop_tuples", "dump_before_event"))
+        self.assertFalse(h["support"])
+        for raw in (0, -1, UNIX_EPOCH, UNIX_EPOCH + (1 << 32) * TICKS):
+            self.make_dump(row["tuple"], filetime=raw)
+            _, h, doc = self.observe(row["record"], compare_time=True)
+            self.assertEqual(doc["reboot_timeline"]["status"], "dump_time_unavailable")
+            self.assertIsNone(doc["reboot_timeline"]["event_minus_dump_100ns"])
+            self.assertEqual(h["state"], "matching_stop_order_unresolved")
+        self.make_dump(row["tuple"], filetime=ft, attributes=0x10)
+        self.assertEqual(self.observe(row["record"], compare_time=True)[2]["reboot_timeline"]["status"], "dump_stop_unqualified")
+        self.make_dump(row["tuple"], filetime=ft)
+        for selected, pin in ((self.row("other")["record"], None), (row["record"], "0" * 64), (str(2**64 - 1), None)):
+            _, _, doc = self.observe(selected, pin=pin, compare_time=True)
+            self.assertEqual(doc["reboot_timeline"]["status"], "event_time_unavailable")
+            self.assertIsNone(doc["reboot_timeline"]["event_minus_dump_100ns"])
+
+    def test_chronology_requires_explicit_record_and_protects_inputs(self):
+        command = self.command("1")
+        for invalid in (command[:5] + ["--compare-time"], command + ["--compare-time", "--compare-time"],
+                        command[:-2] + ["--compare-time", *command[-2:]]):
+            p = subprocess.run(invalid, capture_output=True, timeout=20)
+            self.assertEqual((p.returncode, p.stdout), (2, b""))
+        for original in (self.dump, self.log):
+            before = original.read_bytes()
+            link = self.root / "output-alias"
+            os.link(original, link)
+            for channel, argv in (("stdout", command + ["--compare-time"]), ("stderr", command + ["--compare-time", "extra"])):
+                with link.open("r+b") as output:
+                    p = subprocess.run(argv, **{channel: output, ("stderr" if channel == "stdout" else "stdout"): subprocess.PIPE}, timeout=20)
+                self.assertEqual(p.returncode, 2)
+                self.assertTrue(original.read_bytes() == before)
+            link.unlink()
 
     def test_installed_kernel_power_templates(self):
         command = r"""

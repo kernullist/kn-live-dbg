@@ -21,7 +21,10 @@ PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", "
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
-CRASH_SCHEMAS = ("kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
+REBOOT_TIME_SCHEMAS = ("kn.crash_diagnosis.v4", "kn.reboot_timeline.v1")
+REBOOT_CLOCK_FIELDS = ("header_system_filetime", "header_uptime_100ns", "dbgeng_unix_seconds", "dbgeng_uptime_seconds",
+                       "event_xml_filetime", "event_typed_filetime", "event_minus_dump_100ns", "estimated_dump_boot_filetime")
+CRASH_SCHEMAS = (*REBOOT_TIME_SCHEMAS, "kn.crash_diagnosis.v1", "kn.crash_diagnosis.v2", "kn.crash_diagnosis.v3",
                  "kn.whea_event_comparison.v1", "kn.reboot_event_comparison.v1")
 EVENT_EXPORT_PROVIDER = re.compile(
     r'''(?is)<(?:[\w.-]+:)?Provider\b[^<>]*\b(?:Name|Guid)\s*=\s*["'](?:'''
@@ -229,7 +232,7 @@ WAIT_PLAN_FIELDS = tuple(frozenset(fields) for fields in (
     ("evaluated_views", "required_views", "capture_bytes"), ("pid", "process_created", "tid", "thread_created"),
     ("receiver_tid", "receiver_created"), ("send_return_tick", "handler_entry_tick", "handler_leave_tick"),
 ))
-DUMP_EVIDENCE_SCHEMAS = ("kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
+DUMP_EVIDENCE_SCHEMAS = (*REBOOT_TIME_SCHEMAS, "kn.dump_read.v2", "kn.dump_initialization.v1", "kn.dump_capability_probe.v1")
 ETL_COMPARISON_MARKERS = (*ETL_COMPARISON_SCHEMAS, '"retained_sha256"', '"before_sha256"', '"supported_descriptors"',
                           '"verdict"', '"process_state"', '"started_ns"', '"unresolved_opcode_names"', '"admission_id"',
                           '"admission_sha256"', '"planned_slots"', '"distinct_source_hashes"', '"agreement_per_planned"', '"acquisition"', '"prefix_sha256"', '"observed_sha256"',
@@ -248,7 +251,8 @@ ETL_COMPARISON_FIELDS = tuple(frozenset(fields) for fields in (
     ("agreement_per_planned_group", "agreement_per_comparable_group"),
     ("case_id", "sample_family", "partition", "independence_group"), ("supplied_source_partition", "case_id", "acquisition"),
 ))
-DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
+DUMP_EVIDENCE_MARKERS = (*DUMP_EVIDENCE_SCHEMAS, *(f'"{field}"' for field in REBOOT_CLOCK_FIELDS),
+                         '"candidate_levels"', '"seek_win32_status"', '"first_file_sequence"', "saved_dump_probe",
                          '"expected_header_sha256"', '"range_evidence"', '"range_state"', '"span_sha256"', '"physical_read_sequence"', '"translation_reason"')
 DISK_IO_MARKERS = (DISK_IO_SCHEMA, DISK_REQUEST_SCHEMA, *FILE_OPERATION_SCHEMAS, '"disk_event_ordinal"', '"high_res_response_ticks"', '"longest_response_ties"',
                    '"response_ticks_per_second"', '"decoded_disk_records"', '"cross_provider_join"', '"packet_first_ordinal"',
@@ -367,6 +371,7 @@ ETL_ROW_MARKERS = (*TRACE_QUERY_SCHEMAS, *LOADER_WINDOW_MARKERS, *READY_ORIGIN_M
                    '"group_masks"', '"profile_source_name"', '"payload_bytes"', '"group_mask_bracket"', '"reported_period_100ns"')
 
 DUMP_EVIDENCE_FIELDS = tuple(frozenset(fields) for fields in (
+    *((field,) for field in REBOOT_CLOCK_FIELDS),
     ("expected_header_sha256", "digest_scope"), ("availability_scope", "range_evidence"),
     ("range_state", "captured_bytes", "unobserved_bytes"), ("range_offset", "state", "span_sha256"),
     ("physical_read_sequence", "native_status_domain", "win32_status"), ("range_offset", "translation_state", "translation_reason"),

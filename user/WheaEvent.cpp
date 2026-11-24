@@ -43,7 +43,7 @@ namespace
         return value;
     }
 
-    bool UtcTimestamp(View t)
+    bool UtcTimestamp(View t, std::optional<uint64_t>& fileTime)
     {
         if (t.size() < 20 || t.size() > 30 || t[4] != L'-' || t[7] != L'-' || t[10] != L'T' ||
             t[13] != L':' || t[16] != L':' || t.back() != L'Z') { return false; }
@@ -58,7 +58,17 @@ namespace
         st.wYear = n(0, 4); st.wMonth = n(5, 2); st.wDay = n(8, 2);
         st.wHour = n(11, 2); st.wMinute = n(14, 2); st.wSecond = n(17, 2);
         FILETIME ft{};
-        return SystemTimeToFileTime(&st, &ft) != FALSE;
+        if (!SystemTimeToFileTime(&st, &ft)) { return false; }
+        uint64_t fraction = 0, place = 1000000;
+        for (size_t i = 20; i + 1 < t.size(); ++i)
+        {
+            // Keep valid sub-100 ns XML for older reports. Its exact value cannot be a FILETIME.
+            if (!place && t[i] != L'0') { return true; }
+            fraction += (t[i] - L'0') * place;
+            place /= 10;
+        }
+        fileTime = ((static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime) + fraction;
+        return true;
     }
 
     enum class Group { Other, System, Data };
@@ -227,7 +237,7 @@ namespace
             return hr == S_FALSE;
         }
 
-        struct Identity { uint64_t id, version, recordId; };
+        struct Identity { uint64_t id, version, recordId; std::optional<uint64_t> fileTime; };
 
         std::optional<Identity> Metadata(const wchar_t* name, const wchar_t* guid)
         {
@@ -236,12 +246,13 @@ namespace
                 text[Channel] != L"System") { status = L"different_event_source"; return {}; }
             const auto id = Decimal(text[Id], UINT16_MAX), version = Decimal(text[Version], UINT8_MAX);
             const auto recordId = Decimal(text[RecordId], UINT64_MAX);
-            if (!id || !version || !recordId || !*recordId || !UtcTimestamp(text[Time]))
+            std::optional<uint64_t> time;
+            if (!id || !version || !recordId || !*recordId || !UtcTimestamp(text[Time], time))
             { status = L"event_metadata_incomplete"; return {}; }
             metadata = L"{\"provider\":" + Quote(name) + L",\"channel\":\"System\",\"event_id\":" +
                 std::to_wstring(*id) + L",\"version\":" + std::to_wstring(*version) + L",\"event_record_id\":" +
                 Quote(std::to_wstring(*recordId)) + L",\"system_time_utc\":" + Quote(text[Time]) + L"}";
-            return Identity{*id, *version, *recordId};
+            return Identity{*id, *version, *recordId, time};
         }
 
         void Compare(const WheaRecord& dump)
@@ -309,6 +320,7 @@ void DecodeRebootEvent(const BYTE* xml, UINT byteCount, RebootEventComparison& r
     result.metadata = event.metadata;
     if (id->recordId != result.recordId) { result.status = L"record_id_mismatch"; return; }
     if (id->id != 41 || id->version > 10) { result.status = L"unsupported_event_template"; return; }
+    result.xmlFileTime = id->fileTime;
     if (!id->version) { result.status = L"event_stop_code_unavailable"; return; }
     SavedCrashStop stop;
     const auto code = Decimal(event.text[StopCode], UINT32_MAX);

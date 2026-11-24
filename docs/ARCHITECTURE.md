@@ -4640,6 +4640,24 @@ the next startup and can report a zero code after a bugcheck. Keep the
 archive and reports with the private dump.
 [Microsoft's Event 41 interpretation](https://learn.microsoft.com/en-us/troubleshoot/windows-client/performance/event-id-41-restart)
 
+With `--compare-time`, the command reads the saved target time and uptime
+from DbgEng at the initial stop. Each reading has whole-second precision.
+It compares each with the corresponding dump header value rounded down to
+the second. An unavailable, zero or out-of-range reading leaves that clock
+unresolved. If both wall time and uptime agree, their difference gives a
+range for when the crashed system booted. A clock adjustment during that
+boot can shift the estimate. [DbgEng target time](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol2-getcurrenttimedate)
+and [system uptime](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol3-getcurrentsystemuptime).
+
+From the same saved Event 41 record, Windows returns a typed FILETIME and
+an XML UTC timestamp. When these agree to 100 ns and the dump stop and wall
+time qualify, the report subtracts both ends of the debugger second from the
+event time. Two negative bounds put the dump after the startup event. An
+interval containing zero leaves the order unresolved. The assessment keeps
+stop-field evidence and timing evidence separately so a matching tuple and
+conflicting times can both be inspected. Relating the two clocks to one host
+and boot requires other evidence. [Windows event rendering](https://learn.microsoft.com/en-us/windows/win32/wes/rendering-events)
+
 ## Cooperative callbacks and pending I/O
 
 `!callbacks` and `!minifilter` control only the exact cooperative

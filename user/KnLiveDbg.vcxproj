@@ -265,6 +265,7 @@
     <ClCompile Include="ProcessImageSourceReceipt.cpp" />
     <ClCompile Include="ProcessImageSourceReplay.cpp" />
     <ClCompile Include="CrashDumpDiagnosis.cpp" />
+    <ClCompile Include="RebootTimeline.cpp" />
     <ClCompile Include="RebootEvent.cpp" />
     <ClCompile Include="EtlProfile.cpp" />
     <ClCompile Include="EtlImageLifetime.cpp" />

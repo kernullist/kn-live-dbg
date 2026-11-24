@@ -17,7 +17,21 @@ namespace
     constexpr uint64_t MaxLogBytes = 256ull << 20;
     constexpr DWORD MaxRenderedBytes = 256u << 10;
 
-    void ReadRecord(const std::wstring& path, RebootEventComparison& result)
+    void ReadEventTime(EVT_HANDLE event, RebootEventComparison& result)
+    {
+        LPCWSTR path = L"Event/System/TimeCreated/@SystemTime";
+        EventHandle context(EvtCreateRenderContext(1, &path, EvtRenderContextValues), EvtClose);
+        if (!context) { result.timeError = GetLastError(); return; }
+        EVT_VARIANT value{};
+        DWORD used = 0, count = 0;
+        if (!EvtRender(context.get(), event, EvtRenderEventValues, sizeof(value), &value, &used, &count))
+        { result.timeError = GetLastError(); return; }
+        if (used != sizeof(value) || count != 1 || value.Type != EvtVarTypeFileTime)
+        { result.timeError = ERROR_INVALID_DATA; return; }
+        result.typedFileTime = value.FileTimeVal;
+    }
+
+    void ReadRecord(const std::wstring& path, RebootEventComparison& result, bool readTime)
     {
         const auto queryText = L"*[System[EventRecordID=" + std::to_wstring(result.recordId) + L"]]";
         EventHandle query(EvtQuery(nullptr, path.c_str(), queryText.c_str(), EvtQueryFilePath | EvtQueryForwardDirection), EvtClose);
@@ -57,11 +71,12 @@ namespace
         if (used != size || xml.back() != L'\0' || std::find(xml.begin(), xml.end() - 1, L'\0') != xml.end() - 1)
         { result.status = L"event_render_size_invalid"; return; }
         DecodeRebootEvent(reinterpret_cast<const BYTE*>(xml.data()), used - static_cast<DWORD>(sizeof(wchar_t)), result);
+        if (readTime) { ReadEventTime(event.get(), result); }
     }
 }
 
 RebootEventComparison CompareSavedRebootEvent(const std::wstring& name, const std::wstring& pin,
-    uint64_t recordId, const SavedCrashStop* qualifiedDumpStop)
+    uint64_t recordId, const SavedCrashStop* qualifiedDumpStop, bool readTime)
 {
     RebootEventComparison result;
     result.recordId = recordId;
@@ -76,7 +91,7 @@ RebootEventComparison CompareSavedRebootEvent(const std::wstring& name, const st
     if (!approved_file::ReadAt(archive.File.Handle(), 0, signature.data(), static_cast<DWORD>(signature.size()), &used) ||
         used != signature.size() || std::memcmp(signature.data(), "ElfFile", signature.size()) != 0)
     { result.status = L"unsupported_event_archive"; return result; }
-    ReadRecord(archive.PinnedVolumePath(), result);
+    ReadRecord(archive.PinnedVolumePath(), result, readTime);
     if (!archive.Revalidated())
     {
         RebootEventComparison changed;
@@ -112,7 +127,7 @@ std::wstring RebootEventComparison::Json() const
         L",\"source_authenticated\":false,\"same_host_boot_verified\":false}";
 }
 
-std::wstring RebootEventComparison::Hypothesis() const
+std::wstring RebootEventComparison::Hypothesis(const RebootTimeline* timing) const
 {
     const std::wstring evidence = L"[\"/header/bugcheck\",\"/dbgeng/bugcheck\",\"/reboot_event/log_sha256\","
         L"\"/reboot_event/event\",\"/reboot_event/bugcheck\"]";
@@ -121,13 +136,36 @@ std::wstring RebootEventComparison::Hypothesis() const
     std::wstring missing;
     if (!dumpQualified) { missing = L"\"/status\",\"/header\",\"/dbgeng/initial_stop\""; }
     if (!eventStop || !eventStop->code) { missing += (missing.empty() ? L"" : L",") + Quote(L"/reboot_event/status"); }
-    const auto next = !dumpQualified ? L"obtain_an_ordinary_dump_with_a_qualified_stop" :
+    const wchar_t* next = !dumpQualified ? L"obtain_an_ordinary_dump_with_a_qualified_stop" :
         (!eventStop || !eventStop->code) ? L"locate_the_original_record_with_full_stop_fields" : L"verify_host_boot_and_incident_provenance";
-    return L"{\"candidate\":\"same_recorded_stop_at_restart\",\"state\":" +
-        Quote(codeConflict ? L"contradicted_by_stop_code" : !sameStop ? L"unresolved" :
-            match ? L"supported_by_stop_tuples" : L"conflicting_stop_tuples") +
-        L",\"support\":" + (match ? evidence : L"[]") + L",\"contrary\":" + (codeConflict ?
-            L"[\"/header/bugcheck/code\",\"/dbgeng/bugcheck/code\",\"/reboot_event/log_sha256\",\"/reboot_event/bugcheck_code_decimal\"]" :
-            sameStop && !match ? evidence : L"[]") +
+    const wchar_t* state = codeConflict ? L"contradicted_by_stop_code" : !sameStop ? L"unresolved" :
+        match ? L"supported_by_stop_tuples" : L"conflicting_stop_tuples";
+    std::wstring support = match ? evidence : L"[]";
+    std::wstring contrary = codeConflict ?
+        L"[\"/header/bugcheck/code\",\"/dbgeng/bugcheck/code\",\"/reboot_event/log_sha256\",\"/reboot_event/bugcheck_code_decimal\"]" :
+        sameStop && !match ? evidence : L"[]";
+    if (timing)
+    {
+        auto citeTime = [](std::wstring& array) {
+            array.pop_back();
+            if (array.size() > 1) { array += L","; }
+            array += L"\"/reboot_timeline/event_minus_dump_100ns\"]";
+        };
+        if (timing->order == RebootTimeline::Order::AfterEvent)
+        {
+            state = codeConflict || (sameStop && !match) ? L"conflicting_stop_and_recorded_order" : L"conflicting_recorded_order";
+            citeTime(contrary);
+            next = L"check_clock_changes_and_verify_incident_provenance";
+        }
+        else if (timing->order == RebootTimeline::Order::BeforeEvent && match)
+        { state = L"consistent_stop_and_recorded_order"; citeTime(support); }
+        else if (match) { state = L"matching_stop_order_unresolved"; }
+        if (timing->order == RebootTimeline::Order::Unknown || timing->order == RebootTimeline::Order::SameSecond)
+        { missing += (missing.empty() ? L"" : L",") + Quote(L"/reboot_timeline/status"); }
+        missing += (missing.empty() ? L"" : L",") + Quote(L"/reboot_event/same_host_boot_verified") +
+            L",\"/reboot_timeline/clock_correspondence_verified\"";
+    }
+    return L"{\"candidate\":\"same_recorded_stop_at_restart\",\"state\":" + Quote(state) +
+        L",\"support\":" + support + L",\"contrary\":" + contrary +
         L",\"missing\":[" + missing + L"],\"next\":" + Quote(next) + L"}";
 }
