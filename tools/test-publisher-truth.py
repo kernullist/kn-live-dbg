@@ -175,6 +175,173 @@ class RootHistoryTests(unittest.TestCase):
         self.assertEqual((proof["status"], proof["root_rotation"]["verified_updates"]), ("verified", publisher.MAX_ROOT_UPDATES))
 
 
+def delegation(repo, name, paths, *, terminating=False, signer="timestamp"):
+    return dict(name=name, paths=paths, terminating=terminating, keyids=repo.quorum[signer], threshold=1)
+
+
+def role_body(repo, targets, children=(), **changes):
+    body = dict(repo.base["targets"], targets=targets, **changes)
+    if children:
+        body["delegations"] = dict(keys=repo.base["root"]["keys"], roles=list(children))
+    return body
+
+
+def delegated_release(repo, top, roles, *, retained=None, links=None, expires=None):
+    # Sign the independent fixture from leaf to timestamp using exact lengths and digests.
+    top_bytes = repo.sign("targets", top)
+    descriptors = {name + ".json": dict(version=json.loads(data)["signed"]["version"], length=len(data),
+                                         hashes=dict(sha256=sha(data)))
+                   for name, data in {"targets": top_bytes, **roles}.items()}
+    for name, value in (links or {}).items():
+        if value is None:
+            del descriptors[name + ".json"]
+        else:
+            descriptors[name + ".json"] = value
+    overrides = {role: {"expires": expires} for role in publisher.ROLES} if expires else {}
+    overrides.setdefault("snapshot", {})["meta"] = descriptors
+    files = repo.files(overrides)
+    files["targets"] = top_bytes
+    envelope = json.loads(bundle(files))
+    envelope.update(schema=publisher.DELEGATED_REFERENCE, root_updates=[],
+                    delegated_roles={name: base64.b64encode(data).decode("ascii")
+                                     for name, data in (roles if retained is None else retained).items()})
+    return raw(envelope)
+
+
+class DelegationTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.repo = Repository()
+        cls.anchor = sha(cls.repo.files()["root"])
+        cls.descriptor = dict(length=len(SOURCE), hashes=dict(sha256=sha(SOURCE)))
+
+    def check(self, envelope):
+        resolved, proof = publisher.check_reference(envelope, corpus.decode_document, self.anchor, TIME)
+        self.assertEqual(proof["status"], "verified")
+        return resolved, proof["delegated_role_checks"]
+
+    def test_ordered_search_and_termination_across_subtrees(self):
+        r, path = self.repo, "dist/item"
+        def rule(name, terminal=False):
+            return delegation(r, name, ["dist/*"], terminating=terminal)
+        first = r.sign("timestamp", role_body(r, {}))
+        winner = r.sign("timestamp", role_body(r, {path: self.descriptor}))
+        other = r.sign("timestamp", role_body(r, {path: dict(length=0, hashes=dict(sha256=sha(b"")))}))
+        top = role_body(r, {"dist/top": self.descriptor}, [rule("left"), rule("right")])
+        for terminal, expected in ((False, "right"), (True, None)):
+            left = r.sign("timestamp", role_body(r, {}, [rule("nested", terminal)]))
+            roles = dict(left=left, nested=first, right=other)
+            targets, checks = self.check(delegated_release(r, top, roles))
+            self.assertEqual(targets.resolve("dist/top")[1]["role_check_indices"], [])
+            target, result = targets.resolve(path)
+            self.assertEqual(result["target_role"], expected)
+            self.assertEqual([checks[i]["delegated_role"] for i in result["role_check_indices"]],
+                             ["left", "nested"] if terminal else ["left", "nested", "right"])
+            if not terminal:
+                self.assertEqual(target.length, 0)
+            roles["nested"] = winner
+            targets, checks = self.check(delegated_release(r, top, roles))
+            self.assertEqual(targets.resolve(path)[1]["target_role"], "nested")
+            self.assertEqual(checks[-1]["snapshot_link"]["hashes"]["sha256"], sha(winner))
+        # An earlier applicable role must resolve before a later valid descriptor can be considered.
+        targets, checks = self.check(delegated_release(r, top, roles, retained={"right": other}))
+        self.assertEqual(targets.resolve(path)[1]["status"], "delegated_metadata_missing")
+        self.assertEqual(len(checks), 1)
+
+    def test_parent_authority_is_checked_per_edge_and_path(self):
+        r = self.repo
+        paths = ["a/item", "b/item", "x/item"]
+        top = role_body(r, {}, [delegation(r, "one", ["a/*"]), delegation(r, "two", ["b/*"])])
+        one = role_body(r, {}, [delegation(r, "shared", ["*/*"])])
+        two = role_body(r, {}, [delegation(r, "shared", ["*/*"], signer="snapshot")])
+        leaf = role_body(r, {path: self.descriptor for path in paths})
+        roles = {name: r.sign("timestamp", body) for name, body in (("one", one), ("two", two), ("shared", leaf))}
+        targets, checks = self.check(delegated_release(r, top, roles))
+        self.assertEqual(targets.resolve(paths[0])[1]["target_role"], "shared")
+        self.assertEqual(targets.resolve(paths[1])[1]["status"], "signature_threshold_failed")
+        self.assertEqual(targets.resolve(paths[2])[1]["role_check_indices"], [])
+        self.assertEqual(targets.resolve("a/deeper/item")[1]["role_check_indices"], [])
+        self.assertEqual(targets.resolve(paths[0])[1]["role_check_indices"], [0, 1])
+        self.assertEqual(len(checks), 4)
+
+    def test_hash_prefixes_succinct_roles_and_cycles(self):
+        r, path = self.repo, "release/public"
+        prefix = hashlib.sha256(path.encode()).hexdigest()[:5]
+        rule = delegation(r, "bin", [])
+        del rule["paths"]
+        rule["path_hash_prefixes"] = [prefix]
+        top = role_body(r, {}, [rule])
+        nested = "bin-" + format(int(prefix, 16) >> 15, "02x")  # five high bits, padded to two hex digits
+        bins = dict(keys=r.base["root"]["keys"], succinct_roles=dict(name_prefix="bin", bit_length=5,
+                    keyids=r.quorum["snapshot"], threshold=1))
+        middle = role_body(r, {}, delegations=bins)
+        leaf = role_body(r, {path: self.descriptor}, [delegation(r, "bin", ["*/*"])])
+        roles = {"bin": r.sign("timestamp", middle), nested: r.sign("snapshot", leaf)}
+        targets, checks = self.check(delegated_release(r, top, roles))
+        target, result = targets.resolve(path)
+        self.assertEqual((target.length, result["target_role"]), (len(SOURCE), nested))
+        self.assertTrue(checks[-1]["terminating"])
+        self.assertIsNone(targets.resolve("release/other")[0])
+        leaf["targets"] = {}
+        roles[nested] = r.sign("snapshot", leaf)
+        targets, checks = self.check(delegated_release(r, top, roles))
+        self.assertEqual(targets.resolve(path)[1]["status"], "target_not_in_authorized_roles")
+        self.assertEqual(len(checks), 2)
+
+    def test_snapshot_signatures_expiry_and_encoding(self):
+        r, path = self.repo, "file.bin"
+        rule = delegation(r, "release", ["*"])
+        rule.update(keyids=r.quorum["targets"], threshold=2)
+        top = role_body(r, {}, [rule])
+        body = role_body(r, {path: self.descriptor}, version=7)
+        data = r.sign("targets", body)
+        for retained, link, expected in (
+                (data, None, "delegated_snapshot_entry_missing"),
+                (data, dict(version=6), "metadata_version_mismatch"),
+                (data, dict(version=7, length=len(data)+1), "metadata_length_or_hash_mismatch"),
+                (data, dict(version=7, hashes=dict(sha256="0"*64)), "metadata_length_or_hash_mismatch"),
+                (r.sign("targets", body, r.quorum["targets"][:1]), dict(version=7), "signature_threshold_failed"),
+                (r.sign("targets", dict(body, expires="2024-02-01T00:00:00Z")), dict(version=7), "expired_metadata"),
+                (data, dict(version=7), "found")):
+            targets, checks = self.check(delegated_release(r, top, {"release": data}, retained={"release": retained},
+                                                           links={"release": link}))
+            self.assertEqual(targets.resolve(path)[1]["status"], expected)
+            self.assertEqual(checks[0]["metadata_sha256"], sha(retained))
+        for invalid, reason in ((dict(version=True), "metadata_version_mismatch"),
+                                (dict(version=7, length=None), "invalid_metadata_length"),
+                                (dict(version=7, hashes=None), "invalid_metadata_hashes")):
+            bad = delegated_release(r, dict(top, targets={"local": self.descriptor}), {"release": data}, links={"release": invalid})
+            targets, checks = self.check(bad)
+            self.assertEqual(targets.resolve("local")[1]["target_role"], "targets")
+            self.assertEqual(targets.resolve(path)[1]["status"], reason)
+        for change in ({"threshold": True}, {"terminating": 1}, {"paths": "file.bin"}, {"name": "root"},
+                       {"path_hash_prefixes": []}, {"paths": ["../*"]}, {"keyids": [rule["keyids"][0]] * 2}):
+            bad = delegated_release(r, role_body(r, {}, [dict(rule, **change)]), {"release": data})
+            self.assertNotEqual(publisher.check_reference(bad, corpus.decode_document, self.anchor, TIME)[1]["status"], "verified")
+
+    def test_bounded_history_role_count_and_search(self):
+        r, path = self.repo, "one"
+        names = ["level-" + str(i) for i in range(publisher.MAX_DELEGATED_ROLES + 1)]
+        def branch(name):
+            return [delegation(r, name, ["*"])]
+        top = role_body(r, {}, branch(names[0]))
+        roles = {name: r.sign("timestamp", role_body(r, {}, branch(names[i+1])))
+                 for i, name in enumerate(names[:-1])}
+        ref = delegated_release(r, top, roles)
+        targets, checks = self.check(ref)
+        self.assertEqual(targets.resolve(path)[1]["status"], "delegation_search_limit")
+        self.assertEqual(len(checks), publisher.MAX_DELEGATED_ROLES)
+        roles[names[-2]] = r.sign("timestamp", role_body(r, {path: self.descriptor}))
+        targets, checks = self.check(delegated_release(r, top, roles))
+        self.assertEqual(targets.resolve(path)[1]["target_role"], names[-2])
+        self.assertEqual(len(checks), publisher.MAX_DELEGATED_ROLES)
+        doc = json.loads(ref)
+        for bad in (dict(doc, delegated_roles={**doc["delegated_roles"], names[-1]: "AA=="}),
+                    dict(doc, delegated_roles={"../outside": "AA=="}), dict(doc, delegated_roles={"targets": "AA=="}),
+                    dict(doc, root_updates=[doc["root"]] * 33)):
+            self.assertNotEqual(publisher.check_reference(raw(bad), corpus.decode_document, self.anchor, TIME)[1]["status"], "verified")
+
+
 class PublisherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -358,6 +525,26 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual((ratio["numerator"], ratio["denominator"]), (1, len(cases)))
             self.assertEqual(run(command + flags + ["--minimum-root-version", "0"], 2), b"")
             self.assertEqual(run(command + ["--minimum-root-version", "2"], 2), b"")
+
+            top = role_body(self.repo, {}, [delegation(self.repo, "release", ["file.bin"]),
+                                            delegation(self.repo, "absent", ["other"])])
+            leaf = self.repo.sign("timestamp", role_body(self.repo, self.repo.base["targets"]["targets"]))
+            delegated = keep(delegated_release(self.repo, top, {"release": leaf}))
+            new_plan = raw(dict(json.loads(plan), cases=[dict(c, truth_ref_sha256=delegated) for c in cases]))
+            new_results = raw(dict(json.loads(results), corpus_sha256=sha(new_plan)))
+            path = directory / "delegations.knbench"
+            members = set(inputs) - {ref, rotated}
+            receipt = archive.seal(path, new_plan, new_results, [inputs[k] for k in sorted(members)], members)
+            report = run(["--archive-corpus", path, "--sha256", receipt["package_sha256"],
+                          "--plan-sha256", sha(new_plan), *flags], 1)
+            self.assertEqual(report["schema"], "kn.benchmark_publisher_report.v2")
+            self.assertEqual(report["adjudicated_per_planned_case"], corpus.ratio(3, len(cases)))
+            by_case = {c["case_id"]: c for c in report["coverage"]["cases"]}
+            self.assertEqual([by_case[k]["publisher_truth"] for k in ("match", "different", "holes")],
+                             ["positive", "negative", "unknown"])
+            self.assertEqual(by_case["unlisted"]["truth_reason"], "delegated_metadata_missing")
+            self.assertEqual(by_case["match"]["delegation_search"]["target_role"], "release")
+            self.assertEqual(len(report["publisher_references"][0]["delegated_role_checks"]), 2)
 
     def test_changed_original_is_an_archive_failure(self):
         with self.assertRaisesRegex(ValueError, "changed"):

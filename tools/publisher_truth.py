@@ -22,6 +22,9 @@ ROLES = ("root", "timestamp", "snapshot", "targets")
 MAX_ROLE = 1 << 20
 MAX_SCOPE = 1 << 20
 MAX_ROOT_UPDATES = 32
+MAX_DELEGATED_ROLES = 32
+MAX_DELEGATION_SELECTORS = 256
+DELEGATED_REFERENCE = "kn.benchmark_tuf_reference.v3"
 TRUTHS = ("positive", "negative", "unknown")
 
 
@@ -94,10 +97,19 @@ def reference_updates(bundle):
     if bundle.get("schema") == "kn.benchmark_tuf_reference.v1":
         need(bundle.keys() == keys, "invalid_reference")
         return []
-    need(bundle.get("schema") == "kn.benchmark_tuf_reference.v2" and bundle.keys() == (keys | {"root_updates"}),
-         "invalid_reference")
+    delegated = bundle.get("schema") == DELEGATED_REFERENCE
+    if delegated:
+        need(bundle.keys() == keys | {"root_updates", "delegated_roles"}, "invalid_reference")
+        roles = bundle["delegated_roles"]
+        need(type(roles) is dict and len(roles) <= MAX_DELEGATED_ROLES, "invalid_delegated_roles")
+        for name, field in roles.items():
+            delegated_name(name)
+            need(type(field) is str and 0 < len(field) <= 4 * ((MAX_ROLE + 2) // 3), "invalid_role_bytes")
+    else:
+        need(bundle.get("schema") == "kn.benchmark_tuf_reference.v2" and bundle.keys() == keys | {"root_updates"},
+             "invalid_reference")
     updates = bundle["root_updates"]
-    need(type(updates) is list and 1 <= len(updates) <= MAX_ROOT_UPDATES, "invalid_root_updates")
+    need(type(updates) is list and (0 if delegated else 1) <= len(updates) <= MAX_ROOT_UPDATES, "invalid_root_updates")
     return updates
 
 
@@ -108,7 +120,51 @@ def role_bytes(field):
     return data
 
 
-def parse_role(data, role, decode):
+def delegated_name(name):
+    need(type(name) is str and name not in ROLES and 0 < len(name.encode("utf-8")) <= 128, "invalid_delegated_name")
+    target_name(name)
+
+
+def validate_delegations(delegations):
+    need(type(delegations) is dict and type(delegations.get("keys")) is dict and
+         (("roles" in delegations) != ("succinct_roles" in delegations)), "invalid_delegation_policy")
+    explicit = "roles" in delegations
+    policies = delegations["roles"] if explicit else [delegations["succinct_roles"]]
+    need(type(policies) is list and len(policies) <= MAX_DELEGATED_ROLES, "invalid_delegation_policy")
+    selectors = 0
+    for policy in policies:
+        keys, quorum = policy["keyids"], policy["threshold"]
+        need(type(keys) is list and all(type(k) is str and k in delegations["keys"] for k in keys)
+             and len(keys) == len(set(keys)) and type(quorum) is int and 1 <= quorum <= len(keys),
+             "invalid_role_threshold")
+        if explicit:
+            delegated_name(policy["name"])
+            need(type(policy["terminating"]) is bool and (("paths" in policy) != ("path_hash_prefixes" in policy)),
+                 "invalid_delegation_policy")
+            by_path = "paths" in policy
+            rules = policy["paths"] if by_path else policy["path_hash_prefixes"]
+            need(type(rules) is list, "invalid_delegation_policy")
+            selectors += len(rules)
+            need(selectors <= MAX_DELEGATION_SELECTORS, "delegation_selector_limit")
+            for rule in rules:
+                if by_path:
+                    target_name(rule)
+                else:
+                    need(type(rule) is str and re.fullmatch(r"[0-9a-f]{1,64}", rule), "invalid_delegation_policy")
+        else:
+            bits = policy["bit_length"]
+            need(type(bits) is int and 1 <= bits <= 32 and type(policy["name_prefix"]) is str
+                 and policy["name_prefix"], "invalid_delegation_policy")
+            delegated_name(policy["name_prefix"] + "-" + "f" * ((bits + 3) // 4))
+
+
+def validate_link(link):
+    need(type(link["version"]) is int and link["version"] > 0, "metadata_version_mismatch")
+    need("length" not in link or type(link["length"]) is int and link["length"] >= 0, "invalid_metadata_length")
+    need("hashes" not in link or strong_hashes(link["hashes"]), "invalid_metadata_hashes")
+
+
+def parse_role(data, role, decode, *, delegated=False, invalid_links=None):
     document = decode(data)
     signed = document["signed"]
     need(signed["_type"] == role and type(signed["version"]) is int and signed["version"] > 0 and
@@ -121,11 +177,16 @@ def parse_role(data, role, decode):
                  type(policy["threshold"]) is int and 1 <= policy["threshold"] <= len(keyids), "invalid_role_threshold")
     if role in ("timestamp", "snapshot"):
         child = "snapshot.json" if role == "timestamp" else "targets.json"
-        link = signed["meta"][child]
         # The TUF decoder folds JSON null and an omitted field into the same optional value.
-        need(type(link["version"]) is int and link["version"] > 0, "metadata_version_mismatch")
-        need("length" not in link or type(link["length"]) is int and link["length"] >= 0, "invalid_metadata_length")
-        need("hashes" not in link or strong_hashes(link["hashes"]), "invalid_metadata_hashes")
+        validate_link(signed["meta"][child])
+        if role == "snapshot" and invalid_links is not None:
+            for name, link in signed["meta"].items():
+                try:
+                    validate_link(link)
+                except Rejected as exc:
+                    invalid_links[name] = str(exc)
+    if delegated and role == "targets" and "delegations" in signed:
+        validate_delegations(signed["delegations"])
     # Preserve exactly what was signed before the typed decoder consumes the mapping.
     payload = encode_canonical(signed).encode("utf-8")
     return Metadata.from_dict(document), payload
@@ -161,6 +222,101 @@ def role_receipt(signed, result):
                 expires=signed.expires.strftime("%Y-%m-%dT%H:%M:%SZ"))
 
 
+class DelegatedTargets:
+    """Resolve a target using only the role bytes held in one verified release."""
+
+    def __init__(self, top, snapshot, invalid_links, originals, decode, instant, checks):
+        self.top = top
+        self.snapshot = snapshot
+        self.invalid_links = invalid_links
+        self.originals = originals
+        self.decode = decode
+        self.instant = instant
+        self.checks = checks
+        self.loaded = {}
+        self.edges = {}
+
+    def load(self, name, receipt):
+        # Parsing and snapshot checks are shared. Signing authority depends on the parent.
+        if name not in self.loaded:
+            need(name in self.originals, "delegated_metadata_missing")
+            data = role_bytes(self.originals[name])
+            details = dict(metadata_sha256=hashlib.sha256(data).hexdigest())
+            receipt.update(details)
+            filename = name + ".json"
+            if filename in self.invalid_links:
+                raise Rejected(self.invalid_links[filename])
+            link = self.snapshot.meta.get(filename)
+            need(link is not None, "delegated_snapshot_entry_missing")
+            details["snapshot_link"] = dict(version=link.version, length=link.length, hashes=link.hashes)
+            receipt.update(details)
+            link.verify_length_and_hashes(data)
+            metadata, payload = parse_role(data, "targets", self.decode, delegated=True)
+            need(metadata.signed.version == link.version, "metadata_version_mismatch")
+            self.loaded[name] = metadata, payload, details
+        metadata, payload, details = self.loaded[name]
+        receipt.update(details)
+        return metadata, payload
+
+    def verify_edge(self, parent_name, parent, name, terminating):
+        edge = parent_name, name
+        if edge in self.edges:
+            return self.edges[edge]
+        receipt = dict(parent_role=parent_name, delegated_role=name, terminating=terminating)
+        child = None
+        try:
+            metadata, payload = self.load(name, receipt)
+            result = parent.get_verification_result(name, payload, metadata.signatures)
+            receipt.update(role_receipt(metadata.signed, result))
+            need(bool(result), "signature_threshold_failed")
+            need(not metadata.signed.is_expired(self.instant), "expired_metadata")
+            receipt["status"] = "verified"
+            child = metadata.signed
+        except Rejected as exc:
+            receipt["status"] = str(exc)
+        except LengthOrHashMismatchError:
+            receipt["status"] = "metadata_length_or_hash_mismatch"
+        except (KeyError, IndexError, TypeError, ValueError, AttributeError, OverflowError,
+                RecursionError, RepositoryError, SigningLibraryError):
+            receipt["status"] = "invalid_role_metadata"
+        index = len(self.checks)
+        self.checks.append(receipt)
+        self.edges[edge] = child, index
+        return child, index
+
+    def resolve(self, path):
+        search = dict(role_check_indices=[], target_role=None, status="target_not_in_authorized_roles")
+        stack = [("targets", None, False)]
+        visited = {}
+        while stack:
+            name, parent, terminating = stack.pop()
+            if name in visited:
+                continue
+            current = self.top
+            if parent is not None:
+                if len(visited) > MAX_DELEGATED_ROLES:
+                    search.update(status="delegation_search_limit", failed_role=name)
+                    return None, search
+                current, index = self.verify_edge(parent, visited[parent], name, terminating)
+                search["role_check_indices"].append(index)
+                if current is None:
+                    search.update(status=self.checks[index]["status"], failed_role=name)
+                    return None, search
+            visited[name] = current
+            if path in current.targets:
+                search.update(target_role=name, status="found")
+                return current.targets[path], search
+            if current.delegations is not None:
+                children = []
+                for child, terminal in current.delegations.get_roles_for_target(path):
+                    children.append((child, name, terminal))
+                    if terminal:
+                        stack.clear()  # This subtree also takes precedence over pending ancestors' siblings.
+                        break
+                stack.extend(reversed(children))
+        return None, search
+
+
 def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
     versions, links = {}, {}
     proof = {} if minimum_version is None else dict(minimum_root_version=minimum_version)
@@ -168,7 +324,11 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
     try:
         need(0 < len(raw) <= MAX_DOCUMENT, "invalid_reference")
         bundle = decode(raw)
+        delegated = type(bundle) is dict and bundle.get("schema") == DELEGATED_REFERENCE
+        if delegated:
+            proof["delegated_role_checks"] = []
         updates = reference_updates(bundle)
+        invalid_links = {} if delegated else None
         role = "root"
         root, result = verified_root(bundle[role], updates, decode, trusted_root, proof)
         # Historical roots authorize the next transition. Only the terminal root authorizes these roles.
@@ -178,7 +338,7 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
         parent_link = None
         for role in ROLES[1:]:
             data = role_bytes(bundle[role])
-            metadata, payload = parse_role(data, role, decode)
+            metadata, payload = parse_role(data, role, decode, delegated=delegated, invalid_links=invalid_links)
             version = metadata.signed.version
             result = root.get_verification_result(role, payload, metadata.signatures)
             need(bool(result), "signature_threshold_failed")
@@ -191,8 +351,13 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
             if role == "timestamp":
                 parent_link = metadata.signed.snapshot_meta
             elif role == "snapshot":
-                parent_link = metadata.signed.meta["targets.json"]
-        return metadata.signed.targets, dict(status="verified", roles=versions, metadata_links=links, **proof)
+                snapshot = metadata.signed
+                parent_link = snapshot.meta["targets.json"]
+        targets = metadata.signed.targets
+        if delegated:
+            targets = DelegatedTargets(metadata.signed, snapshot, invalid_links, bundle["delegated_roles"], decode, instant,
+                                       proof["delegated_role_checks"])
+        return targets, dict(status="verified", roles=versions, metadata_links=links, **proof)
     except Rejected as exc:
         reason = str(exc)
     except LengthOrHashMismatchError:
@@ -205,13 +370,19 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
 def compare_target(scope, pin, original, targets, stream, sha512_cache):
     name, file_bytes, has_holes = scope
     details = dict(target_path=name, file_bytes=file_bytes)
+    if isinstance(targets, DelegatedTargets):
+        target, search = targets.resolve(name)
+        details["delegation_search"] = search
+        absent = search["status"]
+    else:
+        target = targets.get(name)
+        absent = "target_not_in_top_level"
     if original is None:
         return "unknown", "artifact_missing", details
     if has_holes or original[1] != file_bytes:
         return "unknown", "incomplete_file", details
-    target = targets.get(name)
     if target is None:
-        return "unknown", "target_not_in_top_level", details
+        return "unknown", absent, details
     hashes = target.hashes
     if type(target.length) is not int or target.length < 0 or not strong_hashes(hashes):
         return "unknown", "unsupported_target_descriptor", details
@@ -257,7 +428,6 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
             targets, proof = {}, dict(status="reference_" + gap)
         else:
             targets, proof = check_reference(data, decode, trusted_root, instant, minimum_version)
-        references.append(dict(truth_ref_sha256=ref, **proof))
         status = proof["status"]
         failed += status not in ("verified", "reference_missing")
         for key in group:
@@ -272,12 +442,16 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                 if scope is not None:
                     pin = case["artifact_sha256"]
                     truth, reason, details = compare_target(scope, pin, objects.get(pin), targets, stream, sha512_cache)
+                    search = details.get("delegation_search")
+                    if search and search["status"] not in ("found", "target_not_in_authorized_roles"):
+                        failed += 1
             derived[key]["truth"] = truth
             coverage[key].update(publisher_truth=truth, truth_reason=reason, truth_ref_sha256=ref,
                                  artifact_sha256=case["artifact_sha256"], **details)
             adjudicated += truth != "unknown"
             confirmed += truth != "unknown" and truth == case["truth"]
             contradictions += truth != "unknown" and case["truth"] not in ("unknown", truth)
+        references.append(dict(truth_ref_sha256=ref, **proof))
 
     declared = Counter(c["truth"] for c in cases.values())
     if minimum_version is not None:
@@ -289,4 +463,6 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                   publisher_references=references, publisher_task_cases=sum(map(len, groups.values())),
                   registered_truth={t: declared[t] for t in TRUTHS}, confirmed_labels=confirmed,
                   contradicted_labels=contradictions, adjudicated_per_planned_case=ratio(adjudicated, len(cases)))
+    if any("delegated_role_checks" in ref for ref in references):
+        report.update(schema="kn.benchmark_publisher_report.v2", truth_basis="whole_file_against_signed_tuf_target")
     return derived, int(bool(failed))

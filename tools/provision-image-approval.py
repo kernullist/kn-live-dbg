@@ -44,10 +44,10 @@ def main(argv):
         return 2
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     for flag, help_text in (
-            ("--publisher-reference", "retained TUF roles and any signed root updates"),
+            ("--publisher-reference", "retained TUF release metadata, root updates and delegated roles"),
             ("--trusted-root-sha256", "independently provisioned SHA-256 of the publisher's initial root metadata"),
             ("--verification-time", "UTC instant in YYYYMMDDTHHMMSSZ form"),
-            ("--policy-target", "name in the signed top-level targets role"),
+            ("--policy-target", "exact target path authorized by the TUF publisher"),
             ("--policy", "publisher's exact native image approval policy file"),
             ("--manifest", "exact native image change manifest"),
             ("--reference", "complete retained PE reference bytes"),

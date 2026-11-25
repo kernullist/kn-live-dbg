@@ -403,11 +403,13 @@ ETL_ROTATION_FIELDS = tuple(frozenset(fields) for fields in (
 RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v1", "kn.benchmark_original_recovery.v1",
                     "kn.process_image_source.v1", "kn.image_source_replay.v1", "kn.image_source_collection.v1", "kn.image_source_session.v1",
                     "kn.image_iat_reference.v1", "kn.minidump_iat_observation.v1", "kn.minidump_import_declaration.v1", "kn.minidump_iat_archive.v1",
-                    "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1",
+                    "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1", "kn.benchmark_publisher_report.v2",
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
-                    "kn.image_approval_provision.v1",
+                    "kn.benchmark_tuf_reference.v3", "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
-RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"archive_requires_efs"', '"packing_reader_sha256"', '"original_report_reproduced"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
+RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"delegated_roles"', '"delegated_role_checks"', '"delegation_search"', '"role_check_indices"', '"delegated_role"', '"snapshot_link"',
+                    '"spec_version"', '"terminating"', '"name_prefix"',
+                    '"archive_requires_efs"', '"packing_reader_sha256"', '"original_report_reproduced"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
                     '"iat_slot_rva"', '"import_lookup_rva"', '"instruction_reread"',
                     '"slot_value_sha256"', '"slot_file_spans"', '"instruction_file_spans"', '"module_list_index"',
@@ -447,6 +449,10 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("signer_certificate_sha256",), ("catalog_member_sha256",), ("catalog_sha256", "catalog_bytes"),
     ("wintrust_status",), ("win32_status", "finished_utc"),
     ("root_updates",), ("root_rotation",), ("last_root_sha256",), ("anchor_version", "presented_updates"),
+    ("delegated_roles",), ("delegated_role_checks",), ("delegation_search",), ("role_check_indices",),
+    ("parent_role", "delegated_role"), ("snapshot_link", "metadata_sha256"),
+    ("_type", "spec_version", "targets"), ("keyids", "threshold", "terminating"),
+    ("keyids", "threshold", "name_prefix", "bit_length"),
     ("presented_updates", "verified_updates"), ("verified_updates", "last_root_version"), ("minimum_root_version", "failed_role"),
 ))
 DETACHED_FIELD_SETS = LOADER_WINDOW_FIELDS + RETAINED_FIELDS + READY_ORIGIN_FIELDS + WAIT_PLAN_FIELDS + DUMP_EVIDENCE_FIELDS + ETL_ROTATION_FIELDS + tuple(frozenset(fields) for fields in (

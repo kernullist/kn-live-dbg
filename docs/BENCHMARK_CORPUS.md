@@ -599,6 +599,10 @@ file. A `kn.benchmark_tuf_reference.v2` envelope also contains `root_updates`,
 an array of 1 to 32 Base64-encoded successor roots in version order. The
 `root` field always holds the original independently pinned root. The last
 successor supplies the keys for `timestamp`, `snapshot` and `targets`.
+Use `kn.benchmark_tuf_reference.v3` when a target is published by a delegated
+role. Its `root_updates` array may be empty. Its `delegated_roles` object maps
+each retained role name to the Base64 encoding of that original metadata file.
+The signed parent determines which roles can authorize a given path.
 Several cases can share a reference. The per-case hole map uses
 `kn.benchmark_target_scope.v1`. Record the exact, case-sensitive target name,
 the acquisition's declared file size in bytes and its sorted, nonoverlapping
@@ -611,14 +615,24 @@ other roles from the revision being evaluated. Set `$rootUpdates` to an
 ordered array of paths to successive root files, or `@()` for v1. For
 example, for a v5 anchor and v16 terminal root in the same metadata directory,
 use `$rootUpdates = @(6..16 | ForEach-Object { Join-Path $metadata "$_.root.json" })`.
+For delegated verification, set `$delegatedRoles` to a hashtable of role
+names and local files. For example, Sigstore's npm role can be supplied with
+`$delegatedRoles = @{ 'registry.npmjs.org' = (Join-Path $metadata 'registry.npmjs.org.json') }`.
+An empty hashtable or an unset variable keeps the v1/v2 format.
 Set `$work` to the empty working directory,
 `$targetName` to the signed name and `$capturedSize` to the whole-file size
 recorded during acquisition. Use the recorded missing intervals for a capture
 with gaps.
 
 ```powershell
+$roleArgs = @()
+if ((Test-Path variable:delegatedRoles) -and $null -ne $delegatedRoles) {
+    foreach ($entry in $delegatedRoles.GetEnumerator()) {
+        $roleArgs += @('--delegated-role', $entry.Key, $entry.Value)
+    }
+}
 @'
-import base64, json, sys
+import argparse, base64, json, sys
 from pathlib import Path
 metadata, work = map(Path, sys.argv[1:3])
 def role_bytes(path):
@@ -631,12 +645,18 @@ def role_bytes(path):
 reference = dict(schema="kn.benchmark_tuf_reference.v1")
 for role in ("root", "timestamp", "snapshot", "targets"):
     reference[role] = role_bytes(metadata / (role + ".json"))
-updates = sys.argv[5:]
-if len(updates) > 32:
-    raise ValueError("too many root updates")
-if updates:
+parser = argparse.ArgumentParser(allow_abbrev=False)
+parser.add_argument("updates", nargs="*")
+parser.add_argument("--delegated-role", nargs=2, action="append", default=[])
+args = parser.parse_args(sys.argv[5:])
+if len(args.updates) > 32 or len(args.delegated_role) > 32:
+    raise ValueError("too many root updates or delegated roles")
+if args.updates or args.delegated_role:
     reference["schema"] = "kn.benchmark_tuf_reference.v2"
-    reference["root_updates"] = [role_bytes(Path(p)) for p in updates]
+    reference["root_updates"] = [role_bytes(Path(p)) for p in args.updates]
+if args.delegated_role:
+    reference["schema"] = "kn.benchmark_tuf_reference.v3"
+    reference["delegated_roles"] = {name: role_bytes(Path(p)) for name, p in args.delegated_role}
 scope = dict(schema="kn.benchmark_target_scope.v1", target_path=sys.argv[3], file_bytes=int(sys.argv[4]), missing=[])
 for name, document in (("publisher.json", reference), ("scope.json", scope)):
     encoded = json.dumps(document, separators=(",", ":")).encode("utf-8")
@@ -644,7 +664,7 @@ for name, document in (("publisher.json", reference), ("scope.json", scope)):
         raise ValueError("document exceeds its size limit")
     with (work / name).open("xb") as out:
         out.write(encoded)
-'@ | python -B - $metadata $work $targetName $capturedSize @rootUpdates
+'@ | python -B - $metadata $work $targetName $capturedSize @rootUpdates @roleArgs
 if ($LASTEXITCODE -ne 0) { throw 'Could not prepare publisher inputs' }
 ```
 
@@ -682,14 +702,27 @@ must also match. The report records the actual link fields and the number of
 valid key IDs for each role. A version-only link remains visible. For a root
 history, `root_rotation` records the starting version, the presented and
 verified update counts, and the version and raw SHA-256 of the last root whose
-signatures passed. The reference's top-level `status` determines acceptance.
-The operator's optional `--minimum-root-version` applies to both envelope
-versions. It accepts decimal integers from 1 through 2⁶³−1. Replay evaluates
-the retained top-level targets. Timestamp and snapshot rollback checks across
-runs require a client's previously trusted metadata. Online discovery of
-newer revisions, delegated targets and proof of historical publication remain
-outside this check.
+signatures passed. The reference's top-level `status` records whether the
+root and release metadata passed. The optional `--minimum-root-version`
+applies to all three envelope versions and accepts decimal integers from 1
+through 2⁶³−1. Timestamp and snapshot rollback checks across runs require a
+client's previously trusted metadata. Discovering newer revisions and proving
+historical publication require independent evidence.
 [TUF root update rules](https://theupdateframework.github.io/specification/latest/#update-root)
+
+For v3, read the individual case's `delegation_search` as well. The reader
+checks the exact target path in signed order, starting at the top-level role.
+It follows matching path patterns, path hash prefixes and succinct hash bins.
+A terminating delegation cuts off later alternatives. A missing, invalid or
+expired role on the search path suspends that lookup. Other target paths in
+the same release can still resolve. The indices in `role_check_indices`
+refer to the reference's zero-based `delegated_role_checks` list. Each entry
+identifies the parent, child and result. Available evidence includes the raw
+metadata digest, snapshot link, role version, signature threshold and expiry.
+The lookup accepts 32 retained delegated roles and visits up to 32 per target.
+Each role may declare up to 32 explicit children and 256 path selectors in
+total. Role names may occupy up to 128 UTF-8 bytes.
+[TUF target lookup](https://theupdateframework.github.io/specification/latest/#update-targets)
 
 A positive file matches the signed length and every signed digest. A complete
 file that differs is negative. Missing originals, unsupported digests,
@@ -700,12 +733,15 @@ hole map may occupy up to 1 MiB. The reference envelope may occupy up to
 8 MiB.
 
 `kn.benchmark_publisher_report.v1` keeps every planned case, its registered
-truth and imported outcome. The scoped and per-family metrics use the
-publisher-derived truths and assessments backed by retained originals.
+truth and imported outcome. A report that processes a v3 reference uses
+`kn.benchmark_publisher_report.v2` and includes its target lookups. The
+scoped and per-family metrics use the publisher-derived truths and
+assessments backed by retained originals.
 A missing assessment for a known positive stays in end-to-end recall. The
 compact JSON report has a 32 MiB limit and escapes non-ASCII target names.
 Exit 0 returns the report, including partial file observations. Exit 1
-returns a report with at least one retained reference rejected. Exit 2
+returns a report with a rejected reference or an incomplete delegation
+search caused by missing or invalid metadata or the search bound. Exit 2
 indicates invalid arguments, a missing verifier dependency, an archive
 integrity failure or an I/O failure. The ordinary replay command continues
 to score the submitted labels. [Sigstore file study](VALIDATION.md#publisher-file-comparisons-on-2026-11-24)

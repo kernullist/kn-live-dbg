@@ -195,7 +195,11 @@ def select_approval(args, receipt, publisher, parameters):
     approved = next((row for row in policy["approvals"] if all(row[k] == v for k, v in selected.items())), None)
     require(approved is not None, "approval_tuple_missing")
     # Both the captured observation and the assessment must fit the resulting native half-open window.
-    role_expiry = min(filetime(datetime.fromisoformat(v["expires"])) for v in proof["roles"].values())
+    # An earlier role inspected in the ordered search can supersede the selected sibling on renewal.
+    authorities = list(proof["roles"].values())
+    if "delegation_search" in descriptor:
+        authorities.extend(proof["delegated_role_checks"][i] for i in descriptor["delegation_search"]["role_check_indices"])
+    role_expiry = min(filetime(datetime.fromisoformat(v["expires"])) for v in authorities)
     start, stop = max(start, lower), min(stop, upper, role_expiry)
     require(start <= at < stop, "outside_approval_window")
     projected = dict(policy, schema="kn.image_approval_policy.v1", not_before_filetime=str(start),

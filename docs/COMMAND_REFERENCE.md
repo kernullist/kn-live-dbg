@@ -633,7 +633,12 @@ to the exact published policy file, `$manifest` to the change manifest and
 `$reference` to the whole retained PE file or its `.knblob` (up to 64 MiB).
 Use the approval authority's independently configured `$trustedRootSha256`
 for the initial root and its case-sensitive `$policyTarget`. A v2 reference
-can carry up to 32 successive root revisions. Set `$minimumRootVersion` to
+can carry up to 32 successive root revisions. A v3 reference also retains
+delegated roles for that path. The receipt records the ordered search, and
+every consulted role's expiry limits the native approval window.
+[Prepare the publisher reference](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release)
+
+Set `$minimumRootVersion` to
 the last trusted root version recorded for this authority, or to `$null`
 to leave that check unset. Supply `$verificationTime` as UTC in
 `YYYYMMDDTHHMMSSZ` form, `$selectedPolicy` as a new filename in a private
@@ -752,7 +757,9 @@ Use the same publisher, target and UTC instant as at issuance. Supply the
 original receipt digest from the case record and `$debuggerSha256` from
 the trusted installation. Set `$journalHeadSha256` to a separately recorded
 closure head, or `$null` to verify membership using the archived chain.
-The optional minimum root version also applies at replay.
+The optional minimum root version also applies at replay. For a delegated
+approval, replay verifies the original search and its per-parent signatures
+using the metadata inside the archive.
 
 ```powershell
 $archiveOptions = @('--debugger', $debugger, '--debugger-sha256', $debuggerSha256,

@@ -822,7 +822,12 @@ class PublicContentTests(unittest.TestCase):
         samples = (dict(schema="kn.benchmark_tuf_reference.v2"), dict(root_updates=["metadata"]),
                    dict(root_rotation={}), dict(last_root_sha256=None), dict(anchor_version=5, presented_updates=11),
                    dict(presented_updates=2, verified_updates=1), dict(verified_updates=3, last_root_version=8),
-                   dict(minimum_root_version=2, failed_role="root"))
+                   dict(minimum_root_version=2, failed_role="root"), dict(schema="kn.benchmark_tuf_reference.v3"),
+                   dict(schema="kn.benchmark_publisher_report.v2"), dict(delegated_roles={"example": "metadata"}),
+                   dict(delegated_role_checks=[]), dict(delegation_search={}), dict(role_check_indices=[], target_role=None),
+                   dict(parent_role="targets", delegated_role="example"), dict(snapshot_link={}, metadata_sha256="a"),
+                   dict(_type="targets", spec_version="1.0", targets={}),
+                   dict(keyids=[], threshold=1, terminating=True), dict(keyids=[], threshold=1, name_prefix="bin", bit_length=8))
         for sample in samples:
             for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
                 data = ("record\n" + json.dumps({"part": [sample]})[:-2]).encode(encoding)

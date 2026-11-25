@@ -3966,9 +3966,10 @@ separate journal policies. Each updated policy requires its own explicit digest.
 
 ### Publisher-signed image approval policies
 
-An organization can distribute its image approval policy as a named top-level
-TUF target. The operator configures the authority's trusted root digest and
-target name independently of the capture. `tools/provision-image-approval.py`
+An organization can distribute its image approval policy as a TUF target,
+either directly or through a delegated role. The operator configures the
+authority's trusted root digest and target name independently of the capture.
+`tools/provision-image-approval.py`
 verifies the retained root, timestamp, snapshot and targets metadata at an
 explicit UTC instant. It checks the exact published policy bytes against the
 signed length and every declared target hash. It validates every policy row
@@ -3977,7 +3978,8 @@ change manifest and issuer. The manifest and policy epochs must agree.
 
 The tool writes a new single-row native policy and returns its SHA-256. Its
 validity starts at the later of the policy and manifest start times and ends
-at the earliest of their end times and the four metadata expirations. The
+at the earliest of their end times and the expirations of the four release
+roles and every delegated role consulted for this target. The
 verification instant must fall inside that half-open window. This allows a
 publisher to endorse an earlier capture within its stated window. The native
 assessment independently checks the capture and evaluation times, reopens the
@@ -4024,11 +4026,19 @@ the derived native policy. An independently recorded minimum root version
 lets the operator reject an older terminal revision. Both single-root and
 rotated references work with either source approval policy.
 
+A v3 publisher reference can retain the delegated metadata for several target
+paths in the same release. Each lookup starts with the signed top-level targets
+role. For each applicable delegation it checks the snapshot's version and
+any length or hashes, then verifies the child's signatures with the keys and
+threshold selected by that parent. An earlier sibling's metadata can affect
+which policy wins. Its expiry therefore also limits the issued approval. The
+provisioning receipt identifies the consulted roles and the role that supplied
+the policy. Portable replay checks that receipt against the original envelope.
+
 The portable archive below binds the original roots and release roles, source
 policy and issuance receipt to one closed native collection. The operator
-keeps the trust configuration independently. Discovering a newer revision,
-delegated targets and evidence of revocation between retained revisions
-remain open. See the
+keeps the trust configuration independently. Discovering a newer revision
+and establishing revocation between retained revisions remain open. See the
 [publisher reference format](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release).
 
 ### Portable publisher approval archives

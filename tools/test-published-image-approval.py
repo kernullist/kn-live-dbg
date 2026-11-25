@@ -93,6 +93,46 @@ class ApprovalFixture(unittest.TestCase):
         return receipt
 
 class ApprovalTests(ApprovalFixture):
+    def delegate_policy(self, expiry, earlier):
+        repo = self.repository
+        source = self.source.read_bytes()
+        rules = [T["delegation"](repo, name, ["approval/windows/*"]) for name in ("first", "release")]
+        top = T["role_body"](repo, {}, rules, expires=expiry)
+        leaf = T["role_body"](repo, {NAME: dict(length=len(source), hashes=dict(sha256=sha(source)))}, expires=expiry)
+        roles = dict(first=repo.sign("timestamp", T["role_body"](repo, {}, expires=earlier)),
+                     release=repo.sign("timestamp", leaf))
+        self.env.write_bytes(T["delegated_release"](repo, top, roles, expires=expiry))
+        self.root_pin = sha(repo.files({"root": {"expires": expiry}})["root"])
+
+    def test_delegated_approval_uses_all_consulted_expiries(self):
+        self.delegate_policy("2024-08-01T00:00:00Z", "2024-03-01T00:00:00Z")
+        receipt = self.call(0, out=self.root / "accepted.knapproval")
+        self.assertEqual(receipt["policy_target_comparison"]["delegation_search"],
+                         dict(status="found", target_role="release", role_check_indices=[0, 1]))
+        self.assertEqual([row["delegated_role"] for row in receipt["publisher_proof"]["delegated_role_checks"]],
+                         ["first", "release"])
+        self.assertEqual(int(receipt["not_after_filetime"]), P["filetime"](datetime(2024, 3, 1, tzinfo=timezone.utc)))
+        denied = self.call(1, verification_time="20240301T000000Z")
+        self.assertEqual(denied["reason"], "expired_metadata")
+        self.assertEqual(denied["policy_target_comparison"]["delegation_search"]["failed_role"], "first")
+        self.assertEqual(self.call(1, policy_target="outside/sub/policy.json")["reason"], "target_not_in_authorized_roles")
+
+    def test_delegated_native_archive(self):
+        if not native_cases:
+            self.skipTest("supply a retained native case for delegated policy archive replay")
+        capture, manifest, reference = native_cases[0]
+        change = json.loads(manifest.read_bytes())
+        row = dict(image_sha256=sha(reference.read_bytes()), manifest_sha256=sha(manifest.read_bytes()),
+                   issuer=change["issuer"])
+        self.source.write_bytes(raw(dict(self.policy, approvals=[row], policy_epoch=change["policy_epoch"])))
+        now = datetime.now(timezone.utc)
+        self.delegate_policy((now + timedelta(days=2)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                             (now + timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        at = now.strftime("%Y%m%dT%H%M%SZ")
+        self.call(0, manifest=manifest, reference=reference, verification_time=at)
+        verify_archived_approval(native_exe, capture, manifest, self.out, self.env, self.source, self.provision_bytes,
+                                 self.root_pin, NAME, at)
+
     def test_provision_with_rotated_approval_authority(self):
         replacement = T["Repository"]()
         anchor = self.repository.files({"root": {"expires": "2023-01-01T00:00:00Z"}})["root"]

@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Delegated publisher targets
+
+On 2026-11-25 the offline verifier evaluated ten registered file cases
+from one Sigstore release and its controls. It followed eleven signed root
+updates to root 16. The top-level targets role delegated the npm path to a
+terminating role. Version 9 of that role signed the length and digest of
+the 2,121-byte `registry.npmjs.org/keys.json`. Python-TUF's updater resolved
+the same target from a local copy of the release. A separate OpenSSL check
+verified the delegated signature and rejected a changed signed payload.
+[Sigstore's retained delegated metadata](https://github.com/sigstore/root-signing/blob/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata/registry.npmjs.org.json)
+
+Three cases matched the publisher and one complete file differed. Six
+remained unknown, including a missing delegate, a changed signed descriptor
+and a lookup outside the authorized path. The snapshot linked this role by
+version alone. Adding whitespace outside its signed payload preserved the
+match and changed the observed metadata digest. The top-level target still
+matched when the delegated file was absent. All ten outcomes reproduced
+from the pinned corpus archive.
+
+In a separate owned image case, a delegated policy authorized the original
+native assessment after the source collection was removed. The portable
+archive reproduced the provisioning receipt and assessment. An earlier
+applicable sibling with a shorter lifetime capped the approval window in
+the expiry control. These runs cover the selected release and test
+authority. Cross-run timestamp and snapshot rollback checks remain open.
+[Publisher verification and report fields](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release)
+
 ## Cross-channel bugcheck reports
 
 On 2026-11-25 the development x64 Release reader compared one saved

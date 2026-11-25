@@ -346,7 +346,7 @@ def main(argv):
                                 ("--debugger-sha256", "independent digest of that executable"),
                                 ("--receipt-sha256", "independently recorded digest of the original provisioning receipt"),
                                 ("--trusted-root-sha256", "independent digest of the publisher's initial TUF root"),
-                                ("--policy-target", "expected signed top-level policy target"),
+                                ("--policy-target", "exact publisher-authorized policy target path"),
                                 ("--verification-time", "original UTC verification time, YYYYMMDDTHHMMSSZ")):
             op.add_argument(flag, required=True, help=help_text)
         op.add_argument("--journal-head-sha256", help="independently recorded native closure head")
