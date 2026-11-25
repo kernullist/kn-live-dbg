@@ -2943,6 +2943,7 @@ TimelineIngestResult TimelineStore::IngestSnapshotDiff(
         event.Evidence = record.Evidence;
         event.Evidence[L"source"] = sourceName;
         event.Evidence[L"diff_kind"] = event.Action;
+        event.Evidence[L"snapshot_boot_comparison"] = diff.BootBasis;
         AddEvidenceIfPresent(&event.Evidence, L"baseline_label", diff.BaselineLabel);
         AddEvidenceIfPresent(&event.Evidence, L"current_label", diff.CurrentLabel);
         AddEvidenceIfPresent(&event.Evidence, L"display", record.Display);

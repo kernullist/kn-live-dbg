@@ -34,6 +34,8 @@ struct SnapshotRecord
     std::map<std::wstring, std::wstring> Evidence;
 };
 
+enum class SnapshotBootSource { Unspecified, LocalCapture, NoReceipt, UnverifiedReceipt, LocalReceipt };
+
 struct SnapshotDocument
 {
     std::wstring Schema;
@@ -43,6 +45,7 @@ struct SnapshotDocument
     std::wstring ReportPath;
     std::wstring BootId;
     bool SameBootOnly = true;
+    SnapshotBootSource BootSource = SnapshotBootSource::Unspecified;
     std::map<std::wstring, std::wstring> Metadata;
     std::map<std::wstring, std::vector<std::wstring>> DomainWarnings;
     std::vector<SnapshotProcessRecord> Processes;
@@ -63,6 +66,8 @@ std::wstring SnapshotToLower(const std::wstring& value);
 std::wstring SnapshotHex(uint64_t value, uint32_t width = 0);
 std::wstring SnapshotCurrentUtcTimestamp();
 std::wstring SnapshotCurrentBootId();
+bool SnapshotHasBootGuid(const std::wstring& id);
+const wchar_t* SnapshotBootSourceName(SnapshotBootSource source);
 std::wstring SnapshotSafeFileComponent(const std::wstring& value);
 std::wstring SnapshotRiskNormalize(const std::wstring& risk);
 uint32_t SnapshotRiskRank(const std::wstring& risk);

@@ -6734,6 +6734,8 @@ static void PrintDiffHelp()
     std::wcout << L"\n";
     std::wcout << L"description:\n";
     std::wcout << L"  /memory skips current-snapshot and diff report file writes.\n";
+    std::wcout << L"  Saved same-boot findings require both local receipts. bootBasis explains the comparison.\n";
+    std::wcout << L"  Offline summary: KnLiveDbg.exe --offline !diff <old.json> <new.json> /summary /json\n";
     std::wcout << L"  Compares snapshots with new-focused semantics: records absent from baseline\n";
     std::wcout << L"  but present now, plus high-risk escalations. !diff baseline captures a fresh\n";
     std::wcout << L"  current snapshot, scans VAD DKOM for newly live processes, writes JSON and\n";
@@ -6815,6 +6817,14 @@ static bool ParseSnapshotNameOption(
     return ok;
 }
 
+static bool WriteCapturedSnapshot(const std::wstring& path, const SnapshotDocument& document, std::wstring* error)
+{
+    bool sealed = false;
+    const bool saved = WriteSnapshotJsonFile(path, document, error, &sealed);
+    if (saved && !sealed) { std::wcerr << L"[snapshot.warning] saved without a verifiable local boot receipt\n"; }
+    return saved;
+}
+
 static bool FinalizeAndWriteSnapshot(
     SnapshotDocument* document,
     const std::wstring& jsonPath,
@@ -6834,7 +6844,7 @@ static bool FinalizeAndWriteSnapshot(
         document->JsonPath = jsonPath;
         document->ReportPath = reportPath;
 
-        if (!WriteSnapshotJsonFile(jsonPath, *document, &error))
+        if (!WriteCapturedSnapshot(jsonPath, *document, &error))
         {
             std::wcerr << L"!snapshot json failed: " << error << L"\n";
             break;
@@ -7241,7 +7251,7 @@ static void HandleDiffCommand(
             {
                 newSnapshot.JsonPath = BuildSnapshotDefaultPath(L"snapshots", newSnapshot.TimestampUtc, label, L".json");
                 newSnapshot.ReportPath = BuildSnapshotDefaultPath(L"reports", newSnapshot.TimestampUtc, label + L"-snapshot", L".md");
-                if (!WriteSnapshotJsonFile(newSnapshot.JsonPath, newSnapshot, &error))
+                if (!WriteCapturedSnapshot(newSnapshot.JsonPath, newSnapshot, &error))
                 {
                     std::wcerr << L"!diff current json failed: " << error << L"\n";
                     break;
@@ -22710,6 +22720,7 @@ static bool TryIngestTimelineDashboardProcessBaseline(
         document.Label = L"timeline-dashboard-baseline";
         document.TimestampUtc = SnapshotCurrentUtcTimestamp();
         document.BootId = SnapshotCurrentBootId();
+        document.BootSource = SnapshotBootSource::LocalCapture;
         document.Metadata[L"source"] = L"!timeline dashboard";
         document.Metadata[L"scope"] = L"process-baseline";
         document.Processes = std::move(processes);
@@ -54245,6 +54256,7 @@ int wmain(int argc, wchar_t** argv)
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::OwnedRead) << L"   probe an owned read and existing device; no driver load\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedDump) << L"\n";
         std::wcout << L"  KnLiveDbg.exe " << capability_probes::Invocation(capability_probes::SavedEtl) << L"   check saved CPU sample, context switch, disk I/O and hard page fault records\n";
+        std::wcout << L"  KnLiveDbg.exe --offline !diff <baseline.json> <current.json> /summary /json\n";
         std::wcout << L"  KnLiveDbg.exe --offline !kmon trace|dump-read|dump-image-iat|verify-image|journal-image|journal-image-source|journal-image-approval|assess-image|replay-image-approval|replay-image-source|replay-image|replay-irp|inventory|journal|store|retire-collection|gc|init-store|privacy|redact-image|redact-irp|disclosure|evidence|relate|graph|replay|why <path> [options]\n";
         std::wcout << L"    inspect saved evidence without elevation, a driver, or symbols\n";
         std::wcout << L"  KnLiveDbg.exe --etl-profile <local.etl> --sha256 <digest> [--after N] [--limit N] [--thread-evidence] [--image-evidence] [--process-evidence] [--clr-evidence] [--build-evidence] [--capture-settings] [--reference-image <local.pe> <pe-sha256>] [--check-page <page-sha256> [--capture-statement <file.jws> <capture_controller|archive_witness> <trusted-p256-point>]]   read saved CPU samples\n";
@@ -54358,7 +54370,9 @@ int wmain(int argc, wchar_t** argv)
     if (argc >= 2 && ToLower(argv[1]) == L"--offline")
     {
         // Return before any driver service, symbol engine, or live monitor is constructed.
-        return RunKmonOfflineCommand(std::vector<std::wstring>(argv + 2, argv + argc), true);
+        const std::vector<std::wstring> args(argv + 2, argv + argc);
+        if (!args.empty() && ToLower(args.front()) == L"!diff") { return RunSavedSnapshotDiff(args); }
+        return RunKmonOfflineCommand(args, true);
     }
     if (argc >= 2 && ToLower(argv[1]) == L"--game-manifest")
     {

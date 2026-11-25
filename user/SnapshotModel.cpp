@@ -1,4 +1,5 @@
 #include "SnapshotModel.h"
+#include "ObservationWindows.h"
 
 #include <Windows.h>
 
@@ -48,60 +49,28 @@ std::wstring SnapshotCurrentUtcTimestamp()
     return stream.str();
 }
 
+bool SnapshotHasBootGuid(const std::wstring& id)
+{
+    return id.size() == 32 && id.find_first_not_of(L"0123456789abcdef") == std::wstring::npos &&
+        id.find_first_not_of(L'0') != std::wstring::npos;
+}
+
 std::wstring SnapshotCurrentBootId()
 {
-    uint64_t bootFileTime = 0;
+    const auto& guid = ObservationBootId();
+    return SnapshotHasBootGuid(guid) ? guid : L"boot-unknown";
+}
 
-    do
+const wchar_t* SnapshotBootSourceName(SnapshotBootSource source)
+{
+    switch (source)
     {
-        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-        if (ntdll != nullptr)
-        {
-            using NtQuerySystemInformationFn = LONG (WINAPI*)(ULONG, PVOID, ULONG, PULONG);
-            auto query = reinterpret_cast<NtQuerySystemInformationFn>(
-                GetProcAddress(ntdll, "NtQuerySystemInformation"));
-            if (query != nullptr)
-            {
-                struct SystemTimeOfDayInformation
-                {
-                    LARGE_INTEGER BootTime;
-                    LARGE_INTEGER CurrentTime;
-                    LARGE_INTEGER TimeZoneBias;
-                    ULONG TimeZoneId;
-                    ULONG Reserved;
-                    ULONGLONG BootTimeBias;
-                    ULONGLONG SleepTimeBias;
-                };
-
-                SystemTimeOfDayInformation timeOfDay = {};
-                LONG status = query(3, &timeOfDay, static_cast<ULONG>(sizeof(timeOfDay)), nullptr);
-                if (status >= 0)
-                {
-                    bootFileTime = static_cast<uint64_t>(timeOfDay.BootTime.QuadPart);
-                }
-            }
-        }
-
-        if (bootFileTime == 0)
-        {
-            FILETIME nowFileTime = {};
-            ULARGE_INTEGER now = {};
-            GetSystemTimeAsFileTime(&nowFileTime);
-            now.LowPart = nowFileTime.dwLowDateTime;
-            now.HighPart = nowFileTime.dwHighDateTime;
-
-            uint64_t uptime100ns = GetTickCount64() * 10000ull;
-            if (now.QuadPart > uptime100ns)
-            {
-                bootFileTime = now.QuadPart - uptime100ns;
-                bootFileTime = (bootFileTime / 10000000ull) * 10000000ull;
-            }
-        }
-    } while (false);
-
-    return bootFileTime == 0
-        ? L"boot-unknown"
-        : (L"boot-filetime:" + SnapshotHex(bootFileTime, 16));
+    case SnapshotBootSource::LocalCapture: return L"local_capture";
+    case SnapshotBootSource::NoReceipt: return L"receipt_missing";
+    case SnapshotBootSource::UnverifiedReceipt: return L"receipt_unverified";
+    case SnapshotBootSource::LocalReceipt: return L"local_receipt";
+    default: return L"unspecified";
+    }
 }
 
 std::wstring SnapshotSafeFileComponent(const std::wstring& value)

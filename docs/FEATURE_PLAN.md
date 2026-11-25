@@ -91,6 +91,12 @@ The direct process-image collector also preserves the
 needed to distinguish a denied open, a mismatched process generation and
 a reference failure after a successful open.
 
+In P07, a [saved snapshot comparison](ARCHITECTURE.md#boot-evidence-for-snapshot-comparisons)
+can bind both documents to the same locally observed Windows boot. Earlier
+snapshots retain their inventory comparisons with an unverified origin.
+Associating snapshots from other installations or independently administered
+collectors still requires an explicit correspondence.
+
 In P13, comparing saved crash and reboot times can expose an event that
 precedes a dump even when the stop fields agree. An operator can inspect
 recorded clock steps preceding Event 41 in the same EVTX, including gaps

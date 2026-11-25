@@ -874,6 +874,14 @@ class PublicContentTests(unittest.TestCase):
                 data = ("saved\n" + json.dumps({"entry": [value]})[:-2]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("fragment.txt", data)})
 
+    def test_local_snapshot_boot_receipt(self):
+        for fragment in (dict(local_boot_receipt=None), dict(local_boot_receipt="ab" * 64),
+                         dict(schema="kn.saved_snapshot_diff.v1"), dict(baseline_boot_source="local_receipt"),
+                         dict(current_boot_source="receipt_missing")):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("row\n" + json.dumps({"nested": [fragment]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+
     def test_independent_windows_read_observations(self):
         for data in (b"KNREADW1", b"KNREADW1" + bytes(128)):
             self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.bin", data)})

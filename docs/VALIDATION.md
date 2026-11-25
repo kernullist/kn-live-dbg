@@ -7,6 +7,37 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Boot evidence in saved snapshot diffs
+
+On 2026-11-25, two fixture processes ran on one Windows installation under
+the same user. Each recorded its own PID and creation time, the Windows boot
+GUID and three fixed rows for testing transitions. A third process read their
+saved snapshots after both writers exited. A separate Windows CNG client
+decrypted the receipt, checked the user-and-machine descriptor, and reproduced
+the protected SHA-256 from the original document. It independently queried
+Windows for the boot GUID.
+
+The previous comparison from `3f4060f` reported all three transitions for
+four pairs. The current reader reproduced the three transitions for the
+originals. It withheld them for files without receipts, the same files with
+an identical legacy boot-time label, and a file with an edited label and its original
+receipt. Renaming a file preserved the comparison. Copying another file's
+receipt, changing the formatting, and using user-only, machine-only or
+alternative-recipient protection all withheld the comparison.
+
+The file suite passed 32 native comparisons and 21 checks through the
+product's offline command. A 64 MiB snapshot remained readable. Adding one
+byte exceeded the input limit. A conflicting write handle withheld the
+comparison, and closing it restored the original result. The command
+self-test passed 3,097 checks, the timeline passed 28, and the restricted
+launcher passed 100 checks with zero remote accepts.
+
+The fixture used the native snapshot writer and reader without loading the
+driver. Different boot GUIDs and a disabled comparison policy were exercised
+as controls. A physical reboot, an independently administered second host,
+VM cloning and the full live driver capture remain outside this run.
+[Run the saved comparison](COMMAND_REFERENCE.md#baselines-diffs-and-dumps)
+
 ## Two-process Windows file read comparison
 
 On 2026-11-25, a collector and a separately keyed observer ran with ordinary

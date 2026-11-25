@@ -630,7 +630,7 @@ namespace
                 EvidenceChanged(oldRecord, newRecord, L"fingerprint");
         }
 
-        if (!escalated && newRecord.Domain == L"pool")
+        if (!escalated && sameBoot && newRecord.Domain == L"pool")
         {
             escalated = (SnapshotRecordHasTag(newRecord, L"wx") &&
                 !SnapshotRecordHasTag(oldRecord, L"wx")) ||
@@ -638,7 +638,7 @@ namespace
                 !SnapshotRecordHasTag(oldRecord, L"pool-pe"));
         }
 
-        if (!escalated && newRecord.Domain == L"vad-dkom")
+        if (!escalated && sameBoot && newRecord.Domain == L"vad-dkom")
         {
             escalated = SnapshotRecordHasTag(newRecord, L"hidden-pte") &&
                 !SnapshotRecordHasTag(oldRecord, L"hidden-pte");
@@ -851,18 +851,23 @@ bool BuildSnapshotDiff(
         *result = SnapshotDiffResult{};
         result->BaselineLabel = oldSnapshot.Label;
         result->CurrentLabel = newSnapshot.Label;
-        bool comparableBootIds = !oldSnapshot.BootId.empty() &&
-            !newSnapshot.BootId.empty() &&
-            oldSnapshot.BootId != L"boot-unknown" &&
-            newSnapshot.BootId != L"boot-unknown";
-        result->SameBoot = options.InMemoryBaseline ||
-            (oldSnapshot.SameBootOnly &&
-                newSnapshot.SameBootOnly &&
-                comparableBootIds &&
-                oldSnapshot.BootId == newSnapshot.BootId);
+        const bool session = options.InMemoryBaseline && oldSnapshot.BootSource == SnapshotBootSource::LocalCapture &&
+            newSnapshot.BootSource == SnapshotBootSource::LocalCapture;
+        const bool receipts = oldSnapshot.BootSource == SnapshotBootSource::LocalReceipt &&
+            newSnapshot.BootSource == SnapshotBootSource::LocalReceipt;
+        const bool knownGuids = SnapshotHasBootGuid(oldSnapshot.BootId) && SnapshotHasBootGuid(newSnapshot.BootId);
+        if (!oldSnapshot.SameBootOnly || !newSnapshot.SameBootOnly) { result->BootBasis = L"comparison_disabled"; }
+        else if ((session || receipts) && knownGuids && oldSnapshot.BootId != newSnapshot.BootId)
+            { result->BootBasis = L"different_local_boots"; }
+        else if (session || (receipts && knownGuids))
+        {
+            result->SameBoot = true;
+            result->BootBasis = session ? L"collector_session" : L"local_boot_receipts";
+        }
         if (!result->SameBoot)
         {
-            result->Warnings.push_back(L"snapshot boot identifiers differ or are missing");
+            result->Warnings.push_back(L"same-boot comparison withheld (" + result->BootBasis + L", baseline=" +
+                SnapshotBootSourceName(oldSnapshot.BootSource) + L", current=" + SnapshotBootSourceName(newSnapshot.BootSource) + L")");
         }
 
         auto oldFingerprint = oldSnapshot.Metadata.find(L"byovd_catalog_fingerprint");
@@ -1398,6 +1403,13 @@ bool BuildSnapshotDiff(
     return ok;
 }
 
+static SnapshotDocument SnapshotSessionFixture()
+{
+    SnapshotDocument snapshot;
+    snapshot.BootSource = SnapshotBootSource::LocalCapture;
+    return snapshot;
+}
+
 bool SnapshotDriverDispatchDiffSelfTest()
 {
     SnapshotRecord oldDispatch = {};
@@ -1416,8 +1428,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
     SnapshotRecord newDispatch = oldDispatch;
     newDispatch.Evidence[L"function"] = L"0xfffff80000002000";
 
-    SnapshotDocument oldSnapshot = {};
-    SnapshotDocument newSnapshot = {};
+    auto oldSnapshot = SnapshotSessionFixture();
+    auto newSnapshot = SnapshotSessionFixture();
     oldSnapshot.Records.push_back(oldDispatch);
     newSnapshot.Records.push_back(newDispatch);
 
@@ -1508,7 +1520,7 @@ bool SnapshotDriverDispatchDiffSelfTest()
     collisionB.Domain = L"a\nb";
     collisionB.Identity = L"c";
     collisionB.Risk = L"low";
-    SnapshotDocument collisionOld = {};
+    auto collisionOld = SnapshotSessionFixture();
     collisionOld.Records = {collisionA, collisionB};
     SnapshotDocument collisionNew = collisionOld;
     SnapshotDiffResult collisionResult = {};
@@ -1550,8 +1562,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
     SnapshotRecord newEtw = oldEtw;
     newEtw.Evidence[L"get_cpu_clock"] =
         L"0xfffff80000002000";
-    SnapshotDocument oldEtwSnapshot = {};
-    SnapshotDocument newEtwSnapshot = {};
+    auto oldEtwSnapshot = SnapshotSessionFixture();
+    auto newEtwSnapshot = SnapshotSessionFixture();
     oldEtwSnapshot.SameBootOnly = true;
     newEtwSnapshot.SameBootOnly = true;
     oldEtwSnapshot.BootId = L"boot-a";
@@ -1616,8 +1628,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
     callbackOwner.Evidence[L"image"] =
         L"securityflt.sys";
 
-    SnapshotDocument callbackOld = {};
-    SnapshotDocument callbackNew = {};
+    auto callbackOld = SnapshotSessionFixture();
+    auto callbackNew = SnapshotSessionFixture();
     callbackOld.Records = {callback, callbackOwner};
     callbackNew.Records = {callbackOwner};
     callbackNew.Metadata[L"callbacks_coverage_complete"] =
@@ -1781,8 +1793,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
     strippedProcess.Evidence[L"protection_hex"] =
         L"0x00";
 
-    SnapshotDocument protectionOld = {};
-    SnapshotDocument protectionNew = {};
+    auto protectionOld = SnapshotSessionFixture();
+    auto protectionNew = SnapshotSessionFixture();
     protectionOld.Records = {protectedProcess};
     protectionNew.Records = {strippedProcess};
     options.InMemoryBaseline = true;
@@ -1811,8 +1823,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
     malformedProtection.Evidence[
         L"protection_raw"] =
             L"49junk";
-    SnapshotDocument malformedOld = {};
-    SnapshotDocument malformedNew = {};
+    auto malformedOld = SnapshotSessionFixture();
+    auto malformedNew = SnapshotSessionFixture();
     malformedOld.Records =
         {malformedProtection};
     malformedNew.Records =
@@ -1829,8 +1841,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
         return false;
     }
 
-    SnapshotDocument upgradeOld = {};
-    SnapshotDocument upgradeNew = {};
+    auto upgradeOld = SnapshotSessionFixture();
+    auto upgradeNew = SnapshotSessionFixture();
     upgradeOld.Records = {strippedProcess};
     upgradeNew.Records = {protectedProcess};
     SnapshotDiffResult upgradeResult = {};
@@ -1854,8 +1866,8 @@ bool SnapshotDriverDispatchDiffSelfTest()
     processOwner.Domain = L"process";
     processOwner.Identity = L"4321:100";
     processOwner.Risk = L"info";
-    SnapshotDocument protectionMissingOld = {};
-    SnapshotDocument protectionMissingNew = {};
+    auto protectionMissingOld = SnapshotSessionFixture();
+    auto protectionMissingNew = SnapshotSessionFixture();
     protectionMissingOld.Records =
         {processOwner, protectedProcess};
     protectionMissingNew.Records =
@@ -1951,8 +1963,8 @@ bool SnapshotMinifilterAttachmentDiffSelfTest()
     detached.Tags.push_back(
         L"detached-volume");
 
-    SnapshotDocument transitionOld = {};
-    SnapshotDocument transitionNew = {};
+    auto transitionOld = SnapshotSessionFixture();
+    auto transitionNew = SnapshotSessionFixture();
     transitionOld.Records = {attachment};
     transitionNew.Records = {detached};
     transitionNew.Metadata[
@@ -2049,8 +2061,8 @@ bool SnapshotMinifilterAttachmentDiffSelfTest()
     callback.Evidence[L"function_module"] =
         L"WdFilter.sys";
 
-    SnapshotDocument removalOld = {};
-    SnapshotDocument removalNew = {};
+    auto removalOld = SnapshotSessionFixture();
+    auto removalNew = SnapshotSessionFixture();
     removalOld.Records =
         {attachment, volume, callback};
     removalNew.Records =

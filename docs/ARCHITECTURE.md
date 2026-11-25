@@ -1953,6 +1953,31 @@ hypervisor feature leaves with `Hv#1` and the reported leaf range. It does not
 infer enforcement history from a current flag. Recapture older unloaded-driver
 snapshot baselines after the v0.0.36 identity-format change.
 
+### Boot evidence for snapshot comparisons
+
+A locally collected snapshot records the 16 bytes of the Windows boot GUID
+in lowercase hexadecimal. An unavailable or zero GUID yields `boot-unknown`.
+The in-memory baseline and current capture belong to the running collector
+session. A conflict between two known GUIDs withholds same-boot transitions.
+
+The saved JSON writer places an optional `local_boot_receipt` member first in
+the object. The protected statement contains a format identifier and the
+SHA-256 of the exact JSON text with that member removed. The hash uses
+UTF-16LE code units without a BOM. Whitespace, the reported GUID, record
+contents and coverage are all included. The original file can be renamed or
+copied intact. If a reformatted or edited copy fails verification, use the
+original file for the same-boot comparison.
+
+The reader inspects the Windows CNG protection descriptor before decryption.
+It requires both the local user and the local machine, checks the effective
+descriptor again after decryption, and compares the protected statement with
+the loaded text. Two receipts verified by the reader can identify a shared
+past boot even when the current boot has changed. This relies on the local
+collector and the Windows protection keys. Code running with the same
+credentials can issue receipts. The snapshot records themselves are plaintext
+JSON. Host compromise, VM cloning and continuous object lifetime require
+separate evidence. [Windows protection descriptors](https://learn.microsoft.com/en-us/windows/win32/seccng/protection-descriptors)
+
 `!hunt` combines memory, process, driver, policy and event evidence. Name/path
 matches remain distinct from exact hashes and observed effects.
 Exact-only public filenames such as `HwAudKiller.exe` are not suffix-normalized.

@@ -2505,6 +2505,33 @@ claims.
 
 ## Baselines, diffs and dumps
 
+For two saved captures, run `!diff <old.json> <new.json> /summary /memory`.
+The `bootBasis` field gives the evidence for boot-dependent findings.
+
+To compare the same files without starting a live debugger, use the offline
+summary. It reads two resident local files of up to 64 MiB each. The JSON
+includes both input hashes, the receipt state of each input, `boot_basis`
+and the counts of added, escalated, removed and high-risk findings.
+
+```powershell
+$result = & $exe --offline '!diff' $baseline $current /summary /json | ConvertFrom-Json
+if ($LASTEXITCODE -ne 0) { throw $result.reason }
+$result | Select-Object same_boot, boot_basis, baseline_boot_source, current_boot_source, escalated
+```
+
+| Value | Interpretation |
+| --- | --- |
+| `local_boot_receipts` | Both original JSON files verify under the current Windows user and installation and record the same boot GUID. |
+| `collector_session` | The baseline and its new observation came from this running collector. |
+| `different_local_boots` | The qualified observations record different boot GUIDs. |
+| `origin_unverified` | At least one file lacks a verifiable local receipt. This includes earlier snapshots and edited copies. |
+| `comparison_disabled` | At least one input disables the same-boot comparison. |
+
+Keep the original JSON produced by `!snapshot save` or a saved baseline.
+Structured display output is a projection of the snapshot. A missing or
+unreadable receipt still permits ordinary inventory and risk comparisons.
+The warning names the receipt state of each input. [Receipt format and scope](ARCHITECTURE.md#boot-evidence-for-snapshot-comparisons)
+
 ```text
 !snapshot baseline /all
 !snapshot show baseline /domains /warnings

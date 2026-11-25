@@ -2163,6 +2163,7 @@ bool SnapshotCollector::Capture(const SnapshotCaptureOptions& options, SnapshotD
         document->TimestampUtc = SnapshotCurrentUtcTimestamp();
         document->SameBootOnly = true;
         document->BootId = SnapshotCurrentBootId();
+        document->BootSource = SnapshotBootSource::LocalCapture;
         document->Metadata[L"include_all"] = BoolText(options.IncludeAll);
         document->Metadata[L"vad_dkom_new_process_mode"] = BoolText(options.CaptureVadDkomForNewProcesses);
         document->Metadata[L"byovd_auto_update"] = BoolText(options.AllowByovdAutoUpdate);

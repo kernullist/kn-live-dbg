@@ -47,7 +47,8 @@ struct SnapshotDiffResult
     std::wstring BaselineLabel;
     std::wstring CurrentLabel;
     std::wstring ReportPath;
-    bool SameBoot = true;
+    bool SameBoot = false;
+    std::wstring BootBasis = L"origin_unverified";
     uint64_t Added = 0;
     uint64_t Escalated = 0;
     uint64_t Removed = 0;
@@ -65,4 +66,5 @@ bool BuildSnapshotDiff(
     std::wstring* error);
 
 bool SnapshotDriverDispatchDiffSelfTest();
+int RunSavedSnapshotDiff(const std::vector<std::wstring>& args);
 bool SnapshotMinifilterAttachmentDiffSelfTest();

@@ -142,6 +142,7 @@ void PrintSnapshotSummary(const SnapshotDocument& document, bool domains, bool w
 {
     std::wcout << L"[snapshot] label=" << document.Label
                << L" ts=" << document.TimestampUtc
+               << L" bootSource=" << SnapshotBootSourceName(document.BootSource)
                << L" records=" << document.Records.size()
                << L" processes=" << document.Processes.size();
     if (!document.JsonPath.empty())
@@ -185,6 +186,7 @@ void PrintSnapshotDiff(const SnapshotDiffResult& diff, const SnapshotDiffOptions
     std::wcout << L"[diff] baseline=" << diff.BaselineLabel
                << L" current=" << diff.CurrentLabel
                << L" sameBoot=" << (diff.SameBoot ? L"yes" : L"no")
+               << L" bootBasis=" << diff.BootBasis
                << L" added=" << diff.Added
                << L" escalated=" << diff.Escalated
                << L" removed=" << diff.Removed
@@ -397,6 +399,7 @@ std::wstring BuildSnapshotDiffMarkdown(const SnapshotDiffResult& diff, const Sna
     stream << L"- baseline: `" << diff.BaselineLabel << L"`\n";
     stream << L"- current: `" << diff.CurrentLabel << L"`\n";
     stream << L"- same boot: `" << (diff.SameBoot ? L"yes" : L"no") << L"`\n";
+    stream << L"- boot comparison basis: `" << diff.BootBasis << L"`\n";
     stream << L"- added: `" << diff.Added << L"`\n";
     stream << L"- escalated: `" << diff.Escalated << L"`\n";
     stream << L"- removed: `" << diff.Removed << L"`\n";

@@ -1,4 +1,5 @@
 #include "SnapshotJson.h"
+#include "SnapshotBootReceipt.h"
 
 #include <Windows.h>
 
@@ -11,9 +12,6 @@
 
 namespace
 {
-    constexpr uint64_t kMaxSnapshotTextFileBytes =
-        64ull * 1024ull * 1024ull;
-
     bool WideToUtf8(
         const std::wstring& value,
         std::string* result)
@@ -2059,7 +2057,7 @@ bool EnsureSnapshotDirectoryForFile(const std::wstring& path, std::wstring* erro
     return EnsureDirectoryTree(DirectoryFromPath(path), error);
 }
 
-bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, std::wstring* error)
+static bool WriteSnapshotText(const std::wstring& path, const std::wstring& text, uint64_t maxBytes, std::wstring* error)
 {
     bool ok = false;
     std::string utf8;
@@ -2085,6 +2083,11 @@ bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, s
             break;
         }
 
+        if (utf8.size() > maxBytes)
+        {
+            if (error) { *error = L"snapshot file exceeds the 64 MiB safety limit: " + path; }
+            break;
+        }
         if (!EnsureSnapshotDirectoryForFile(path, error))
         {
             break;
@@ -2110,6 +2113,11 @@ bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, s
     } while (false);
 
     return ok;
+}
+
+bool WriteSnapshotTextFile(const std::wstring& path, const std::wstring& text, std::wstring* error)
+{
+    return WriteSnapshotText(path, text, UINT64_MAX, error);
 }
 
 bool ReadSnapshotTextFile(const std::wstring& path, std::wstring* text, std::wstring* error)
@@ -2171,7 +2179,7 @@ bool ReadSnapshotTextFile(const std::wstring& path, std::wstring* text, std::wst
             break;
         }
         if (static_cast<uint64_t>(fileSize.QuadPart) >
-            kMaxSnapshotTextFileBytes)
+            SnapshotMaxTextFileBytes)
         {
             if (error != nullptr)
             {
@@ -2240,9 +2248,18 @@ bool ReadSnapshotTextFile(const std::wstring& path, std::wstring* text, std::wst
     return ok;
 }
 
-bool WriteSnapshotJsonFile(const std::wstring& path, const SnapshotDocument& document, std::wstring* error)
+bool WriteSnapshotJsonFile(const std::wstring& path, const SnapshotDocument& document, std::wstring* error, bool* bootReceiptWritten)
 {
-    return WriteSnapshotTextFile(path, BuildSnapshotJson(document), error);
+    auto json = BuildSnapshotJson(document);
+    bool sealed = false;
+    if (document.BootSource == SnapshotBootSource::LocalCapture)
+    {
+        sealed = SnapshotHasBootGuid(document.BootId) && document.BootId == SnapshotCurrentBootId() && AttachSnapshotBootReceipt(json);
+        if (!sealed) { json.insert(2, L"  \"local_boot_receipt\":null,\n"); }
+    }
+    const bool saved = WriteSnapshotText(path, json, SnapshotMaxTextFileBytes, error);
+    if (bootReceiptWritten) { *bootReceiptWritten = saved && sealed; }
+    return saved;
 }
 
 bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, std::wstring* error)
@@ -2698,6 +2715,10 @@ bool ReadSnapshotJsonFile(const std::wstring& path, SnapshotDocument* document, 
             break;
         }
 
+        if (!JsonContainsKey(json, L"local_boot_receipt")) { document->BootSource = SnapshotBootSource::NoReceipt; }
+        else if (SnapshotHasBootGuid(document->BootId) && VerifySnapshotBootReceipt(json))
+            { document->BootSource = SnapshotBootSource::LocalReceipt; }
+        else { document->BootSource = SnapshotBootSource::UnverifiedReceipt; }
         ok = true;
     } while (false);
 

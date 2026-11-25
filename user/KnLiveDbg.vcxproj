@@ -218,6 +218,8 @@
     <ClCompile Include="SnapshotCollector.cpp" />
     <ClCompile Include="SnapshotDiff.cpp" />
     <ClCompile Include="SnapshotJson.cpp" />
+    <ClCompile Include="SnapshotBootReceipt.cpp" />
+    <ClCompile Include="SavedSnapshotDiff.cpp" />
     <ClCompile Include="SnapshotModel.cpp" />
     <ClCompile Include="SnapshotPrinter.cpp" />
     <ClCompile Include="main.cpp">
@@ -461,6 +463,7 @@
     <ClInclude Include="SnapshotCollector.h" />
     <ClInclude Include="SnapshotDiff.h" />
     <ClInclude Include="SnapshotJson.h" />
+    <ClInclude Include="SnapshotBootReceipt.h" />
     <ClInclude Include="SnapshotModel.h" />
     <ClInclude Include="SnapshotPrinter.h" />
     <ClInclude Include="SymbolEngine.h" />
