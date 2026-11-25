@@ -16,7 +16,7 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_ARCHIVE_HEADERS = (b"KNAPARC1", b"KNMDIAT1", b"KNPUBHS1")
+PRIVATE_ARCHIVE_HEADERS = (b"KNAPARC1", b"KNMDIAT1", b"KNPUBHS1", b"KNREADW1")
 PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".knpubhistory", ".kniatarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".knsource", ".knsourceledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
@@ -407,7 +407,8 @@ RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
                     "kn.benchmark_tuf_reference.v3", "kn.benchmark_publisher_report.v3", "kn.publisher_history_result.v1",
                     "kn.benchmark_corpus.v2", "kn.benchmark_publisher_report.v4", "kn.benchmark_publisher_report.v5",
-                    "kn.benchmark_windows_reads.v1", "kn.benchmark_read_capture.v1",
+                    "kn.benchmark_windows_reads.v1", "kn.benchmark_read_capture.v1", "kn.benchmark_read_capture.v2",
+                    "kn.windows_file_read_observation.v1", "kn.windows_file_read_observer_plan.v1", "kn.benchmark_publisher_report.v6",
                     "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"delegated_roles"', '"delegated_role_checks"', '"delegation_search"', '"role_check_indices"', '"delegated_role"', '"snapshot_link"',
@@ -418,6 +419,10 @@ RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"delegated_roles"', '"delegated_role_che
                     '"stored_capture_bytes"', '"declared_observed_bytes"', '"first_difference_offset"', '"distinct_comparisons"',
                     '"cases_decided_from_partial_captures"', '"read_acquisition"', '"capture_nonce"', '"collector_key_sha256"',
                     '"authenticated_scopes_per_planned_case"', '"packed_sha256"', '"opened_path_sha256"', '"volume_serial"', '"start_ns"',
+                    '"collector_receipt_sha256"', '"repeat_ntstatus"', '"repeat_packed_sha256"', '"os_read_observation"',
+                    '"observer_key_sha256"', '"corroborated_acquisitions_per_planned_case"', '"read_operations"', '"collector_file_truth"',
+                    '"matching_attempt_results"', '"observer_key"', '"repeat_requested_bytes"', '"repeat_returned_bytes"',
+                    '"sampled_process_read_operations"', '"sampled_process_read_bytes"',
                     '"spec_version"', '"terminating"', '"name_prefix"',
                     '"archive_requires_efs"', '"packing_reader_sha256"', '"original_report_reproduced"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
@@ -468,6 +473,10 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("distinct_comparisons", "reused_comparisons"),
     ("cases_decided_from_partial_captures",), ("read_acquisition",), ("capture_nonce",), ("collector_key_sha256",),
     ("authenticated_scopes_per_planned_case",), ("packed_sha256",), ("opened_path_sha256",), ("volume_serial", "file_id"),
+    ("collector_receipt_sha256",), ("repeat_ntstatus",), ("repeat_packed_sha256",), ("os_read_observation",),
+    ("observer_key_sha256",), ("corroborated_acquisitions_per_planned_case",), ("position", "read_operations", "read_bytes"),
+    ("collector_file_truth",), ("matching_attempt_results", "repeated_content_matches"), ("observer_key",),
+    ("repeat_requested_bytes",), ("repeat_returned_bytes",), ("sampled_process_read_operations",), ("sampled_process_read_bytes",),
     ("start_ns", "end_ns", "transferred"),
     ("parent_role", "delegated_role"), ("snapshot_link", "metadata_sha256"),
     ("_type", "spec_version", "targets"), ("keyids", "threshold", "terminating"),

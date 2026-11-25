@@ -12,6 +12,7 @@ from retained_corpus import MAX_DOCUMENT, MAX_PACKAGE, visit_original
 
 try:
     import file_read_scope
+    import read_observation
     from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_pem_public_key
@@ -558,7 +559,7 @@ def compare_target(scope, pin, original, targets, stream, sha512_cache, *, case=
 
 
 def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, minimum_version=None, previous_checkpoint=None,
-               collector_key=None, capture_nonce=None):
+               collector_key=None, capture_nonce=None, observer_key=None):
     instant = verification_time(at)
     groups = defaultdict(list)
     coverage = {r["case_id"]: r for r in report["coverage"]["cases"]}
@@ -576,31 +577,52 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
     authenticated = 0
     has_read_policy = collector_key is not None
     has_read_receipts = False
+    has_observations = False
+    corroborated = 0
 
     @lru_cache(maxsize=1)
     def load_scope(pin, keep_ranges):
         # A large decoded hole map is needed only while its ranges are being compared.
-        raw, gap = read_small(stream, objects, pin, MAX_SCOPE)
+        extent = objects.get(pin)
+        if extent and extent[1] > MAX_SCOPE:
+            stream.seek(extent[0])
+            if stream.read(len(read_observation.MAGIC)) != read_observation.MAGIC:
+                return None, "scope_over_limit", None, None
+        raw, gap = read_small(stream, objects, pin, read_observation.MAX_COMBINED)
         if gap:
-            return None, "scope_" + gap, None
+            return None, "scope_" + gap, None, None
+        extra = None
+        if raw.startswith(read_observation.MAGIC):
+            try:
+                raw, extra = read_observation.split(raw)
+            except ValueError:
+                return None, "invalid_read_observation_extent", None, dict(status="invalid_read_observation_extent")
+        elif len(raw) > MAX_SCOPE:
+            return None, "scope_over_limit", None, None
+        observed = dict(status="collector_scope_unbound") if extra is not None else None
         try:
             record = decode(raw)
         except (ValueError, RecursionError):
-            return None, "invalid_file_scope", None
+            return None, "invalid_file_scope", None, observed
         if type(record) is dict and record.get("schema") == file_read_scope.SCHEMA:
             if not keep_ranges:
-                return None, "receipt_requires_packed_range_case", {}
+                return None, "receipt_requires_packed_range_case", {}, observed
             try:
                 scope, witness = file_read_scope.verify(record, collector_key, capture_nonce)
             except (ValueError, RecursionError) as exc:
-                return None, str(exc), {}
-            return scope, None, witness
-        if has_read_policy:
-            return None, "signed_read_receipt_required", None
+                return None, str(exc), {}, observed
+            if extra is not None:
+                try:
+                    observed = read_observation.verify(extra, decode, raw, record["body"], collector_key, observer_key)
+                except (ValueError, RecursionError) as exc:
+                    observed = dict(status=str(exc))
+            return scope, None, witness, observed
+        if has_read_policy or extra is not None:
+            return None, "signed_read_receipt_required", None, observed
         try:
-            return registered_scope(record, keep_ranges), None, None
+            return registered_scope(record, keep_ranges), None, None, None
         except Rejected as exc:
-            return None, str(exc), None
+            return None, str(exc), None, None
 
     adjudicated = contradictions = confirmed = failed = 0
     for ref, group in groups.items():
@@ -623,11 +645,11 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
             if status == "verified" or ranges or has_read_policy:
                 holes = case["holes_sha256"]
                 if ranges:
-                    scope, scope_error, witness = load_scope(holes, True)
+                    scope, scope_error, witness, observed = load_scope(holes, True)
                 else:
                     if holes not in scope_cache:
                         scope_cache[holes] = load_scope(holes, False)
-                    scope, scope_error, witness = scope_cache[holes]
+                    scope, scope_error, witness, observed = scope_cache[holes]
                 if has_read_policy or witness is not None:
                     has_read_receipts |= witness is not None
                     if witness:
@@ -655,6 +677,18 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                         details.update(target_path=scope[0], file_bytes=scope[1])
                 if ranges and witness and scope_error is None:
                     details["file_range_comparison"]["scope_status"] = "signed_reads_verified"
+                if observed is not None or observer_key is not None:
+                    has_observations = True
+                    if scope_error:
+                        observed = dict(status="collector_scope_unbound")
+                    elif observed is None:
+                        observed = dict(status="observer_receipt_missing")
+                    details.update(os_read_observation=observed, collector_file_truth=truth, collector_truth_reason=reason)
+                    corroborated += observed["status"] == "corroborated"
+                    if observer_key is not None and observed["status"] != "corroborated":
+                        if status == "verified" and scope_error is None:
+                            truth, reason = "unknown", observed["status"]
+                        failed += 1
             derived[key]["truth"] = truth
             coverage[key].update(publisher_truth=truth, truth_reason=reason, truth_ref_sha256=ref,
                                  artifact_sha256=case["artifact_sha256"], **details)
@@ -691,4 +725,7 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                       file_scope_basis="controller_signed_windows_reads" if has_read_policy else "per_case_scope_evidence",
                       acquisition_scope_authenticated=authenticated == len(cases),
                       ground_truth_authenticated=adjudicated == len(cases) and authenticated == len(cases))
+    if has_observations or observer_key is not None:
+        report.update(schema="kn.benchmark_publisher_report.v6", observer_key_sha256=observer_key,
+                      corroborated_acquisitions_per_planned_case=ratio(corroborated, len(cases)))
     return derived, int(bool(failed))

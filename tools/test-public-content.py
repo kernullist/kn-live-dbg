@@ -874,6 +874,21 @@ class PublicContentTests(unittest.TestCase):
                 data = ("saved\n" + json.dumps({"entry": [value]})[:-2]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("fragment.txt", data)})
 
+    def test_independent_windows_read_observations(self):
+        for data in (b"KNREADW1", b"KNREADW1" + bytes(128)):
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.bin", data)})
+        for fragment in (dict(schema="kn.windows_file_read_observation.v1"), dict(schema="kn.windows_file_read_observer_plan.v1"),
+                         dict(observer_key="private path"), dict(schema="kn.benchmark_read_capture.v2"),
+                         dict(schema="kn.benchmark_publisher_report.v6"), dict(collector_receipt_sha256="capture"),
+                         dict(os_read_observation={}), dict(repeat_ntstatus=0), dict(repeat_packed_sha256="bytes"),
+                         dict(observer_key_sha256="observer"), dict(corroborated_acquisitions_per_planned_case={}),
+                         dict(position=10, read_operations=3, read_bytes=9), dict(collector_file_truth="unknown"),
+                         dict(matching_attempt_results=1, repeated_content_matches=True), dict(repeat_requested_bytes=4),
+                         dict(repeat_returned_bytes=3), dict(sampled_process_read_operations=1), dict(sampled_process_read_bytes=3)):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                probe = ("row\n" + json.dumps({"nested": [fragment]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", probe)})
+
     def test_windows_publisher_policy_and_receipts(self):
         samples = (dict(schema="kn.image_approval_policy.v2"), dict(schema="kn.image_approval_provision.v2"),
                    dict(windows_publisher={}), dict(reference_signature={}, issuer="team"),

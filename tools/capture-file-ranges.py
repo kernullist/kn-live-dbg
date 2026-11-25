@@ -45,38 +45,29 @@ class DiskReader:
         self.read.restype = w.BOOL
 
     def identity(self):
-        class FileId(ctypes.Structure):
-            _fields_ = [("volume", ctypes.c_ulonglong), ("identifier", ctypes.c_ubyte * 16)]
-        data = FileId()
-        if not self.files.info(self.handle, 18, ctypes.byref(data), ctypes.sizeof(data)):  # FileIdInfo
-            raise ctypes.WinError(ctypes.get_last_error())
-        name = ctypes.create_unicode_buffer(32768)
-        length = self.files.final_name(self.handle, name, len(name), 0x9)  # VOLUME_NAME_GUID | FILE_NAME_OPENED
-        if not 0 < length < len(name):
-            raise ctypes.WinError(ctypes.get_last_error() if length == 0 else 122)
-        return dict(volume_serial=f"{data.volume:016x}", file_id=bytes(data.identifier).hex(),
-                    file_bytes=os.fstat(self.stream.fileno()).st_size,
-                    opened_path_sha256=hashlib.sha256(name.value.encode("utf-16le", errors="surrogatepass")).hexdigest())
+        return self.files.file_identity(self.stream)
 
-    def attempt(self, offset, requested):
+    def attempt(self, offset, requested, observer=None):
         actual = ctypes.c_longlong()
-        if not self.seek(self.handle, offset, ctypes.byref(actual), 0):
-            return "seek", ctypes.get_last_error(), b""
-        if actual.value != offset:
+        ready = self.seek(self.handle, offset, ctypes.byref(actual), 0)
+        status = 0 if ready else ctypes.get_last_error()
+        if ready and actual.value != offset:
             raise ValueError("file pointer differs from the requested offset")
         data, count = ctypes.create_string_buffer(requested), w.DWORD()
-        if not self.read(self.handle, data, requested, ctypes.byref(count), None):
-            error = ctypes.get_last_error()
-            if count.value or not error:
+        if observer is not None:
+            observer.checkpoint()
+        if ready and not self.read(self.handle, data, requested, ctypes.byref(count), None):
+            status = ctypes.get_last_error()
+            if not status or count.value:
                 raise ValueError("unexpected unsuccessful disk read result")
-            return "read", error, b""
-        return "read", 0, data.raw[:count.value]
+        if observer is not None:
+            observer.checkpoint()
+        if count.value > requested:
+            raise ValueError("invalid Windows transfer length")
+        return "read" if ready else "seek", status, data.raw[:count.value]
 
 
 def collect(args):
-    from cryptography.exceptions import UnsupportedAlgorithm
-    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
-    from cryptography.hazmat.primitives.serialization import load_pem_private_key
     from etl_reader_process import WindowsFiles
     import file_read_scope as scope
 
@@ -95,15 +86,9 @@ def collect(args):
             raise ValueError("the source aliases the signing key")
         if not outputs_safe((), src) or not outputs_safe((), secret):
             raise ValueError("an output aliases a protected input")
-        raw_key = secret.read(8193)
-        if len(raw_key) > 8192:
-            raise ValueError("invalid acquisition key")
-        try:
-            key = load_pem_private_key(raw_key, password=None)
-        except (ValueError, TypeError, UnsupportedAlgorithm):
-            raise ValueError("cannot load the acquisition signing key") from None
-        if not isinstance(key, Ed25519PrivateKey):
-            raise ValueError("an Ed25519 private key is required")
+        key = scope.signing_key(secret)
+        public = key.public_key().public_bytes_raw()
+        key_pin = hashlib.sha256(public).hexdigest()
         if os.path.lexists(dest):
             raise ValueError("the capture destination already exists")
         reader = DiskReader(files, src)
@@ -111,16 +96,24 @@ def collect(args):
         if not 0 <= identity["file_bytes"] <= scope.MAX_PACKAGE:
             raise ValueError("source size exceeds the file comparison limit")
         # Rename the complete pair on the same volume. An existing destination wins a race.
-        with tempfile.TemporaryDirectory(prefix=".knbench-", suffix=".tmp", dir=dest.parent) as private:
+        with tempfile.TemporaryDirectory(prefix=".knbench-", suffix=".tmp", dir=dest.parent) as private, ExitStack() as observers:
             stage = Path(private) / "capture"
             stage.mkdir()
+            observer = None
+            observation_key = getattr(args, "observer_signing_key", None)
+            if observation_key is not None:
+                from windows_read_observer import observe
+                job = dict(schema="kn.windows_file_read_observer_plan.v1", source=str(source),
+                           observer_key=str(local_path(observation_key)), collector_key=key_pin, ranges=ranges,
+                           nonce=args.capture_nonce, case_id=args.case_id, target=args.target_path)
+                observer = observers.enter_context(observe(reader.handle, Path(private), job))
             payload = hashlib.sha256()
             attempts = []
             started, clock = time.time_ns(), time.monotonic_ns()
             with (stage / "capture.knblob").open("xb") as output:
                 for offset, requested in ranges:
                     begin = time.monotonic_ns() - clock
-                    operation, status, data = reader.attempt(offset, requested)
+                    operation, status, data = reader.attempt(offset, requested, observer)
                     finish = time.monotonic_ns() - clock
                     attempts.append(dict(offset=offset, requested=requested, operation=operation, win32_status=status,
                                          transferred=len(data), start_ns=begin, end_ns=finish))
@@ -133,17 +126,20 @@ def collect(args):
             body = dict(case_id=args.case_id, target_path=args.target_path, capture_nonce=args.capture_nonce,
                         source=identity, started_unix_ns=started, attempts=attempts, packed_sha256=payload.hexdigest())
             _, witness = scope.inspect_reads(body)
-            public = key.public_key().public_bytes_raw()
             signature = key.sign(scope.DOMAIN + scope.canonical(body))
             receipt = scope.canonical(dict(schema=scope.SCHEMA, body=body, public_key=public.hex(), signature=signature.hex()))
+            observed = {}
+            if observer is not None:
+                receipt, observed = observer.finish(receipt)
             with (stage / "scope.knreads").open("xb") as output:
                 output.write(receipt)
                 output.flush()
                 os.fsync(output.fileno())
             os.rename(stage, dest)
-    return scope.canonical(dict(schema="kn.benchmark_read_capture.v1", artifact_sha256=payload.hexdigest(),
+    schema = "kn.benchmark_read_capture.v2" if observed else "kn.benchmark_read_capture.v1"
+    return scope.canonical(dict(schema=schema, artifact_sha256=payload.hexdigest(),
                                 holes_sha256=hashlib.sha256(receipt).hexdigest(), packed_bytes=witness["packed_bytes"],
-                                collector_key_sha256=hashlib.sha256(public).hexdigest())) + b"\n"
+                                collector_key_sha256=key_pin, **observed)) + b"\n"
 
 
 def main():
@@ -151,7 +147,7 @@ def main():
     # that a Windows path cannot, including in a command that redirects its report.
     args = sys.argv[1:]
     paths = []
-    path_flags = ("--source", "--signing-key", "--output")
+    path_flags = ("--source", "--signing-key", "--observer-signing-key", "--output")
     for index, arg in enumerate(args):
         flag, sep, value = arg.partition("=")
         if len(flag) > 2 and flag.startswith("--") and any(option.startswith(flag) for option in path_flags):
@@ -165,6 +161,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     for flag in ("source", "signing-key", "output", "case-id", "target-path", "capture-nonce"):
         parser.add_argument("--" + flag, required=True)
+    parser.add_argument("--observer-signing-key", help="run an independent cursor, process I/O and file reread observer with a distinct Ed25519 key")
     parser.add_argument("--range", dest="ranges", action="append", required=True, metavar="OFFSET+LENGTH")
     parsed = parser.parse_args(args)
     try:

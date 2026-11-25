@@ -7,6 +7,35 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Two-process Windows file read comparison
+
+On 2026-11-25, a collector and a separately keyed observer ran with ordinary
+user permissions on one Windows host. In nine cases using three Sigstore
+targets from timestamp 842, all 16 sampled reads agreed on cursor movement,
+process I/O counts and the bytes returned by the independent native reread.
+The observer requested 3,076 bytes and received 2,662. The file comparison
+covered 2,662 bytes.
+OpenSSL verified both signatures for each case. After removal of the working
+inputs and keys, the retained package reproduced two whole-file matches,
+two differences and five unknowns. In the partial difference, 31 of 57 bytes
+differed, starting at offset 63. [Source files and signed targets](https://github.com/sigstore/root-signing/tree/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata)
+
+A locked range returned Win32 error 33 and native `STATUS_FILE_LOCK_CONFLICT`.
+A read starting past EOF returned Win32 success with zero bytes while the
+observer recorded `STATUS_END_OF_FILE`. In a separate control, an extra read
+from an unrelated file increased the process operation count to two. Replay
+retained the matching repeated bytes and marked that attempt inconclusive.
+Another control confirmed the observer exited after the collector terminated
+inside a sampling interval. Starting a system ETW session on this host returned
+access denied. An independent kernel event for the original call remains
+unverified.
+[Acquisition and replay](BENCHMARK_CORPUS.md#corroborate-a-capture-from-a-second-windows-process)
+
+A separate capacity run observed all 2,048 requests on a sparse NTFS file
+of 4,294,967,354 logical bytes. The last data range began above 4 GiB.
+The capture returned exactly 2,067 bytes and preserved the gap between the
+two populated regions.
+
 ## Signed Windows file read receipts
 
 On 2026-11-25 a Windows collector made 12 read calls across seven cases using

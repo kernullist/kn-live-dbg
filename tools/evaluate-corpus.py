@@ -363,6 +363,9 @@ def retained_command(args, protected):
         if args.collector_key_sha256 is not None:
             digest(args.collector_key_sha256, "acquisition collector public key")
             digest(args.capture_nonce, "acquisition challenge")
+            if args.observer_key_sha256 is not None:
+                digest(args.observer_key_sha256, "file observer public key")
+                require(args.observer_key_sha256 != args.collector_key_sha256, "collector and observer keys must differ")
     status = 0
     with ExitStack() as inputs:
         stream = None
@@ -406,7 +409,7 @@ def retained_command(args, protected):
                 cases, status = publisher_truth.adjudicate(report, stream, originals, cases,
                                                           args.trusted_root_sha256, args.verification_time,
                                                           decode_document, ratio, minimum, args.previous_checkpoint_sha256,
-                                                          args.collector_key_sha256, args.capture_nonce)
+                                                          args.collector_key_sha256, args.capture_nonce, args.observer_key_sha256)
             report["scopes"] = comparison_scopes(cases, scored)
         if args.trusted_root_sha256 is not None:
             raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
@@ -425,7 +428,7 @@ def main():
                  for arg in sys.argv[1:])
     archive_flags = ("--archive-corpus", "--write-archive", "--original", "--get-original", "--destination", "--file-list",
                      "--trusted-root-sha256", "--verification-time", "--minimum-root-version", "--previous-checkpoint-sha256",
-                     "--collector-key-sha256", "--capture-nonce")
+                     "--collector-key-sha256", "--capture-nonce", "--observer-key-sha256")
     archived = any(arg.startswith("--") and any(flag.startswith(arg.split("=", 1)[0]) for flag in archive_flags)
                    for arg in sys.argv[1:])
     protected = sys.argv[1:]
@@ -470,6 +473,7 @@ def main():
     parser.add_argument("--previous-checkpoint-sha256", help="independently retained checkpoint of the previous publisher observation")
     parser.add_argument("--collector-key-sha256", help="require signed Windows read receipts under this Ed25519 public key hash")
     parser.add_argument("--capture-nonce", help="independently supplied 32-byte hex challenge for the acquisition run")
+    parser.add_argument("--observer-key-sha256", help="require Windows I/O observations signed by a second pinned Ed25519 key")
     parser.add_argument("--verification-time", help="publisher metadata verification time in UTC, YYYYMMDDTHHMMSSZ")
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
@@ -477,6 +481,8 @@ def main():
     args = parser.parse_args()
     if (args.collector_key_sha256 is None) != (args.capture_nonce is None):
         parser.error("--collector-key-sha256 and --capture-nonce belong together")
+    if args.observer_key_sha256 is not None and args.collector_key_sha256 is None:
+        parser.error("--observer-key-sha256 requires the collector key and acquisition challenge")
     if any(value is not None for value in (args.trusted_root_sha256, args.verification_time,
                                            args.minimum_root_version, args.previous_checkpoint_sha256, args.collector_key_sha256)):
         if not (args.archive_corpus and args.trusted_root_sha256 and args.verification_time and args.get_original is None):

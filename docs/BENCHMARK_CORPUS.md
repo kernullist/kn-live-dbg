@@ -992,6 +992,71 @@ one file handle. An association with a running image, an independent OS trace
 and a simultaneous snapshot of all file bytes require separate evidence.
 [Windows validation](VALIDATION.md#signed-windows-file-read-receipts)
 
+## Corroborate a capture from a second Windows process
+
+Add `--observer-signing-key` when collecting the ranges. Use a second
+Ed25519 key and keep both public-key hashes with the verifier before starting.
+The observer receives a read-only duplicate of the source file handle, a
+query-only process handle with synchronization rights, and two events. At
+each requested offset, it samples the shared file position and the collector's
+cumulative read operations and bytes immediately before and after the call.
+It then reads the planned range on a separate handle with `NtReadFile`.
+The 2,048-range limit permits up to 2 GiB of additional requested file reads.
+This works with ordinary user permissions on a fixed local volume.
+[Shared file position](https://learn.microsoft.com/en-us/windows/win32/api/handleapi/nf-handleapi-duplicatehandle)
+[Process I/O counters](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-getprocessiocounters)
+[Native file read](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntreadfile)
+
+Set the variables from the preceding procedure, including the verifier's
+fresh challenge. Use a new `$captureDir` and point `$observerKey` to the
+second private PEM. Register the two output files in the same packed case.
+
+```powershell
+$captureJson = & $python -B tools/capture-file-ranges.py --source $candidate --output $captureDir `
+    --signing-key $controllerKey --observer-signing-key $observerKey --case-id $caseId `
+    --target-path $targetName --capture-nonce $captureNonce --range '0+32' --range '64+64'
+if ($LASTEXITCODE -ne 0) { throw 'Observed acquisition failed' }
+$captureResult = $captureJson | ConvertFrom-Json
+if ($captureResult.collector_key_sha256 -cne $collectorKeySha256 -or
+    $captureResult.observer_key_sha256 -cne $observerKeySha256) { throw 'Unexpected acquisition keys' }
+```
+
+The combined `scope.knreads` starts with the eight ASCII bytes `KNREADW1`
+and two little-endian 32-bit lengths, followed by the original collector and
+observer JSON receipts. The observer signs the exact collector receipt digest,
+source identity, both process identities, paired counter and cursor readings,
+native repeat statuses and lengths, and a SHA-256 of the repeated bytes.
+The observer watches the collector's process handle between samples. A failed
+handshake ends collection. A forced collector exit can leave private staging
+files before the output directory is published.
+
+```powershell
+$readPolicy = @('--collector-key-sha256', $collectorKeySha256, '--capture-nonce', $captureNonce,
+                '--observer-key-sha256', $observerKeySha256)
+$json = & $python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan @trust @readPolicy
+if ($LASTEXITCODE -eq 2) { throw 'Observed acquisition replay failed' }
+$report = $json | ConvertFrom-Json
+$report.coverage.cases | Select-Object case_id, publisher_truth, collector_file_truth, os_read_observation
+```
+
+With both pins, the v6 report requires one process read in the interval,
+the expected cursor movement and byte count, a comparable result from the
+second read, and equal packed bytes. Each case reports the repeat's requested
+and returned bytes, the sampled process I/O deltas and the bytes used for the
+publisher comparison separately. Exit 1 records a missing, rejected or
+inconclusive required observation. The primary collector verdict stays in
+`collector_file_truth`. With only the collector policy, the report identifies
+the missing observer policy and can still use the primary evidence.
+
+The original requested length and Win32 result come from the collector.
+The observer independently repeats the planned length and retains its own
+NTSTATUS. Replay recognizes success, synchronous EOF and byte-range lock
+conflicts. Competing reads in the same process make the counter delta
+inconclusive. The measured interval includes the observer handshakes and
+repeat read. Kernel event attribution, simultaneous file contents and
+independent host identity require other evidence.
+[Validation on public files](VALIDATION.md#two-process-windows-file-read-comparison)
+
 ## Imported report semantics
 
 `kn.benchmark_report.v1` is UTF-8 JSON on stdout, capped at 16 MiB. A comparison

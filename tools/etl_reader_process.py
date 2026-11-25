@@ -36,6 +36,22 @@ class WindowsFiles:
         check(0 < get_system(buf, len(buf)) < len(buf), "cannot locate Windows system directory")
         self.tracerpt = Path(buf.value) / "tracerpt.exe"
 
+    def file_identity(self, stream):
+        import msvcrt
+        class FileId(ctypes.Structure):
+            _fields_ = [("volume", ctypes.c_ulonglong), ("identifier", ctypes.c_ubyte * 16)]
+        handle = msvcrt.get_osfhandle(stream.fileno())
+        data = FileId()
+        if not self.info(handle, 18, ctypes.byref(data), ctypes.sizeof(data)):  # FileIdInfo
+            raise ctypes.WinError(ctypes.get_last_error())
+        name = ctypes.create_unicode_buffer(32768)
+        length = self.final_name(handle, name, len(name), 0x9)  # VOLUME_NAME_GUID | FILE_NAME_OPENED
+        if not 0 < length < len(name):
+            raise ctypes.WinError(ctypes.get_last_error() if length == 0 else 122)
+        return dict(volume_serial=f"{data.volume:016x}", file_id=bytes(data.identifier).hex(),
+                    file_bytes=os.fstat(stream.fileno()).st_size,
+                    opened_path_sha256=hashlib.sha256(name.value.encode("utf-16le", errors="surrogatepass")).hexdigest())
+
     def process_identity(self, pid, *, process_handle=None):
         handle = self.open_process(0x1000, False, pid) if process_handle is None else process_handle
         if not handle:

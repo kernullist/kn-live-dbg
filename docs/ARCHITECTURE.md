@@ -4062,6 +4062,15 @@ hash identify the source handle observed by the controller. Joining that file
 to a loaded image requires additional mapping evidence.
 [Signed read receipts](BENCHMARK_CORPUS.md#record-the-file-offsets-windows-actually-read)
 
+A second Windows process can corroborate a file acquisition using a shared
+file position, process-wide I/O counters and its own read on a separate
+handle. Its signature binds these measurements to the original collector
+receipt. Under a required observer policy, an extra process read or conflicting
+repeat keeps the final file verdict unknown. The report retains the primary
+verdict and identifies the first unconfirmed attempt when its measurements
+locate the discrepancy. A packed digest disagreement applies to the capture.
+[Two-process file comparison](BENCHMARK_CORPUS.md#corroborate-a-capture-from-a-second-windows-process)
+
 The portable archive below binds the original roots and release roles, source
 policy and issuance receipt to one closed native collection. The operator
 keeps the trust configuration independently. Discovering a newer revision

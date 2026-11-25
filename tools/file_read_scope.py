@@ -3,8 +3,9 @@ import hashlib
 import json
 import re
 
-from cryptography.exceptions import InvalidSignature
-from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey, Ed25519PublicKey
+from cryptography.hazmat.primitives.serialization import load_pem_private_key
 
 from retained_corpus import CHUNK, MAX_PACKAGE
 
@@ -42,6 +43,17 @@ def context_valid(case_id, target, nonce):
 
 def canonical(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")).encode("ascii")
+
+
+def signing_key(stream):
+    raw = stream.read(8193)
+    require(len(raw) <= 8192, "invalid acquisition key")
+    try:
+        key = load_pem_private_key(raw, password=None)
+    except (ValueError, TypeError, UnsupportedAlgorithm):
+        raise ValueError("cannot load the acquisition signing key") from None
+    require(isinstance(key, Ed25519PrivateKey), "an Ed25519 private key is required")
+    return key
 
 
 def inspect_reads(body):

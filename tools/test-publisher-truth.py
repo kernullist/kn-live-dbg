@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 
 import file_read_scope as reads
+import read_observation
 import publisher_truth as publisher
 import publisher_history as history
 import publisher_ranges
@@ -556,6 +557,16 @@ class FileReadReceiptTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "invalid_collector_signature"):
             reads.verify(envelope, sha(self.pub), self.nonce)
 
+    def test_observation_frame_preserves_exact_signed_bytes(self):
+        frame = read_observation.combine(b"capture\n", b"observation")
+        self.assertEqual(read_observation.split(frame), (b"capture\n", b"observation"))
+        for invalid in (frame[:8], frame[:-1], frame+b"x", bytes(8)+frame[8:],
+                        read_observation.HEADER.pack(read_observation.MAGIC, 0, 1)+b"x"):
+            with self.assertRaisesRegex(ValueError, "invalid_read_observation_extent"):
+                read_observation.split(invalid)
+        with self.assertRaisesRegex(ValueError, "invalid_read_observation_extent"):
+            read_observation.combine(bytes(read_observation.MAX_CAPTURE + 1), b"x")
+
     def test_signed_impossible_attempts(self):
         for change in (dict(offset=-1), dict(transferred=True), dict(offset=4), dict(requested=0),
                        dict(win32_status=33), dict(operation="seek"), dict(end_ns=0), dict(requested=reads.CHUNK+1)):
@@ -590,6 +601,153 @@ class WindowsFileAcquisitionTests(unittest.TestCase):
         p = subprocess.run(command, capture_output=True, timeout=30, **kwargs)
         self.assertEqual(p.returncode, code, p.stderr or p.stdout[:500])
         return p.stdout
+
+    def observer_key(self):
+        key = Ed25519PrivateKey.generate()
+        path = self.root/"observer.key"
+        path.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+        return path, key
+
+    def test_observer_sees_cursor_counters_and_native_repeat(self):
+        import msvcrt
+        path, key = self.observer_key()
+        with self.source.open("rb") as lock:
+            lock.seek(3)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 4)
+            self.invoke([*self.command, "--observer-signing-key", path, "--range", "0+3", "--range", "3+4",
+                         "--range", "7+32", "--range", "40+1"])
+        capture, observed = read_observation.split((self.dest/"scope.knreads").read_bytes())
+        body = json.loads(capture)["body"]
+        result = read_observation.verify(observed, corpus.decode_document, capture, body, self.pin, sha(key.public_key().public_bytes_raw()))
+        self.assertEqual((result["status"], result["matching_attempt_results"], result["repeated_content_matches"]), ("corroborated", 4, True))
+        self.assertEqual((result["repeat_requested_bytes"], result["repeat_returned_bytes"], result["sampled_process_read_operations"],
+                          result["sampled_process_read_bytes"]), (40, len(SOURCE)-4, 4, len(SOURCE)-4))
+        rows = json.loads(observed)["body"]["observations"]
+        self.assertEqual([(r["before"]["position"], r["after"]["position"]) for r in rows], [(0, 3), (3, 3), (7, len(SOURCE)), (40, 40)])
+        self.assertEqual([r["repeat_ntstatus"] for r in rows], [0, 0xc0000054, 0, 0xc0000011])
+        self.assertEqual([r["after"]["read_bytes"] - r["before"]["read_bytes"] for r in rows], [3, 0, len(SOURCE)-7, 0])
+        # A signed sample can still be inconsistent with the other signed evidence.
+        original = json.loads(observed)
+        def replay(mutate):
+            doc = copy.deepcopy(original)
+            mutate(doc["body"])
+            doc["signature"] = key.sign(read_observation.DOMAIN + reads.canonical(doc["body"])).hex()
+            return read_observation.verify(raw(doc), corpus.decode_document, capture, body, self.pin, sha(key.public_key().public_bytes_raw()))
+        for mutate, expected in (
+                (lambda b: b["observations"][2]["after"].update(position=15), "cursor_disagreement"),
+                (lambda b: b["observations"][-1]["after"].update(read_operations=b["observations"][-1]["before"]["read_operations"]+2), "process_read_count_inconclusive"),
+                (lambda b: b["observations"][-1].update(repeat_ntstatus=0xc0000001), "repeat_status_unmapped"),
+                (lambda b: b["observations"][1].update(repeat_ntstatus=0), "repeat_result_disagrees"),
+                (lambda b: b["observations"][0].update(requested=5), "different_range_plan")):
+            self.assertEqual(replay(mutate)["first_unconfirmed"]["reason"], expected)
+        self.assertEqual(replay(lambda b: b.update(repeat_packed_sha256=sha(b"other")))["status"], "repeat_content_disagrees")
+        with self.assertRaisesRegex(ValueError, "observer_counters_regressed"):
+            replay(lambda b: b["observations"][-1]["before"].update(read_operations=0))
+        with self.assertRaisesRegex(ValueError, "observer_capture_mismatch"):
+            replay(lambda b: b.update(collector_receipt_sha256=sha(b"other")))
+
+    def test_observer_aliases_and_interrupted_collector(self):
+        path, _ = self.observer_key()
+        for key in (self.source, self.private):
+            self.invoke([*self.command, "--observer-signing-key", key, "--range", "0+1"], 2)
+        alias = self.root/"redirect"
+        os.link(path, alias)
+        before = path.read_bytes()
+        with alias.open("ab") as output:
+            self.assertEqual(subprocess.run([*self.command, "--observer-signing-key", path, "--help"],
+                                            stdout=output, stderr=output, timeout=10).returncode, 2)
+        self.assertEqual(path.read_bytes(), before)
+        spec = importlib.util.spec_from_file_location("collector", self.command[2])
+        collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collector)
+        args = SimpleNamespace(ranges=["0+3"], source=self.source, signing_key=self.private, observer_signing_key=path,
+                               output=self.dest, case_id="case", target_path="file.bin", capture_nonce=self.nonce)
+        child = []
+        def interrupt(_reader, _offset, _size, observer):
+            observer.checkpoint()
+            child.append(observer.process)
+            raise OSError("interrupted while observer is waiting")
+        with mock.patch.object(collector.DiskReader, "attempt", interrupt), self.assertRaisesRegex(OSError, "interrupted"):
+            collector.collect(args)
+        self.assertTrue(child and child[0].poll() is not None)
+        self.assertFalse(self.dest.exists() or list(self.root.glob(".knbench-*.tmp")))
+
+    def test_concurrent_unrelated_read_is_inconclusive(self):
+        path, _ = self.observer_key()
+        spec = importlib.util.spec_from_file_location("collector", self.command[2])
+        collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collector)
+        args = SimpleNamespace(ranges=["0+3"], source=self.source, signing_key=self.private, observer_signing_key=path,
+                               output=self.dest, case_id="case", target_path="file.bin", capture_nonce=self.nonce)
+        unrelated = self.root/"other-file"
+        unrelated.write_bytes(b"other I/O")
+        original = collector.DiskReader.__init__
+        with unrelated.open("rb", buffering=0) as extra:
+            def instrument(reader, files, stream):
+                original(reader, files, stream)
+                disk_read = reader.read
+                def read(*params):
+                    self.assertEqual(extra.read(1), b"o")
+                    return disk_read(*params)
+                reader.read = read
+            with mock.patch.object(collector.DiskReader, "__init__", instrument):
+                result = json.loads(collector.collect(args))
+        self.assertEqual(result["observation_status"], "attempts_inconclusive")
+        capture, other = read_observation.split((self.dest/"scope.knreads").read_bytes())
+        observation = read_observation.verify(other, corpus.decode_document, capture, json.loads(capture)["body"], self.pin,
+                                              result["observer_key_sha256"])
+        self.assertEqual(observation["first_unconfirmed"], dict(attempt=1, reason="process_read_count_inconclusive"))
+        self.assertTrue(observation["repeated_content_matches"])
+
+    def test_observer_exits_after_collector_dies_inside_read_window(self):
+        import ctypes
+        from ctypes import wintypes as w
+        from etl_reader_process import WindowsFiles
+        path, _ = self.observer_key()
+        # The child signals that the actual observer has taken its first sample.
+        # Retain the observer process handle before letting the collector exit.
+        program = """
+import importlib.util, os, sys
+from pathlib import Path
+from types import SimpleNamespace
+tools = Path(sys.argv[1]).parent
+sys.path.insert(0, str(tools))
+spec = importlib.util.spec_from_file_location('collector',sys.argv[1])
+c = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(c)
+def exit_in_window(reader, offset, size, observer):
+    observer.checkpoint()
+    print(observer.process.pid, flush=True)
+    if sys.stdin.buffer.read(1) == b'x': os._exit(73)
+    raise ValueError('test owner input failed')
+c.DiskReader.attempt = exit_in_window
+c.collect(SimpleNamespace(source=sys.argv[2],signing_key=sys.argv[3],observer_signing_key=sys.argv[4],
+    output=sys.argv[5],case_id='case',target_path='file.bin',capture_nonce=sys.argv[6],ranges=['0+1']))
+"""
+        fs = WindowsFiles()
+        wait = ctypes.WinDLL("kernel32").WaitForSingleObject
+        wait.argtypes, wait.restype = (w.HANDLE, w.DWORD), w.DWORD
+        with subprocess.Popen([sys.executable, "-B", "-c", program, self.command[2], self.source, self.private, path, self.dest,
+                               self.nonce], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as owner:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=1) as pending:
+                result = pending.submit(owner.stdout.readline)
+                try:
+                    pid = int(result.result(timeout=15))
+                    handle = fs.open_process(0x100000, False, pid)
+                    self.assertTrue(handle)
+                    try:
+                        self.assertEqual(wait(handle, 0), 258)
+                        owner.communicate(b"x", timeout=10)
+                        self.assertEqual(owner.returncode, 73)
+                        self.assertEqual(wait(handle, 5000), 0)
+                    finally:
+                        fs.close(handle)
+                finally:
+                    if owner.poll() is None:
+                        owner.stdin.close()
+                        owner.wait(timeout=35)
+        self.assertFalse(self.dest.exists())
 
     def test_locked_range_short_read_eof_and_source_identity(self):
         import msvcrt
@@ -667,6 +825,11 @@ class WindowsFileAcquisitionTests(unittest.TestCase):
         changed[4] ^= 1
         self.source.write_bytes(changed)
         self.invoke([*self.command, "--range", "2+6"])
+        observer_path, observer = self.observer_key()
+        observed_dir = self.root/"observed"
+        observation_pin = sha(observer.public_key().public_bytes_raw())
+        result = json.loads(self.invoke([*self.command, "--output", observed_dir, "--observer-signing-key", observer_path, "--range", "2+6"]))
+        self.assertEqual((result["observation_status"], result["observer_key_sha256"]), ("corroborated", observation_pin))
         blobs = {}
         def keep(data):
             blobs[sha(data)] = data
@@ -705,12 +868,35 @@ class WindowsFileAcquisitionTests(unittest.TestCase):
                                            sha(files["root"]), "--verification-time", "20240201T000000Z", *policy], expected))
         self.source.unlink()
         self.private.unlink()
+        observer_path.unlink()
         policy_flags = ["--collector-key-sha256", self.pin, "--capture-nonce", self.nonce]
         report = replay([case], *policy_flags)
         row = report["coverage"]["cases"][0]
         self.assertEqual((row["publisher_truth"], row["file_range_comparison"]["first_difference_offset"]), ("negative", 4))
         self.assertTrue(report["acquisition_scope_authenticated"] and report["ground_truth_authenticated"])
         self.assertEqual(replay([case], *policy_flags), report)
+        joined = (observed_dir/"scope.knreads").read_bytes()
+        bound = dict(case, holes_sha256=keep(joined))
+        required = [*policy_flags, "--observer-key-sha256", observation_pin]
+        result = replay([bound], *required)
+        self.assertTrue(result["ground_truth_authenticated"])
+        self.assertEqual(result["corroborated_acquisitions_per_planned_case"], corpus.ratio(1, 1))
+        self.assertEqual(result["coverage"]["cases"][0]["publisher_truth"], "negative")
+        optional = replay([bound], *policy_flags)["coverage"]["cases"][0]
+        self.assertEqual((optional["publisher_truth"], optional["os_read_observation"]["status"]), ("negative", "observer_policy_not_supplied"))
+        original, packet = read_observation.split(joined)
+        other = json.loads(packet)
+        other["body"]["repeat_packed_sha256"] = sha(b"disagreement")
+        invalid = keep(read_observation.combine(original, raw(other)))
+        other["signature"] = observer.sign(read_observation.DOMAIN + reads.canonical(other["body"])).hex()
+        disagreement = keep(read_observation.combine(original, raw(other)))
+        for item, flags, reason in [(case, required, "observer_receipt_missing"), (bound, [*required[:-1], "ab"*32], "untrusted_observer_key"),
+                                    (dict(bound, holes_sha256=invalid), required, "invalid_observer_signature"),
+                                    (dict(bound, holes_sha256=disagreement), required, "repeat_content_disagrees")]:
+            result = replay([item], *flags, expected=1)
+            self.assertFalse(result["ground_truth_authenticated"])
+            row = result["coverage"]["cases"][0]
+            self.assertEqual((row["publisher_truth"], row["os_read_observation"]["status"], row["collector_file_truth"]), ("unknown", reason, "negative"))
         unsigned = keep(raw(dict(schema="kn.benchmark_target_scope.v1", target_path="file.bin", file_bytes=len(SOURCE),
                                  missing=[[0, 2], [8, len(SOURCE)]])))
         modified = json.loads(signed)
