@@ -185,6 +185,12 @@ def verify_archived_approval(exe, capture, manifest, policy, envelope, source, r
         def read(path, pin, *more, code=0):
             return call([*replay, "--archive", path, "--archive-sha256", pin, *more], code)
         observed = read(archive, sha(data), *head, "--minimum-root-version", "1")
+        checkpoint = original["publisher_proof"].get("publisher_history", {}).get("previous_checkpoint_sha256")
+        if checkpoint:
+            assert observed["publisher_history"] == archived["publisher_history"] == original["publisher_proof"]["publisher_history"]
+            assert read(archive, sha(data), "--previous-checkpoint-sha256", checkpoint)["assessment"] == expected
+            rejected = read(archive, sha(data), "--previous-checkpoint-sha256", "0"*64, code=1)
+            assert rejected["status"] == "rejected" and "assessment" not in rejected
         assert observed["status"] == "reproduced" and observed["journal_membership_checked"]
         assert observed["original_assessment_reproduced"] and expected == archived["assessment"] == observed["assessment"]
         assert observed["original_windows_verification"] == original.get("windows_publisher")
@@ -198,7 +204,7 @@ def verify_archived_approval(exe, capture, manifest, policy, envelope, source, r
             assert denied["reason"] == "private replay workspace would drop archive encryption"
             assert not list(weak.glob(".knapproval-replay-*"))
 
-        if exercise_failures or catalog:
+        if exercise_failures or catalog or checkpoint:
             changed = workspace / "changed.knapprovalarchive"
             def reject(raw, *more):
                 changed.write_bytes(raw)
@@ -206,6 +212,15 @@ def verify_archived_approval(exe, capture, manifest, policy, envelope, source, r
                 assert r["status"] == "rejected" and "assessment" not in r
                 assert not list(recovery.glob(".knapproval-replay-*"))
                 return r
+            if checkpoint:
+                magic, prior_at, prior_size, _, size = struct.unpack_from("<8s16sI16sI", parts[3])
+                assert magic == b"KNPUBHS1" and prior_size > 0 and size > 0
+                different_at = datetime.strptime(prior_at.decode("ascii"), "%Y%m%dT%H%M%SZ") - timedelta(seconds=1)
+                changed_parts = parts.copy()
+                changed_parts[3] = parts[3][:8] + different_at.strftime("%Y%m%dT%H%M%SZ").encode() + parts[3][24:]
+                assert reject(frame(changed_parts, members))["reason"] == "previous_checkpoint_mismatch"
+                changed_parts[3] = parts[3][-size:]
+                assert reject(frame(changed_parts, members))["reason"] == "publisher_history_required"
             if catalog:
                 wrong = parts.copy()
                 wrong[6] = bytes([parts[6][0] ^ 1]) + parts[6][1:]

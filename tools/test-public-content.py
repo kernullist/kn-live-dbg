@@ -834,6 +834,23 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Supply root_updates in ascending order."))
 
+    def test_publisher_observation_files_and_receipts(self):
+        for name in ("case.KNPUBHISTORY", "case.knpubhistory.pending-1"):
+            self.assertIn("private-container-or-capture", {f["rule"] for f in AUDIT.inspect(name, b"")})
+        for data in (b"KNPUBHS1", b"KNPUBHS1" + bytes(96)):
+            self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.bin", data)})
+            self.assertEqual(AUDIT.inspect_stream("renamed.bin", io.BytesIO(data))[0], len(data))
+        for sample in (dict(schema="kn.publisher_history_result.v1"), dict(schema="kn.benchmark_publisher_report.v3"),
+                       dict(publisher_history={}), dict(checkpoint_sha256="a"), dict(previous_checkpoint_sha256="a"),
+                       dict(current_verification_time="time"), dict(rotated_online_roles=["timestamp"]),
+                       dict(previous_snapshot_entries=3), dict(current_snapshot_entries=4), dict(previous_verification_time="time"),
+                       dict(checkpoint_witness="role"), dict(previous_failed_role="snapshot"), dict(metadata_filename="test", previous_version=7),
+                       dict(failed_observation="current")):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                fragment = ("receipt\n" + json.dumps({"part": [sample]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("result.txt", fragment)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Record checkpoint_sha256 after a successful observation."))
+
     def test_windows_publisher_policy_and_receipts(self):
         samples = (dict(schema="kn.image_approval_policy.v2"), dict(schema="kn.image_approval_provision.v2"),
                    dict(windows_publisher={}), dict(reference_signature={}, issuer="team"),

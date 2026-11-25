@@ -54,6 +54,7 @@ def main(argv):
             ("--out", "new filename for the selected native policy")):
         parser.add_argument(flag, required=True, help=help_text)
     parser.add_argument("--minimum-root-version", help="lowest terminal version accepted from this publisher's retained root history")
+    parser.add_argument("--previous-checkpoint-sha256", help="independently retained checkpoint of the previous publisher observation")
     parser.add_argument("--catalog", help="exact retained Windows catalog required by the signed catalog row")
     parser.add_argument("--require-windows-publisher", action="store_true",
                         help="require a signed v2 policy and a matching Windows PE publisher")

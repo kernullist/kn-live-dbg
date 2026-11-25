@@ -58,6 +58,9 @@
 *.knverify.pending-*
 *.knapprovalarchive
 *.knapprovalarchive.pending-*
+*.knpubhistory
+*.knpubhistory.pending-*
+.knbench-*.tmp
 *.kniatarchive
 *.kniatarchive.pending-*
 .knapproval-replay-*/

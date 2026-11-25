@@ -1,14 +1,17 @@
 """Adjudicate a retained whole file against an externally pinned TUF publisher."""
 import base64
 from collections import Counter, defaultdict
-from datetime import datetime, timezone
 import hashlib
 import re
 
+import publisher_history
+from publisher_history import verification_time
 from retained_corpus import MAX_DOCUMENT, MAX_PACKAGE, visit_original
 
 try:
-    import cryptography.hazmat.primitives.asymmetric.ed25519  # Optional backend for securesystemslib.
+    from cryptography.exceptions import UnsupportedAlgorithm
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_pem_public_key
     from securesystemslib.exceptions import Error as SigningLibraryError
     from securesystemslib.formats import encode_canonical
     from tuf.api.exceptions import LengthOrHashMismatchError, RepositoryError
@@ -192,13 +195,15 @@ def parse_role(data, role, decode, *, delegated=False, invalid_links=None):
     return Metadata.from_dict(document), payload
 
 
-def verified_root(anchor, updates, decode, pin, proof):
+def verified_root(anchor, updates, decode, pin, proof, history_state=None):
     data = role_bytes(anchor)
     need(hashlib.sha256(data).hexdigest() == pin, "untrusted_root")
     metadata, payload = parse_role(data, "root", decode)
     root = metadata.signed
     result = root.get_verification_result("root", payload, metadata.signatures)
     need(bool(result), "signature_threshold_failed")
+    if history_state is not None:
+        history_state["chain"] = [hashlib.sha256(payload).digest()]
     if not updates:
         return root, result
     history = dict(anchor_version=root.version, presented_updates=len(updates), verified_updates=0,
@@ -213,6 +218,8 @@ def verified_root(anchor, updates, decode, pin, proof):
         need(bool(quorum.first), "previous_root_threshold_failed")
         need(bool(quorum.second), "new_root_threshold_failed")
         root, result = candidate, quorum.second
+        if history_state is not None:
+            history_state["chain"].append(hashlib.sha256(payload).digest())
         history.update(verified_updates=index, last_root_version=root.version, last_root_sha256=hashlib.sha256(data).hexdigest())
     return root, result
 
@@ -316,8 +323,36 @@ class DelegatedTargets:
                 stack.extend(reversed(children))
         return None, search
 
+    def witness_identities(self, proof):
+        # A checkpoint can remember a supplied role's signed content. Target authority
+        # still requires resolve() to follow the path selectors, expiry and priority.
+        pending = set(self.originals)
+        parents = [self.top]
+        identities = {}
+        while parents and pending:
+            parent = parents.pop()
+            delegations = parent.delegations
+            if delegations is None:
+                continue
+            for name in sorted(pending):
+                policy = delegations.roles
+                named = name in policy if policy is not None else delegations.succinct_roles.is_delegated_role(name)
+                if not named:
+                    continue
+                proof["checkpoint_witness"] = name
+                metadata, payload = self.load(name, {})
+                if parent.get_verification_result(name, payload, metadata.signatures):
+                    pending.remove(name)
+                    parents.append(metadata.signed)
+                    identities[name] = (metadata.signed.version, hashlib.sha256(payload).digest())
+        if pending:
+            proof["checkpoint_witness"] = min(pending)
+            raise Rejected("checkpoint_witness_unauthenticated")
+        proof.pop("checkpoint_witness", None)
+        return identities
 
-def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
+
+def check_release(raw, decode, trusted_root, instant, minimum_version=None, history_state=None):
     versions, links = {}, {}
     proof = {} if minimum_version is None else dict(minimum_root_version=minimum_version)
     role = "reference"
@@ -328,13 +363,15 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
         if delegated:
             proof["delegated_role_checks"] = []
         updates = reference_updates(bundle)
-        invalid_links = {} if delegated else None
+        invalid_links = {} if delegated or history_state is not None else None
         role = "root"
-        root, result = verified_root(bundle[role], updates, decode, trusted_root, proof)
+        root, result = verified_root(bundle[role], updates, decode, trusted_root, proof, history_state)
         # Historical roots authorize the next transition. Only the terminal root authorizes these roles.
         need(not root.is_expired(instant), "expired_metadata")
         versions[role] = role_receipt(root, result)
         need(minimum_version is None or root.version >= minimum_version, "root_version_below_minimum")
+        if history_state is not None:
+            history_state["root"] = root
         parent_link = None
         for role in ROLES[1:]:
             data = role_bytes(bundle[role])
@@ -348,6 +385,11 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
                 parent_link.verify_length_and_hashes(data)
                 links[role] = dict(version=version, length=parent_link.length, hashes=parent_link.hashes)
             versions[role] = role_receipt(metadata.signed, result)
+            if history_state is not None:
+                if role == "snapshot":
+                    # A release-wide checkpoint covers even names outside this target's lookup path.
+                    need(not invalid_links, "invalid_checkpoint_snapshot_entry")
+                history_state[role] = (metadata, payload)
             if role == "timestamp":
                 parent_link = metadata.signed.snapshot_meta
             elif role == "snapshot":
@@ -357,6 +399,9 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
         if delegated:
             targets = DelegatedTargets(metadata.signed, snapshot, invalid_links, bundle["delegated_roles"], decode, instant,
                                        proof["delegated_role_checks"])
+            if history_state is not None:
+                role = "delegated"
+                history_state["witnesses"] = targets.witness_identities(proof)
         return targets, dict(status="verified", roles=versions, metadata_links=links, **proof)
     except Rejected as exc:
         reason = str(exc)
@@ -365,6 +410,113 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None):
     except (KeyError, IndexError, TypeError, ValueError, AttributeError, OverflowError, RecursionError, RepositoryError, SigningLibraryError):
         reason = "invalid_role_metadata"
     return {}, dict(status=reason, failed_role=role, roles=versions, **proof)
+
+
+def public_keys(keys):
+    identities = set()
+    for key in keys:
+        try:
+            value = key.keyval["public"]
+            public = (Ed25519PublicKey.from_public_bytes(bytes.fromhex(value)) if key.keytype == "ed25519"
+                      else load_pem_public_key(value.encode("ascii")))
+            identities.add(public.public_bytes(Encoding.DER, PublicFormat.SubjectPublicKeyInfo))
+        except (KeyError, TypeError, AttributeError, ValueError, UnsupportedAlgorithm):
+            # An unrecognized key representation cannot establish a rotation.
+            return None
+    return identities
+
+
+def compare_releases(prior, current, detail):
+    old_chain, new_chain = prior["chain"], current["chain"]
+    need(len(new_chain) >= len(old_chain), "root_version_rollback")
+    need(new_chain[:len(old_chain)] == old_chain, "root_history_conflict")
+    if len(new_chain) > len(old_chain):
+        rotated = []
+        for role in ("timestamp", "snapshot"):
+            old, payload = prior[role]
+            root = current["root"]
+            if root.get_verification_result(role, payload, old.signatures):
+                continue
+            signers = prior["root"].get_verification_result(role, payload, old.signatures).signed
+            old_keys = public_keys(signers.values())
+            new_keys = public_keys(root.keys[key] for key in root.roles[role].keyids)
+            if old_keys and new_keys and old_keys - new_keys:
+                rotated.append(role)
+        if rotated:
+            detail["rotated_online_roles"] = rotated
+            return "online_key_recovery"
+    for role in ("timestamp", "snapshot", "targets"):
+        old, old_payload = prior[role]
+        new, new_payload = current[role]
+        need(new.signed.version >= old.signed.version, role + "_version_rollback")
+        need(new.signed.version != old.signed.version or new_payload == old_payload, role + "_version_conflict")
+    old_entries = prior["snapshot"][0].signed.meta
+    new_entries = current["snapshot"][0].signed.meta
+    detail["previous_snapshot_entries"] = len(old_entries)
+    detail["current_snapshot_entries"] = len(new_entries)
+    for name, old in old_entries.items():
+        new = new_entries.get(name)
+        if new is None or new.version < old.version:
+            detail.update(metadata_filename=name, previous_version=old.version, current_version=new.version if new else None)
+            raise Rejected("snapshot_entry_removed" if new is None else "snapshot_entry_rollback")
+    for name, (version, fingerprint) in prior.get("witnesses", {}).items():
+        witness = current.get("witnesses", {}).get(name)
+        if witness is not None and witness[0] == version and witness[1] != fingerprint:
+            detail.update(metadata_filename=name + ".json", previous_version=version, current_version=version)
+            raise Rejected("delegated_version_conflict")
+    if new_chain == old_chain and current["timestamp"][1] == prior["timestamp"][1]:
+        return "unchanged"
+    return "advanced"
+
+
+def check_reference(raw, decode, trusted_root, instant, minimum_version=None, previous_checkpoint=None):
+    if not raw.startswith(publisher_history.MAGIC) and previous_checkpoint is None:
+        return check_release(raw, decode, trusted_root, instant, minimum_version)
+    history = dict(previous_checkpoint_sha256=previous_checkpoint)
+    proof = dict(roles={}, publisher_history=history)
+    if minimum_version is not None:
+        proof["minimum_root_version"] = minimum_version
+    side = "reference"
+    try:
+        need(raw.startswith(publisher_history.MAGIC), "publisher_history_required")
+        previous, current = publisher_history.unpack(raw)
+        history["current_verification_time"] = current.at
+        need(verification_time(current.at) == instant, "checkpoint_verification_time_mismatch")
+        prior_state, current_state = {}, {}
+        if previous is not None:
+            side = "previous"
+            history["previous_verification_time"] = previous.at
+            need(previous_checkpoint is not None, "previous_checkpoint_required")
+            need(previous.checkpoint(trusted_root) == previous_checkpoint, "previous_checkpoint_mismatch")
+            old_at = verification_time(previous.at)
+            need(old_at <= instant, "checkpoint_time_rollback")
+            _, old_proof = check_release(previous.reference, decode, trusted_root, old_at, history_state=prior_state)
+            history["previous_roles"] = old_proof["roles"]
+            if old_proof["status"] != "verified":
+                history["previous_failed_role"] = old_proof["failed_role"]
+                if "checkpoint_witness" in old_proof:
+                    history["checkpoint_witness"] = old_proof["checkpoint_witness"]
+                raise Rejected(old_proof["status"])
+        else:
+            need(previous_checkpoint is None, "previous_observation_missing")
+        side = "current"
+        targets, proof = check_release(current.reference, decode, trusted_root, instant, minimum_version, current_state)
+        proof["publisher_history"] = history
+        if proof["status"] != "verified":
+            history["failed_observation"] = side
+            return {}, proof
+        side = "transition"
+        history["transition"] = compare_releases(prior_state, current_state, history) if previous else "bootstrap"
+        history["checkpoint_sha256"] = current.checkpoint(trusted_root)
+        return targets, proof
+    except ValueError as exc:
+        # Only the frame decoder and our evidence checks supply public reason codes here.
+        reason = str(exc) if isinstance(exc, Rejected) or side == "reference" else "invalid_checkpoint_metadata"
+    except (KeyError, TypeError, AttributeError, RepositoryError, SigningLibraryError):
+        reason = "invalid_checkpoint_metadata"
+    history["failed_observation"] = side
+    proof.update(status=reason, failed_role=side)
+    return {}, proof
 
 
 def compare_target(scope, pin, original, targets, stream, sha512_cache):
@@ -399,16 +551,7 @@ def compare_target(scope, pin, original, targets, stream, sha512_cache):
     return "negative", "differs_from_signed_target", details
 
 
-def verification_time(at):
-    try:
-        if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z", at):
-            raise ValueError
-        return datetime.strptime(at, "%Y%m%dT%H%M%SZ").replace(tzinfo=timezone.utc)
-    except ValueError:
-        raise ValueError("verification time must be a valid UTC YYYYMMDDTHHMMSSZ") from None
-
-
-def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, minimum_version=None):
+def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, minimum_version=None, previous_checkpoint=None):
     instant = verification_time(at)
     groups = defaultdict(list)
     coverage = {r["case_id"]: r for r in report["coverage"]["cases"]}
@@ -423,11 +566,13 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
     references, scope_cache, sha512_cache = [], {}, {}
     adjudicated = contradictions = confirmed = failed = 0
     for ref, group in groups.items():
-        data, gap = read_small(stream, objects, ref, MAX_DOCUMENT)
+        data, gap = read_small(stream, objects, ref, publisher_history.MAX_REFERENCE)
+        if data is not None and len(data) > MAX_DOCUMENT and not data.startswith(publisher_history.MAGIC):
+            gap = "over_limit"
         if gap:
             targets, proof = {}, dict(status="reference_" + gap)
         else:
-            targets, proof = check_reference(data, decode, trusted_root, instant, minimum_version)
+            targets, proof = check_reference(data, decode, trusted_root, instant, minimum_version, previous_checkpoint)
         status = proof["status"]
         failed += status not in ("verified", "reference_missing")
         for key in group:
@@ -465,4 +610,7 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                   contradicted_labels=contradictions, adjudicated_per_planned_case=ratio(adjudicated, len(cases)))
     if any("delegated_role_checks" in ref for ref in references):
         report.update(schema="kn.benchmark_publisher_report.v2", truth_basis="whole_file_against_signed_tuf_target")
+    if previous_checkpoint is not None or any("publisher_history" in ref for ref in references):
+        report.update(schema="kn.benchmark_publisher_report.v3", previous_checkpoint_sha256=previous_checkpoint,
+                      truth_basis="whole_file_against_signed_tuf_target")
     return derived, int(bool(failed))

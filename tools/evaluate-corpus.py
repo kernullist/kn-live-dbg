@@ -348,6 +348,8 @@ def retained_command(args, protected):
         import publisher_truth
         digest(args.trusted_root_sha256, "trusted publisher root")
         minimum = publisher_truth.root_version_floor(args.minimum_root_version)
+        if args.previous_checkpoint_sha256 is not None:
+            digest(args.previous_checkpoint_sha256, "previous publisher checkpoint")
     status = 0
     with ExitStack() as inputs:
         stream = None
@@ -389,7 +391,7 @@ def retained_command(args, protected):
             if args.trusted_root_sha256 is not None:
                 cases, status = publisher_truth.adjudicate(report, stream, originals, cases,
                                                           args.trusted_root_sha256, args.verification_time,
-                                                          decode_document, ratio, minimum)
+                                                          decode_document, ratio, minimum, args.previous_checkpoint_sha256)
             report["scopes"] = comparison_scopes(cases, scored)
         if args.trusted_root_sha256 is not None:
             raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
@@ -407,7 +409,7 @@ def main():
     paired = any(arg.startswith("--sa") and "--saved-etl-comparison".startswith(arg.split("=", 1)[0])
                  for arg in sys.argv[1:])
     archive_flags = ("--archive-corpus", "--write-archive", "--original", "--get-original", "--destination", "--file-list",
-                     "--trusted-root-sha256", "--verification-time", "--minimum-root-version")
+                     "--trusted-root-sha256", "--verification-time", "--minimum-root-version", "--previous-checkpoint-sha256")
     archived = any(arg.startswith("--") and any(flag.startswith(arg.split("=", 1)[0]) for flag in archive_flags)
                    for arg in sys.argv[1:])
     protected = sys.argv[1:]
@@ -449,12 +451,14 @@ def main():
     parser.add_argument("--destination", type=Path, help="new file to receive the selected original bytes")
     parser.add_argument("--trusted-root-sha256", help="independent trust anchor for publisher file comparisons")
     parser.add_argument("--minimum-root-version", help="lowest terminal version accepted from this publisher's retained root history")
+    parser.add_argument("--previous-checkpoint-sha256", help="independently retained checkpoint of the previous publisher observation")
     parser.add_argument("--verification-time", help="publisher metadata verification time in UTC, YYYYMMDDTHHMMSSZ")
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     parser.add_argument("--study-sha256", help="independently retained corpus hash for a partitioned ETL campaign")
     args = parser.parse_args()
-    if args.trusted_root_sha256 is not None or args.verification_time is not None or args.minimum_root_version is not None:
+    if any(value is not None for value in (args.trusted_root_sha256, args.verification_time,
+                                           args.minimum_root_version, args.previous_checkpoint_sha256)):
         if not (args.archive_corpus and args.trusted_root_sha256 and args.verification_time and args.get_original is None):
             parser.error("--trusted-root-sha256 and --verification-time require archive replay together")
     if args.study_sha256 is not None and args.etl_reader_campaign is None:

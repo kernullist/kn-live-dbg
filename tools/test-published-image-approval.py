@@ -1,5 +1,6 @@
 """Exercise offline provisioning with a test publisher, optionally replaying retained native cases."""
 import argparse
+import base64
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -14,6 +15,7 @@ import unittest
 from unittest import mock
 
 from approval_archive_oracle import verify_archived_approval
+import publisher_history
 
 
 TOOLS = Path(__file__).resolve().parent
@@ -93,6 +95,29 @@ class ApprovalFixture(unittest.TestCase):
         return receipt
 
 class ApprovalTests(ApprovalFixture):
+    def updated_reference(self, previous_at, at):
+        previous = publisher_history.Observation(previous_at, self.env.read_bytes())
+        doc = json.loads(previous.reference)
+        signed = json.loads(base64.b64decode(doc["timestamp"]))["signed"]
+        signed["version"] += 1
+        doc["timestamp"] = base64.b64encode(self.repository.sign("timestamp", signed)).decode("ascii")
+        current = publisher_history.Observation(at, raw(doc))
+        self.env.write_bytes(publisher_history.pack(previous, current))
+        return previous, current
+
+    def test_checkpoint_required_before_native_projection(self):
+        previous, current = self.updated_reference("20240101T000000Z", AT)
+        pin = previous.checkpoint(self.root_pin)
+        self.assertEqual(self.call(1)["reason"], "previous_checkpoint_required")
+        self.assertEqual(self.call(1, previous_checkpoint_sha256="0"*64)["reason"], "previous_checkpoint_mismatch")
+        accepted = self.call(0, previous_checkpoint_sha256=pin, out=self.root/"accepted.knapproval")
+        self.assertEqual(accepted["publisher_proof"]["publisher_history"]["transition"], "advanced")
+        self.env.write_bytes(previous.reference)
+        self.assertEqual(self.call(1, previous_checkpoint_sha256=pin)["reason"], "publisher_history_required")
+        self.env.write_bytes(publisher_history.pack(current, publisher_history.Observation(AT, previous.reference)))
+        self.assertEqual(self.call(1, previous_checkpoint_sha256=current.checkpoint(self.root_pin))["reason"],
+                         "timestamp_version_rollback")
+
     def delegate_policy(self, expiry, earlier):
         repo = self.repository
         source = self.source.read_bytes()
@@ -131,6 +156,15 @@ class ApprovalTests(ApprovalFixture):
         at = now.strftime("%Y%m%dT%H%M%SZ")
         self.call(0, manifest=manifest, reference=reference, verification_time=at)
         verify_archived_approval(native_exe, capture, manifest, self.out, self.env, self.source, self.provision_bytes,
+                                 self.root_pin, NAME, at)
+        previous, current = self.updated_reference((now - timedelta(minutes=1)).strftime("%Y%m%dT%H%M%SZ"), at)
+        pin = previous.checkpoint(self.root_pin)
+        output = self.root / "checkpoint.knapproval"
+        accepted = self.call(0, manifest=manifest, reference=reference, verification_time=at, previous_checkpoint_sha256=pin,
+                             out=output)
+        self.assertEqual(accepted["publisher_proof"]["publisher_history"]["checkpoint_sha256"], current.checkpoint(self.root_pin))
+        self.assertEqual(output.read_bytes(), self.out.read_bytes())
+        verify_archived_approval(native_exe, capture, manifest, output, self.env, self.source, self.provision_bytes,
                                  self.root_pin, NAME, at)
 
     def test_provision_with_rotated_approval_authority(self):

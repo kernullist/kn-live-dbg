@@ -644,6 +644,12 @@ to leave that check unset. Supply `$verificationTime` as UTC in
 `YYYYMMDDTHHMMSSZ` form, `$selectedPolicy` as a new filename in a private
 directory and `$capture` as the retained native capture to assess.
 
+For a publisher history file, set `$previousCheckpointSha256` to the
+predecessor digest from the independent case record and supply the current
+observation's recorded time. Set the variable to `$null` for a first
+observation or an ordinary reference.
+[Create a publisher history file](BENCHMARK_CORPUS.md#check-a-publisher-update-against-a-previous-observation)
+
 Set `$requireWindowsPublisher` to `$true` to require a v2 source policy, or
 `$false` to allow v1. A signed v2 policy always enforces its Windows checks.
 Set `$catalog` to the retained catalog file for a catalog row and to `$null`
@@ -655,6 +661,7 @@ Record the resulting receipt digest in your independent case record.
 
 ```powershell
 $approvalOptions = @()
+if ($previousCheckpointSha256) { $approvalOptions += @('--previous-checkpoint-sha256', $previousCheckpointSha256) }
 if ($null -ne $minimumRootVersion) { $approvalOptions += @('--minimum-root-version', $minimumRootVersion) }
 if ($requireWindowsPublisher) { $approvalOptions += '--require-windows-publisher' }
 if ($catalog) { $approvalOptions += @('--catalog', $catalog) }
@@ -761,11 +768,18 @@ The optional minimum root version also applies at replay. For a delegated
 approval, replay verifies the original search and its per-parent signatures
 using the metadata inside the archive.
 
+For a history-backed approval, the independently pinned receipt supplies
+the original predecessor checkpoint. Set `$previousCheckpointSha256` to
+its independently recorded value to require an additional match, or to
+`$null` to use the receipt. Both pack and replay return the verified
+transition and checkpoint in `publisher_history`.
+
 ```powershell
 $archiveOptions = @('--debugger', $debugger, '--debugger-sha256', $debuggerSha256,
     '--trusted-root-sha256', $trustedRootSha256, '--receipt-sha256', $receiptSha256,
     '--policy-target', $policyTarget, '--verification-time', $verificationTime)
 if ($null -ne $minimumRootVersion) { $archiveOptions += @('--minimum-root-version', $minimumRootVersion) }
+if ($previousCheckpointSha256) { $archiveOptions += @('--previous-checkpoint-sha256', $previousCheckpointSha256) }
 if ($requireWindowsPublisher) { $archiveOptions += '--require-windows-publisher' }
 if ($journalHeadSha256) { $archiveOptions += @('--journal-head-sha256', $journalHeadSha256) }
 $catalogOption = @()

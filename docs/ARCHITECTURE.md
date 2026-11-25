@@ -4035,6 +4035,15 @@ which policy wins. Its expiry therefore also limits the issued approval. The
 provisioning receipt identifies the consulted roles and the role that supplied
 the policy. Portable replay checks that receipt against the original envelope.
 
+A publisher history file carries two observations under one independently
+pinned root. The predecessor checkpoint binds its original reference and
+verification time. Issuance, corpus adjudication and native approval use the
+same comparison for root ancestry, timestamp, snapshot and target versions.
+The signed snapshot preserves version floors for every listed metadata file.
+Archive replay recovers the original predecessor pin from the separately
+pinned provisioning receipt and repeats the comparison at issuance time.
+[Publisher observation and recovery rules](BENCHMARK_CORPUS.md#check-a-publisher-update-against-a-previous-observation)
+
 The portable archive below binds the original roots and release roles, source
 policy and issuance receipt to one closed native collection. The operator
 keeps the trust configuration independently. Discovering a newer revision

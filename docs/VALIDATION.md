@@ -7,6 +7,33 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Publisher observation history
+
+On 2026-11-25 the offline verifier followed four retained Sigstore timestamps
+in order, 801, 802, 841 and 842. Snapshot 165 advanced to 166 and the terminal
+root advanced from 15 to 16. Each previous release was rechecked at its
+recorded UTC instant. Before using a predecessor checkpoint, both 842 and
+841 passed individually at the same instant. Supplying the checkpoint from
+842 rejected the return to 841. Repeating 842 yielded an unchanged release.
+Python-TUF independently agreed on both forward timestamp comparisons,
+the reversal and the equal-version case.
+
+Snapshot 165 named version 8 of the npm role. The unversioned file at that
+Git revision already contained version 9. Both verifiers rejected that file
+against snapshot 165. The retained version 8 passed, and snapshot 166
+authorized version 9. [Snapshot 165](https://github.com/sigstore/root-signing/blob/952ec3f76d39337a6b7e793c6d4918b889780446/metadata/snapshot.json)
+[Snapshot 166](https://github.com/sigstore/root-signing/blob/61b14aea66e14c98560845304cb3c2d421adcce2/metadata/snapshot.json)
+
+The ten registered file cases yielded two matches, one different file and
+seven unknowns. Replaying the pinned corpus after removing its source
+directory reproduced all ten outcomes. Separately, an owned native image
+approval using a delegated policy reproduced its provisioning decision and
+assessment from the portable archive. The archive rejected a changed
+predecessor time and removal of the history from its publisher reference.
+The observations establish ordering relative to the supplied checkpoint.
+Latest repository state and publication time require independent evidence.
+[Publisher checkpoint commands](BENCHMARK_CORPUS.md#check-a-publisher-update-against-a-previous-observation)
+
 ## Symbol and type validation fixtures
 
 On 2026-11-25 the x64 Release validators rebuilt both fixtures for the
@@ -42,8 +69,8 @@ In a separate owned image case, a delegated policy authorized the original
 native assessment after the source collection was removed. The portable
 archive reproduced the provisioning receipt and assessment. An earlier
 applicable sibling with a shorter lifetime capped the approval window in
-the expiry control. These runs cover the selected release and test
-authority. Cross-run timestamp and snapshot rollback checks remain open.
+the expiry control. These runs cover one release and the test authority.
+The [publisher history study](#publisher-observation-history) covers successive observations.
 [Publisher verification and report fields](BENCHMARK_CORPUS.md#verify-a-file-against-a-publishers-release)
 
 ## Cross-channel bugcheck reports

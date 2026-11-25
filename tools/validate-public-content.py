@@ -16,8 +16,8 @@ import stat
 import subprocess
 from pathlib import Path
 
-PRIVATE_ARCHIVE_HEADERS = (b"KNAPARC1", b"KNMDIAT1")
-PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".kniatarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".knsource", ".knsourceledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
+PRIVATE_ARCHIVE_HEADERS = (b"KNAPARC1", b"KNMDIAT1", b"KNPUBHS1")
+PRIVATE_EXTENSIONS = {".pfx", ".p12", ".pem", ".key", ".dmp", ".dump", ".etl", ".evtx", ".log", ".kncase", ".knledger", ".knindex", ".knchunk", ".knirp", ".knirpledger", ".knclaims", ".knschema", ".knsymidx", ".knblob", ".knchange", ".knapproval", ".knapprovalcase", ".knapprovalarchive", ".knpubhistory", ".kniatarchive", ".knscopeapproval", ".knscopeledger", ".knscopeblob", ".knapprovalledger", ".knverify", ".kncapture", ".kncaptureledger", ".knsource", ".knsourceledger", ".kntrace", ".knetlstatement", ".knetlset", ".knetlowner", ".kniotrace", ".knreads", ".knreadledger", ".knslice", ".knsweep", ".knsession", ".knjseg", ".knjindex", ".knjlock", ".knstorelock", ".kngc", ".kngcintent", ".kngcreceipt", ".knretirement", ".knprivacy", ".knshare", ".knredact", ".knsend", ".knsendresult", ".knbench", ".knmanifest"}
 PRIVATE_NAMES = {"auth.json", "credentials.json", "mcp-endpoint.json", "id_rsa", "id_ed25519"}
 PRIVATE_DIRECTORIES = {".git", ".build", ".vs", ".codex", ".kn-live-dbg",
                        "logs", "knlivedbg-logs", "dump-bin", "symbols", "mcp-clients"}
@@ -405,9 +405,13 @@ RETAINED_SCHEMAS = ("kn.benchmark_retention.v1", "kn.benchmark_retained_report.v
                     "kn.image_iat_reference.v1", "kn.minidump_iat_observation.v1", "kn.minidump_import_declaration.v1", "kn.minidump_iat_archive.v1",
                     "kn.benchmark_original_files.v1", "kn.benchmark_publisher_report.v1", "kn.benchmark_publisher_report.v2",
                     "kn.benchmark_target_scope.v1", "kn.benchmark_tuf_reference.v1", "kn.benchmark_tuf_reference.v2",
-                    "kn.benchmark_tuf_reference.v3", "kn.image_approval_provision.v1",
+                    "kn.benchmark_tuf_reference.v3", "kn.benchmark_publisher_report.v3", "kn.publisher_history_result.v1",
+                    "kn.image_approval_provision.v1",
                     "kn.image_approval_policy.v2", "kn.image_approval_provision.v2", "kn.image_approval_archive_result.v1")
 RETAINED_MARKERS = (*RETAINED_SCHEMAS, '"delegated_roles"', '"delegated_role_checks"', '"delegation_search"', '"role_check_indices"', '"delegated_role"', '"snapshot_link"',
+                    '"publisher_history"', '"checkpoint_sha256"', '"previous_checkpoint_sha256"', '"current_verification_time"',
+                    '"rotated_online_roles"', '"previous_snapshot_entries"', '"current_snapshot_entries"', '"previous_version"',
+                    '"previous_verification_time"', '"checkpoint_witness"', '"previous_failed_role"', '"failed_observation"',
                     '"spec_version"', '"terminating"', '"name_prefix"',
                     '"archive_requires_efs"', '"packing_reader_sha256"', '"original_report_reproduced"', '"original_windows_verification"', '"current_windows_verification"', '"original_status"', '"original_files"', '"referenced_objects"', '"missing_sha256"',
                     '"archived_attempts"', '"report_committed"', '"committed_source_report_path"', '"retained_collection_id"', '"claim_file_sha256"', '"requested_creation_filetime"', '"requested_filetime"', '"creation_filetime"', '"original_claim_matched"',
@@ -450,6 +454,9 @@ RETAINED_FIELDS = tuple(frozenset(fields) for fields in (
     ("wintrust_status",), ("win32_status", "finished_utc"),
     ("root_updates",), ("root_rotation",), ("last_root_sha256",), ("anchor_version", "presented_updates"),
     ("delegated_roles",), ("delegated_role_checks",), ("delegation_search",), ("role_check_indices",),
+    ("publisher_history",), ("previous_checkpoint_sha256",), ("checkpoint_sha256",), ("current_verification_time",),
+    ("rotated_online_roles",), ("previous_snapshot_entries",), ("current_snapshot_entries",), ("previous_verification_time",),
+    ("checkpoint_witness",), ("previous_failed_role",), ("metadata_filename", "previous_version"), ("failed_observation",),
     ("parent_role", "delegated_role"), ("snapshot_link", "metadata_sha256"),
     ("_type", "spec_version", "targets"), ("keyids", "threshold", "terminating"),
     ("keyids", "threshold", "name_prefix", "bit_length"),

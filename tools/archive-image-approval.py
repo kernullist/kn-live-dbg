@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 from etl_reader_process import WindowsFiles, file_hash
+from publisher_history import MAX_REFERENCE
 from image_approval_policy import (DECODE, IMAGE_LIMIT, NATIVE_LIMIT, authority_parameters, fields, filetime, hash_field,
                                    image_identity, number, record_projection, record_windows, select_approval)
 from owned_module_benchmark import check, encoded, sha
@@ -25,7 +26,7 @@ MIB = 1 << 20
 SEGMENTS = ("00000000000000000001.knjseg", "00000000000000000002.knjseg")
 # The first three records are the native session and its two journal segments.
 # The remaining records hold the exact TUF envelope, signed policy, receipt and optional catalog.
-LIMITS = (4096, 2 * MIB, 2 * MIB, MAX_DOCUMENT, NATIVE_LIMIT, MAX_DOCUMENT, IMAGE_LIMIT)
+LIMITS = (4096, 2 * MIB, 2 * MIB, MAX_REFERENCE, NATIVE_LIMIT, MAX_DOCUMENT, IMAGE_LIMIT)
 HEADER = struct.Struct("<8sI7I")
 MAX_PACKAGE = 448 * MIB
 MAX_SCOPE_INPUTS = 4097
@@ -184,6 +185,11 @@ def verify_authority(args, parts, store, roles):
     check(floor is None or type(floor) is int, "invalid recorded root version floor")
     inputs = argparse.Namespace(**vars(args))
     inputs.minimum_root_version = None if floor is None else str(floor)
+    # The original receipt is independently pinned before its historical floor is recovered.
+    inputs.previous_checkpoint_sha256 = receipt["publisher_proof"].get("publisher_history", {}).get("previous_checkpoint_sha256")
+    requested_checkpoint = getattr(args, "previous_checkpoint_sha256", None)
+    check(requested_checkpoint is None or requested_checkpoint == inputs.previous_checkpoint_sha256,
+          "previous publisher checkpoint differs from the independently requested pin")
     inputs.publisher_reference, inputs.policy = store / "publisher.json", store / "source.knapproval"
     inputs.manifest, inputs.reference = store / roles["manifest"], store / roles["reference"]
     inputs.catalog = store / "distribution.cat" if catalog else None
@@ -212,7 +218,7 @@ def verify_authority(args, parts, store, roles):
     pin = sha(raw)
     record_projection(expected, projected, pin)
     check(same_json(receipt, expected), "retained provisioning receipt disagrees with the verified inputs")
-    return pin, root_version, receipt.get("windows_publisher"), fresh
+    return pin, root_version, receipt.get("windows_publisher"), fresh, expected["publisher_proof"].get("publisher_history")
 
 
 def verify_stream(stream, args, program, workspace, protection):
@@ -253,7 +259,7 @@ def verify_stream(stream, args, program, workspace, protection):
                 copy_member(read, target, size, pin)
         check(not read(1), "trailing archive bytes")
         head = check_journal(program, collection, parts, roles["root"], args.journal_head_sha256)
-        policy, version, original, fresh = verify_authority(args, parts, store, roles)
+        policy, version, original, fresh, history = verify_authority(args, parts, store, roles)
         replay = native(program, "replay-image-approval", store / roles["root"], policy)
         check(replay["status"] == "reproduced" and replay["mode"] == "original_assessment" and
               replay["root_file_sha256"] == entries[roles["root"]][0] and replay["policy_anchor_sha256"] == policy and
@@ -262,7 +268,7 @@ def verify_stream(stream, args, program, workspace, protection):
         if original is not None:
             check(filetime(datetime.fromisoformat(original["finished_utc"])) <= number(replay["assessment"]["evaluation_filetime"]),
                   "recorded Windows verification finished after the original assessment")
-        return dict(collection_id=cid, archive_sha256=archive_digest.hexdigest(), archive_requires_efs=efs_required,
+        result = dict(collection_id=cid, archive_sha256=archive_digest.hexdigest(), archive_requires_efs=efs_required,
                     journal_head_sha256=head, journal_membership_checked=True,
                     approval_root_sha256=replay["root_file_sha256"], native_policy_sha256=policy,
                     receipt_sha256=args.receipt_sha256, trusted_root_sha256=args.trusted_root_sha256,
@@ -270,6 +276,9 @@ def verify_stream(stream, args, program, workspace, protection):
                     publisher_reference_sha256=sha(parts[3]), source_policy_sha256=sha(parts[4]),
                     original_windows_verification=original, current_windows_verification=fresh,
                     original_assessment_reproduced=True, assessment=replay["assessment"], collector_authenticated=False)
+        if history is not None:
+            result["publisher_history"] = history
+        return result
 
 
 def pack(args, files, program, workspace, protection):
@@ -351,6 +360,7 @@ def main(argv):
             op.add_argument(flag, required=True, help=help_text)
         op.add_argument("--journal-head-sha256", help="independently recorded native closure head")
         op.add_argument("--minimum-root-version", help="minimum accepted terminal TUF root version")
+        op.add_argument("--previous-checkpoint-sha256", help="require this historical predecessor in the pinned receipt")
         op.add_argument("--require-windows-publisher", action="store_true", help="require a signed Windows publisher policy")
     writer.add_argument("--collection", required=True, help="private native store's collections/ID directory")
     writer.add_argument("--publisher-reference", required=True, help="exact retained TUF distribution envelope")
@@ -370,6 +380,8 @@ def main(argv):
             digest(pin)
         if args.journal_head_sha256 is not None:
             digest(args.journal_head_sha256)
+        if args.previous_checkpoint_sha256 is not None:
+            digest(args.previous_checkpoint_sha256)
         if not packing:
             digest(args.archive_sha256)
         program = local_path(args.debugger)

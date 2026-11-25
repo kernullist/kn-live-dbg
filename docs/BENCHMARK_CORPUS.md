@@ -705,8 +705,8 @@ verified update counts, and the version and raw SHA-256 of the last root whose
 signatures passed. The reference's top-level `status` records whether the
 root and release metadata passed. The optional `--minimum-root-version`
 applies to all three envelope versions and accepts decimal integers from 1
-through 2⁶³−1. Timestamp and snapshot rollback checks across runs require a
-client's previously trusted metadata. Discovering newer revisions and proving
+through 2⁶³−1. To check for rollback across runs, supply the observation
+checkpoint described below. Discovering newer revisions and proving
 historical publication require independent evidence.
 [TUF root update rules](https://theupdateframework.github.io/specification/latest/#update-root)
 
@@ -745,6 +745,92 @@ search caused by missing or invalid metadata or the search bound. Exit 2
 indicates invalid arguments, a missing verifier dependency, an archive
 integrity failure or an I/O failure. The ordinary replay command continues
 to score the submitted labels. [Sigstore file study](VALIDATION.md#publisher-file-comparisons-on-2026-11-24)
+
+## Check a publisher update against a previous observation
+
+Start with a separately trusted root digest and a v1, v2 or v3 reference.
+Set `$python` to the interpreter with the publisher dependencies, `$firstReference`
+to that file, `$firstTime` to its UTC observation time and `$firstHistory` to
+a new private filename ending in `.knpubhistory`. This first observation
+establishes the starting point for subsequent comparisons.
+
+```powershell
+$issued = & $python -B tools/advance-publisher-reference.py --reference $firstReference --trusted-root-sha256 $anchor --verification-time $firstTime --out $firstHistory
+if ($LASTEXITCODE -ne 0) { throw 'First publisher observation failed' }
+$firstCheckpoint = ($issued | ConvertFrom-Json).checkpoint_sha256
+```
+
+Record `$firstCheckpoint` independently of the distribution. For the next
+observation, retrieve that digest as `$previousCheckpointSha256` and the
+corresponding history file as `$previousHistory`. Set `$newReference` and
+`$verificationTime` to the new release and observation time, and choose a
+new output filename for `$publisherReference`.
+
+```powershell
+$issued = & $python -B tools/advance-publisher-reference.py --reference $newReference --trusted-root-sha256 $anchor --verification-time $verificationTime --previous $previousHistory --previous-checkpoint-sha256 $previousCheckpointSha256 --out $publisherReference
+if ($LASTEXITCODE -ne 0) { throw 'Publisher update failed' }
+$observation = $issued | ConvertFrom-Json
+$observation.publisher_proof.publisher_history.transition
+$nextCheckpoint = $observation.checkpoint_sha256
+```
+
+Use `$publisherReference` as the registered truth reference or the input to
+image approval. Pass the **previous** checkpoint and the same UTC instant to
+`evaluate-corpus.py` or `provision-image-approval.py`. Keep `$nextCheckpoint`
+for the following update. Use the separate `publisher_reference_sha256` when
+pinning the entire history file. Exit 1 from the issuing command returns a
+rejected proof. Exit 2 reports an input, destination or delivery error. To
+reproduce a receipt after losing the original inputs or stdout, use the
+retained file and the same independently recorded trust inputs.
+
+```powershell
+$replayed = & $python -B tools/advance-publisher-reference.py --verify-history $publisherReference --trusted-root-sha256 $anchor --verification-time $verificationTime --previous-checkpoint-sha256 $previousCheckpointSha256
+if ($LASTEXITCODE -ne 0) { throw 'Publisher history verification failed' }
+($replayed | ConvertFrom-Json).checkpoint_sha256
+```
+
+The history file contains the exact previous and current references, each
+bounded at 8 MiB. Its 48-byte header starts with the eight ASCII bytes
+`KNPUBHS1`, followed by the previous and current time/length pairs.
+Each pair holds a 16-byte ASCII UTC instant and a little-endian 32-bit byte
+count. The first observation uses zero bytes throughout the previous pair.
+The two unmodified references follow in the same order. The checkpoint
+is SHA-256 over the ASCII string `kn.publisher.observation.v1`, one zero
+byte, the 32-byte initial root digest, the 16-byte observation time and the
+32-byte SHA-256 of that observation's exact reference.
+The verifier rechecks the previous release at its recorded time, checks the
+current release at the caller's time and requires time to move forward or
+remain equal. Every update uses the same original root anchor and extends
+the previously authenticated root history.
+
+The signed timestamp, snapshot and targets versions may increase or stay
+equal. Equal versions must retain the same signed content. Every name in
+the previous signed snapshot must remain present at the same or a higher
+version, including delegated roles outside the selected target's path.
+For supplied delegated files the verifier also checks the snapshot link
+and a chain of parent signatures. A role retained in both observations at
+the same version must have the same signed content. A version-only link
+leaves unobserved delegated bytes unspecified. Target lookup still checks
+path, priority and expiry. An unchanged root history and signed timestamp
+produce the transition `unchanged`.
+[TUF timestamp checks](https://theupdateframework.github.io/specification/latest/#update-timestamp)
+[TUF snapshot checks](https://theupdateframework.github.io/specification/latest/#update-snapshot)
+
+A verified successor root can recover from an inflated online version. The
+offline verifier resets the timestamp and snapshot floors when that root
+withdraws a previous timestamp or snapshot signer's public key and the
+previous signatures no longer meet the new quorum. Its proof records the
+affected roles under `online_key_recovery`. Changing only key identifiers or
+thresholds preserves the floors. Recovery compares decoded Ed25519 or
+PEM public keys. An unrecognized representation preserves the floors.
+All current signatures, links and expiry
+checks still apply. [TUF root recovery](https://theupdateframework.github.io/specification/latest/#update-root)
+
+The v3 publisher report records the observation and its transition. A required
+predecessor pin rejects a bare JSON reference, a first observation or a
+different predecessor. Keep the latest accepted pin in a trusted record.
+Concurrent updates from the same predecessor can produce separate valid
+observations. The operator selects which one to carry forward.
 
 ## Imported report semantics
 

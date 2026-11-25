@@ -7,6 +7,7 @@ from pathlib import Path
 import re
 import runpy
 
+import publisher_history
 from owned_module_benchmark import sha
 from retained_corpus import CHUNK, MAX_DOCUMENT, regular_file
 from saved_etl_comparison import digest
@@ -165,8 +166,13 @@ def authority_parameters(args, publisher):
 
 def select_approval(args, receipt, publisher, parameters):
     root, minimum_version, name, instant, at = parameters
-    envelope = read_document(args.publisher_reference, MAX_DOCUMENT)
-    targets, proof = publisher.check_reference(envelope, DECODE, root, instant, minimum_version)
+    checkpoint = getattr(args, "previous_checkpoint_sha256", None)
+    if checkpoint is not None:
+        digest(checkpoint)
+    envelope = read_document(args.publisher_reference, publisher_history.MAX_REFERENCE)
+    if len(envelope) > MAX_DOCUMENT and not envelope.startswith(publisher_history.MAGIC):
+        raise ValueError("input document outside byte limit")
+    targets, proof = publisher.check_reference(envelope, DECODE, root, instant, minimum_version, checkpoint)
     receipt.update(trusted_root_sha256=root, verification_time_utc=instant.isoformat().replace("+00:00", "Z"),
                    publisher_reference_sha256=sha(envelope), policy_target=name, publisher_proof=proof)
     require(proof["status"] == "verified", proof["status"])

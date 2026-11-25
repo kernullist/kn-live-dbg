@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from unittest import mock
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import publisher_truth as publisher
+import publisher_history as history
 import retained_corpus as archive
 
 
@@ -342,6 +344,243 @@ class DelegationTests(unittest.TestCase):
             self.assertNotEqual(publisher.check_reference(raw(bad), corpus.decode_document, self.anchor, TIME)[1]["status"], "verified")
 
 
+class PublisherHistoryTests(unittest.TestCase):
+    first_at = "20240101T000000Z"
+    second_at = "20240201T000000Z"
+
+    def setUp(self):
+        self.repo = Repository()
+        self.anchor = self.repo.files()["root"]
+        self.pin = sha(self.anchor)
+
+    def release(self, ts=2, snap=2, top=2, *, members=None, timestamp=None, snapshot=None, targets=None,
+                roots=(), online_signer=None, extra_signatures=()):
+        r = self.repo
+        files = r.files()
+        files["targets"] = r.sign("targets", dict(r.base["targets"], version=top, **(targets or {})))
+        entries = {"targets.json": {"version": top}, **(members or {})}
+        files["snapshot"] = r.sign("snapshot", dict(r.base["snapshot"], version=snap, meta=entries, **(snapshot or {})))
+        body = dict(r.base["timestamp"], version=ts, meta={"snapshot.json": {"version": snap}}, **(timestamp or {}))
+        files["timestamp"] = r.sign(online_signer or "timestamp", body)
+        if extra_signatures:
+            doc = json.loads(files["timestamp"])
+            doc["signatures"].extend(sig for role in extra_signatures for sig in json.loads(r.sign(role, body))["signatures"])
+            files["timestamp"] = raw(doc)
+        return history_bundle(files, self.anchor, roots) if roots else bundle(files)
+
+    def compare(self, old, new, *, previous_at=None, current_at=None, pin=None, minimum=None):
+        prev = history.Observation(previous_at or self.first_at, old)
+        current = history.Observation(current_at or self.second_at, new)
+        return publisher.check_reference(history.pack(prev, current), corpus.decode_document, self.pin, TIME,
+                                         minimum, pin if pin is not None else prev.checkpoint(self.pin))[1]
+
+    def test_all_snapshot_names_and_same_version_content(self):
+        old = self.release(members={"unvisited.json": {"version": 9}})
+        def run(reason, **params):
+            proof = self.compare(old, self.release(**params))
+            self.assertEqual(proof["status"], reason, proof)
+            self.assertNotIn("checkpoint_sha256", proof["publisher_history"])
+            return proof["publisher_history"]
+        run("timestamp_version_rollback", ts=1)
+        run("snapshot_version_rollback", ts=3, snap=1)
+        run("targets_version_rollback", ts=3, snap=3, top=1)
+        run("timestamp_version_conflict", timestamp={"expires": "2024-10-01T00:00:00Z"})
+        run("snapshot_version_conflict", ts=3)
+        run("targets_version_conflict", ts=3, snap=3, targets={"targets": {}})
+        self.assertEqual(run("snapshot_entry_removed", ts=3, snap=3)["metadata_filename"], "unvisited.json")
+        h = run("snapshot_entry_rollback", ts=3, snap=3, members={"unvisited.json": {"version": 8}})
+        self.assertEqual((h["metadata_filename"], h["previous_version"], h["current_version"]), ("unvisited.json", 9, 8))
+        run("invalid_checkpoint_snapshot_entry", ts=3, snap=3, members={"unvisited.json": {"version": True}})
+        self.assertEqual(self.compare(old, old+b" ")["publisher_history"]["transition"], "unchanged")
+        advanced = self.release(ts=3, snap=3, members={"unvisited.json": {"version": 10}})
+        self.assertEqual(self.compare(old, advanced)["publisher_history"]["transition"], "advanced")
+        # Re-signing the identical body or changing its outer whitespace keeps its signed identity.
+        doc = json.loads(old)
+        for role in ("timestamp", "targets"):
+            entry = json.loads(base64.b64decode(doc[role]))
+            entry["signatures"].reverse()
+            doc[role] = base64.b64encode(b" "+raw(entry)).decode()
+        self.assertEqual(self.compare(old, raw(doc))["publisher_history"]["transition"], "unchanged")
+
+    def test_time_and_independent_observation_binding(self):
+        old = self.release(timestamp={"expires": "2024-01-15T00:00:00Z"})
+        new = self.release(ts=3)
+        self.assertEqual(self.compare(old, new)["status"], "verified")
+        self.assertEqual(self.compare(old, new, previous_at=self.second_at)["status"], "expired_metadata")
+        self.assertEqual(self.compare(old, new, previous_at="20240301T000000Z")["status"], "checkpoint_time_rollback")
+        self.assertEqual(self.compare(old, new, current_at=self.first_at)["status"], "checkpoint_verification_time_mismatch")
+        self.assertEqual(self.compare(old, new, pin="0"*64)["status"], "previous_checkpoint_mismatch")
+        first = history.Observation(self.first_at, old)
+        expected = sha(b"kn.publisher.observation.v1\0"+bytes.fromhex(self.pin)+self.first_at.encode()+bytes.fromhex(sha(old)))
+        self.assertEqual(first.checkpoint(self.pin), expected)
+        for wrong in (history.Observation(self.second_at, old).checkpoint(self.pin),
+                      history.Observation(self.first_at, old+b" ").checkpoint(self.pin), first.checkpoint("0"*64)):
+            self.assertEqual(self.compare(old, new, pin=wrong)["status"], "previous_checkpoint_mismatch")
+        current = history.Observation(self.second_at, new)
+        for ref, supplied, reason in ((new, expected, "publisher_history_required"),
+                                      (history.pack(None, current), expected, "previous_observation_missing"),
+                                      (history.pack(first, current), None, "previous_checkpoint_required")):
+            targets, proof = publisher.check_reference(ref, corpus.decode_document, self.pin, TIME, previous_checkpoint=supplied)
+            self.assertEqual((targets, proof["status"]), ({}, reason))
+
+    def test_root_prefix_and_online_key_recovery(self):
+        r = self.repo
+        two = successor(r, r, 2)
+        other_two = successor(r, r, 2, expires="2024-11-01T00:00:00Z")
+        old = self.release(ts=20)
+        self.assertEqual(self.compare(self.release(roots=[two]), self.release())["status"], "root_version_rollback")
+        self.assertEqual(self.compare(self.release(roots=[two]), self.release(roots=[other_two]))["status"], "root_history_conflict")
+        self.assertEqual(self.compare(old, self.release(roots=[two]))["status"], "timestamp_version_rollback")
+        self.assertEqual(self.compare(old, self.release(ts=21, roots=[two]), minimum=2)["status"], "verified")
+        self.assertEqual(self.compare(old, self.release(ts=21, roots=[two]), minimum=3)["status"], "root_version_below_minimum")
+        policies = copy.deepcopy(r.base["root"]["roles"])
+        policies["timestamp"] = policies["snapshot"].copy()
+        rotated = successor(r, r, 2, roles=policies)
+        new = self.release(ts=1, snap=1, top=1, roots=[rotated], online_signer="snapshot")
+        proof = self.compare(old, new)
+        self.assertEqual((proof["status"], proof["publisher_history"]["rotated_online_roles"]), ("verified", ["timestamp"]))
+        self.assertEqual(self.compare(old, self.release(roots=[rotated]))["status"], "signature_threshold_failed")
+        policies["timestamp"] = dict(keyids=r.quorum["timestamp"]+r.quorum["snapshot"], threshold=2)
+        threshold = successor(r, r, 2, roles=policies)
+        self.assertEqual(self.compare(old, self.release(roots=[threshold], extra_signatures=["snapshot"]))["status"],
+                         "timestamp_version_rollback")
+        policies = copy.deepcopy(r.base["root"]["roles"])
+        policies["snapshot"] = policies["timestamp"].copy()
+        next_root = successor(r, r, 2, roles=policies)
+        wrapped = json.loads(self.release(ts=1, snap=1, top=1, roots=[next_root]))
+        snapshot = json.loads(base64.b64decode(wrapped["snapshot"]))["signed"]
+        wrapped["snapshot"] = base64.b64encode(r.sign("timestamp", snapshot)).decode()
+        self.assertEqual(self.compare(old, raw(wrapped))["publisher_history"]["rotated_online_roles"], ["snapshot"])
+        # Relabeling the same signing material can break verification by key ID without replacing the key.
+        old_id, = r.quorum["timestamp"]
+        new_id = sha(b"alias")
+        keys = copy.deepcopy(r.base["root"]["keys"])
+        keys[new_id] = {**keys[old_id], "keyval": {"public": keys[old_id]["keyval"]["public"].upper()}}
+        policies = copy.deepcopy(r.base["root"]["roles"])
+        policies["timestamp"] = dict(keyids=[new_id], threshold=1)
+        wrapped = json.loads(self.release(roots=[successor(r, r, 2, roles=policies, keys=keys)]))
+        meta = json.loads(base64.b64decode(wrapped["timestamp"]))
+        meta["signatures"][0]["keyid"] = new_id
+        wrapped["timestamp"] = base64.b64encode(raw(meta)).decode()
+        self.assertEqual(self.compare(old, raw(wrapped))["status"], "timestamp_version_rollback")
+
+    def test_delegated_witnesses_and_snapshot_only_members(self):
+        r = self.repo
+        rules = [delegation(r, "leaf", ["allowed/*"])]
+        top = role_body(r, {}, rules)
+        def witness(custom, *, wrong_key=False, omit=False, whitespace=False):
+            data = r.sign("snapshot" if wrong_key else "timestamp", role_body(r, {}, custom=custom))
+            if whitespace:
+                data += b" "
+            return delegated_release(r, top, {"leaf": data}, retained={} if omit else {"leaf": data},
+                                     links={"leaf": {"version": 1}})
+        old = witness("one")
+        self.assertEqual(self.compare(old, witness("two"))["status"], "delegated_version_conflict")
+        self.assertEqual(self.compare(old, witness("one", whitespace=True))["status"], "verified")
+        self.assertEqual(self.compare(old, witness("one", omit=True))["status"], "verified")
+        self.assertEqual(self.compare(old, witness("one", wrong_key=True))["status"], "checkpoint_witness_unauthenticated")
+        self.assertEqual(self.compare(witness("one", wrong_key=True), old)["publisher_history"]["checkpoint_witness"], "leaf")
+        detached = json.loads(old)
+        detached["delegated_roles"]["orphan"] = detached["delegated_roles"].pop("leaf")
+        self.assertEqual(self.compare(old, raw(detached))["checkpoint_witness"], "orphan")
+
+    def test_snapshot_entry_comparison_against_python_tuf(self):
+        from tuf.api import exceptions
+        from tuf.ngclient._internal.trusted_metadata_set import EnvelopeType, TrustedMetadataSet
+        old = self.release(members={"unvisited.json": {"version": 4}})
+        old_bytes = base64.b64decode(json.loads(old)["snapshot"])
+        for version, expected in ((None, "snapshot_entry_removed"), (3, "snapshot_entry_rollback"),
+                                  (4, "verified"), (5, "verified")):
+            members = {"unvisited.json": {"version": version}} if version is not None else {}
+            new = self.release(ts=3, snap=3, members=members)
+            doc = json.loads(new)
+            sdk = TrustedMetadataSet(self.anchor, EnvelopeType.METADATA)
+            sdk.reference_time = TIME
+            sdk.update_timestamp(base64.b64decode(doc["timestamp"]))
+            # The updater retains a previously trusted snapshot even when its version is no longer final.
+            with self.assertRaises(exceptions.BadVersionNumberError):
+                sdk.update_snapshot(old_bytes, trusted=True)
+            self.assertEqual(sdk.snapshot.version, 2)
+            if expected == "verified":
+                self.assertEqual(sdk.update_snapshot(base64.b64decode(doc["snapshot"])).version, 3)
+            else:
+                with self.assertRaises(exceptions.RepositoryError):
+                    sdk.update_snapshot(base64.b64decode(doc["snapshot"]))
+            self.assertEqual(self.compare(old, new)["status"], expected)
+
+    def test_framing_boundaries_and_previous_authentication(self):
+        current = history.Observation(self.second_at, self.release())
+        prev = history.Observation(self.first_at, current.reference)
+        frame = history.pack(prev, current)
+        for broken in (frame[:-1], frame+b"x", frame[:10], history.HEADER.pack(history.MAGIC, bytes(16), 0,
+                        self.second_at.encode(), len(frame))+frame):
+            self.assertNotEqual(publisher.check_reference(broken, corpus.decode_document, self.pin, TIME)[1]["status"], "verified")
+        with self.assertRaises(ValueError):
+            history.pack(None, history.Observation(self.second_at, frame))
+        max_member = current.reference.ljust(archive.MAX_DOCUMENT)
+        both = history.pack(prev._replace(reference=max_member), current._replace(reference=max_member))
+        self.assertEqual(len(both), history.MAX_REFERENCE)
+        self.assertEqual(self.compare(max_member, max_member)["status"], "verified")
+        bad = json.loads(current.reference)
+        bad["timestamp"] = bad["targets"]
+        proof = self.compare(raw(bad), current.reference)
+        self.assertEqual((proof["failed_role"], proof["publisher_history"]["previous_failed_role"]), ("previous", "timestamp"))
+        self.assertNotIn("checkpoint_sha256", proof["publisher_history"])
+
+    def test_command_advances_three_observations_without_overwriting(self):
+        cli = Path(__file__).with_name("advance-publisher-reference.py")
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            src, first, second, third, rejected = (directory/n for n in ("input", "first", "second", "third", "rejected"))
+            def command(out, at, *extra):
+                return [sys.executable, "-B", cli, "--reference", src, "--trusted-root-sha256", self.pin,
+                        "--verification-time", at, "--out", out, *extra]
+            def run(code, out, at, *extra):
+                proc = subprocess.run(command(out, at, *extra), capture_output=True, timeout=30)
+                self.assertEqual(proc.returncode, code, (proc.stdout, proc.stderr))
+                return json.loads(proc.stdout) if proc.stdout else {}
+            src.write_bytes(self.release(ts=1))
+            a = run(0, first, self.first_at)
+            self.assertEqual(a["publisher_reference_sha256"], sha(first.read_bytes()))
+            src.write_bytes(self.release(ts=2))
+            args = ("--previous", first, "--previous-checkpoint-sha256", a["checkpoint_sha256"])
+            b = run(0, second, self.second_at, *args)
+            verify = [sys.executable, "-B", cli, "--verify-history", second, "--trusted-root-sha256", self.pin,
+                      "--verification-time", self.second_at]
+            replay = subprocess.run([*verify, "--previous-checkpoint-sha256", a["checkpoint_sha256"]], capture_output=True)
+            self.assertEqual((replay.returncode, json.loads(replay.stdout)), (0, b))
+            replay = subprocess.run(verify, capture_output=True)
+            self.assertEqual((replay.returncode, json.loads(replay.stdout)["publisher_proof"]["status"]),
+                             (1, "previous_checkpoint_required"))
+            args2 = ("--previous", second, "--previous-checkpoint-sha256", b["checkpoint_sha256"])
+            self.assertEqual(run(0, third, self.second_at, *args2)["publisher_proof"]["publisher_history"]["transition"], "unchanged")
+            self.assertFalse(history.unpack(third.read_bytes())[0].reference.startswith(history.MAGIC))
+            self.assertEqual(run(1, rejected, self.second_at, "--previous", first, "--previous-checkpoint-sha256",
+                                 b["checkpoint_sha256"])["publisher_proof"]["status"], "previous_checkpoint_mismatch")
+            src.write_bytes(self.release(ts=1))
+            self.assertEqual(run(1, rejected, self.second_at, *args2)["publisher_proof"]["status"], "timestamp_version_rollback")
+            self.assertFalse(rejected.exists())
+            run(2, first, self.second_at, *args2)
+            self.assertEqual(sha(first.read_bytes()), a["publisher_reference_sha256"])
+            for path in (src, second, third):
+                raw_before = path.read_bytes()
+                alias = directory/"redirected-output"
+                os.link(path, alias)
+                with alias.open("ab", buffering=0) as sink:
+                    proc = subprocess.run([*command(third, self.second_at, *args2), "--help"], stdout=sink, stderr=sink)
+                self.assertEqual(proc.returncode, 2)
+                self.assertEqual(path.read_bytes(), raw_before)
+                alias.unlink()
+            race = directory/"race"
+            children = [subprocess.Popen(command(race, self.second_at), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                        for _ in range(2)]
+            outputs = [child.communicate(timeout=30) for child in children]
+            self.assertEqual(sorted(child.returncode for child in children), [0, 2])
+            index = next(i for i, child in enumerate(children) if child.returncode == 0)
+            self.assertEqual(json.loads(outputs[index][0])["publisher_reference_sha256"], sha(race.read_bytes()))
+            self.assertFalse(list(directory.glob(".knbench-*.tmp")))
+
+
 class PublisherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -545,6 +784,26 @@ class PublisherTests(unittest.TestCase):
             self.assertEqual(by_case["unlisted"]["truth_reason"], "delegated_metadata_missing")
             self.assertEqual(by_case["match"]["delegation_search"]["target_role"], "release")
             self.assertEqual(len(report["publisher_references"][0]["delegated_role_checks"]), 2)
+
+            previous = history.Observation("20240101T000000Z", inputs[delegated].read_bytes())
+            current = history.Observation("20240201T000000Z", inputs[delegated].read_bytes())
+            framed = keep(history.pack(previous, current))
+            mixed = [dict(c, truth_ref_sha256=framed) if c["id"] == "match" else c for c in cases]
+            new_plan = raw(dict(json.loads(plan), cases=mixed))
+            new_results = raw(dict(json.loads(results), corpus_sha256=sha(new_plan)))
+            members = set(inputs) - {rotated, delegated}
+            path = directory / "observations.knbench"
+            receipt = archive.seal(path, new_plan, new_results, [inputs[k] for k in sorted(members)], members)
+            command = ["--archive-corpus", path, "--sha256", receipt["package_sha256"], "--plan-sha256", sha(new_plan)]
+            checkpoint = previous.checkpoint(sha(files["root"]))
+            report = run(command + flags + ["--previous-checkpoint-sha256", checkpoint], 1)
+            self.assertEqual((report["schema"], report["previous_checkpoint_sha256"]), ("kn.benchmark_publisher_report.v3", checkpoint))
+            proofs = {r["truth_ref_sha256"]: r for r in report["publisher_references"]}
+            self.assertEqual(proofs[ref]["status"], "publisher_history_required")
+            self.assertEqual(proofs[framed]["publisher_history"]["transition"], "unchanged")
+            self.assertEqual(report["adjudicated_per_planned_case"], corpus.ratio(1, len(cases)))
+            self.assertEqual(run(command + ["--previous-checkpoint-sha256", checkpoint], 2), b"")
+            self.assertEqual(run(command + flags + ["--previous-checkpoint-sha256", "invalid"], 2), b"")
 
     def test_changed_original_is_an_archive_failure(self):
         with self.assertRaisesRegex(ValueError, "changed"):
