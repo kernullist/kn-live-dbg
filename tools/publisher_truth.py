@@ -11,6 +11,7 @@ from publisher_ranges import RangeReplay
 from retained_corpus import MAX_DOCUMENT, MAX_PACKAGE, visit_original
 
 try:
+    import file_read_scope
     from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
     from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat, load_pem_public_key
@@ -55,26 +56,27 @@ def read_small(stream, objects, pin, limit):
 
 
 def target_name(name):
-    need(type(name) is str and 0 < len(name.encode("utf-8")) <= 512 and
-         not any(ord(ch) < 32 or ord(ch) == 127 or ch in "\\:" for ch in name) and
-         all(part not in ("", ".", "..") for part in name.split("/")), "invalid_target_name")
+    need(file_read_scope.target_name_valid(name), "invalid_target_name")
     return name
+
+
+def registered_scope(scope, keep_ranges):
+    need(type(scope) is dict and scope.keys() == {"schema", "target_path", "file_bytes", "missing"} and
+         scope["schema"] == "kn.benchmark_target_scope.v1", "invalid_file_scope")
+    name, length, missing = scope["target_path"], scope["file_bytes"], scope["missing"]
+    target_name(name)
+    need(type(length) is int and 0 <= length <= MAX_PACKAGE and type(missing) is list, "invalid_file_scope")
+    end = 0
+    for span in missing:
+        need(type(span) is list and len(span) == 2 and all(type(x) is int for x in span) and
+             end <= span[0] < span[1] <= length, "invalid_file_scope")
+        end = span[1]
+    return name, length, missing if keep_ranges else bool(missing)
 
 
 def file_scope(raw, decode, *, keep_ranges=False):
     try:
-        scope = decode(raw)
-        need(type(scope) is dict and scope.keys() == {"schema", "target_path", "file_bytes", "missing"} and
-             scope["schema"] == "kn.benchmark_target_scope.v1", "invalid_file_scope")
-        name, length, missing = scope["target_path"], scope["file_bytes"], scope["missing"]
-        target_name(name)
-        need(type(length) is int and 0 <= length <= MAX_PACKAGE and type(missing) is list, "invalid_file_scope")
-        end = 0
-        for span in missing:
-            need(type(span) is list and len(span) == 2 and all(type(x) is int for x in span) and
-                 end <= span[0] < span[1] <= length, "invalid_file_scope")
-            end = span[1]
-        return (name, length, missing if keep_ranges else bool(missing)), None
+        return registered_scope(decode(raw), keep_ranges), None
     except Rejected as exc:
         return None, str(exc)
     except (ValueError, RecursionError):
@@ -555,7 +557,8 @@ def compare_target(scope, pin, original, targets, stream, sha512_cache, *, case=
     return "negative", "differs_from_signed_target", details
 
 
-def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, minimum_version=None, previous_checkpoint=None):
+def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, minimum_version=None, previous_checkpoint=None,
+               collector_key=None, capture_nonce=None):
     instant = verification_time(at)
     groups = defaultdict(list)
     coverage = {r["case_id"]: r for r in report["coverage"]["cases"]}
@@ -570,12 +573,34 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
     references, scope_cache, sha512_cache = [], {}, {}
     range_replay = RangeReplay(stream, objects)
     has_range_cases = False
+    authenticated = 0
+    has_read_policy = collector_key is not None
+    has_read_receipts = False
 
     @lru_cache(maxsize=1)
     def load_scope(pin, keep_ranges):
         # A large decoded hole map is needed only while its ranges are being compared.
         raw, gap = read_small(stream, objects, pin, MAX_SCOPE)
-        return (None, "scope_" + gap) if gap else file_scope(raw, decode, keep_ranges=keep_ranges)
+        if gap:
+            return None, "scope_" + gap, None
+        try:
+            record = decode(raw)
+        except (ValueError, RecursionError):
+            return None, "invalid_file_scope", None
+        if type(record) is dict and record.get("schema") == file_read_scope.SCHEMA:
+            if not keep_ranges:
+                return None, "receipt_requires_packed_range_case", {}
+            try:
+                scope, witness = file_read_scope.verify(record, collector_key, capture_nonce)
+            except (ValueError, RecursionError) as exc:
+                return None, str(exc), {}
+            return scope, None, witness
+        if has_read_policy:
+            return None, "signed_read_receipt_required", None
+        try:
+            return registered_scope(record, keep_ranges), None, None
+        except Rejected as exc:
+            return None, str(exc), None
 
     adjudicated = contradictions = confirmed = failed = 0
     for ref, group in groups.items():
@@ -595,14 +620,24 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                 has_range_cases = True
                 coverage[key].update(publisher_file_sha256=case["publisher_file_sha256"], artifact_layout=case["artifact_layout"])
             truth, reason, details = "unknown", status, {}
-            if status == "verified" or ranges:
+            if status == "verified" or ranges or has_read_policy:
                 holes = case["holes_sha256"]
                 if ranges:
-                    scope, scope_error = load_scope(holes, True)
+                    scope, scope_error, witness = load_scope(holes, True)
                 else:
                     if holes not in scope_cache:
                         scope_cache[holes] = load_scope(holes, False)
-                    scope, scope_error = scope_cache[holes]
+                    scope, scope_error, witness = scope_cache[holes]
+                if has_read_policy or witness is not None:
+                    has_read_receipts |= witness is not None
+                    if witness:
+                        scope_error = file_read_scope.binding_error(witness, case, objects.get(case["artifact_sha256"]))
+                    if scope_error:
+                        scope = None
+                        failed += scope_error not in ("scope_missing", "receipt_capture_unavailable")
+                    else:
+                        authenticated += 1
+                    coverage[key]["read_acquisition"] = dict(status=scope_error or "verified", **(witness or {}))
                 if status == "verified" and scope is None:
                     reason = scope_error
                 if status == "verified" and scope is not None:
@@ -618,6 +653,8 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                     details["file_range_comparison"] = range_replay.evidence(case, scope, scope_error)
                     if scope is not None:
                         details.update(target_path=scope[0], file_bytes=scope[1])
+                if ranges and witness and scope_error is None:
+                    details["file_range_comparison"]["scope_status"] = "signed_reads_verified"
             derived[key]["truth"] = truth
             coverage[key].update(publisher_truth=truth, truth_reason=reason, truth_ref_sha256=ref,
                                  artifact_sha256=case["artifact_sha256"], **details)
@@ -648,4 +685,10 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
                       acquisition_scope_authenticated=False, cases_decided_from_partial_captures=partial_verdicts,
                       ground_truth_authenticated=adjudicated == len(cases) and partial_verdicts == 0,
                       range_replay=range_replay.accounting())
+    if has_read_policy or has_read_receipts:
+        report.update(schema="kn.benchmark_publisher_report.v5", collector_key_sha256=collector_key,
+                      capture_nonce=capture_nonce, authenticated_scopes_per_planned_case=ratio(authenticated, len(cases)),
+                      file_scope_basis="controller_signed_windows_reads" if has_read_policy else "per_case_scope_evidence",
+                      acquisition_scope_authenticated=authenticated == len(cases),
+                      ground_truth_authenticated=adjudicated == len(cases) and authenticated == len(cases))
     return derived, int(bool(failed))

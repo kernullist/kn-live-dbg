@@ -16,7 +16,9 @@ import unittest
 from unittest import mock
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, NoEncryption, PrivateFormat
 
+import file_read_scope as reads
 import publisher_truth as publisher
 import publisher_history as history
 import publisher_ranges
@@ -525,6 +527,205 @@ class PublisherRangeTests(unittest.TestCase):
                                          "20240201T000000Z", corpus.decode_document, corpus.ratio)
                     self.assertEqual(one["adjudicated_per_planned_case"], corpus.ratio(1, 1))
                     self.assertEqual(one["ground_truth_authenticated"], independent)
+
+
+class FileReadReceiptTests(unittest.TestCase):
+    def setUp(self):
+        self.key = Ed25519PrivateKey.generate()
+        self.pub = self.key.public_key().public_bytes_raw()
+        self.nonce = "12" * 32
+        self.row = dict(offset=2, requested=4, transferred=3, operation="read", win32_status=0, start_ns=1, end_ns=2)
+        self.body = dict(case_id="case", target_path="file.bin", capture_nonce=self.nonce, started_unix_ns=123,
+                         source=dict(file_bytes=5, file_id="00"*16, volume_serial="01"*8, opened_path_sha256=sha(b"name")),
+                         packed_sha256=sha(b"abc"), attempts=[self.row])
+
+    def envelope(self):
+        return dict(schema=reads.SCHEMA, body=self.body, public_key=self.pub.hex(),
+                    signature=self.key.sign(reads.DOMAIN + raw(self.body)).hex())
+
+    def test_signature_key_nonce_and_sparse_set(self):
+        envelope = self.envelope()
+        scope, row = reads.verify(envelope, sha(self.pub), self.nonce)
+        self.assertEqual(scope, ("file.bin", 5, [[0, 2]]))
+        self.assertEqual((row["packed_bytes"], row["short_reads"]), (3, 1))
+        for pin, nonce, reason in [(None, None, "policy_required"), (sha(b"wrong"), self.nonce, "untrusted"),
+                                   (sha(self.pub), "ab"*32, "nonce_mismatch")]:
+            with self.assertRaisesRegex(ValueError, reason):
+                reads.verify(envelope, pin, nonce)
+        self.row.update(offset=0)
+        with self.assertRaisesRegex(ValueError, "invalid_collector_signature"):
+            reads.verify(envelope, sha(self.pub), self.nonce)
+
+    def test_signed_impossible_attempts(self):
+        for change in (dict(offset=-1), dict(transferred=True), dict(offset=4), dict(requested=0),
+                       dict(win32_status=33), dict(operation="seek"), dict(end_ns=0), dict(requested=reads.CHUNK+1)):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "invalid_read_attempt"):
+                self.body["attempts"] = [{**self.row, **change}]
+                reads.verify(self.envelope(), sha(self.pub), self.nonce)
+        self.body["attempts"] = [self.row, self.row]
+        with self.assertRaisesRegex(ValueError, "invalid_read_attempt"):
+            reads.verify(self.envelope(), sha(self.pub), self.nonce)
+        self.body["attempts"] = [dict(self.row, transferred=0, operation="seek", win32_status=87)]
+        scope, row = reads.verify(self.envelope(), sha(self.pub), self.nonce)
+        self.assertEqual((scope[2], row["failed_operations"], row["read_calls"]), ([[0, 5]], 1, 0))
+
+
+@unittest.skipUnless(os.name == "nt", "requires local Windows file handles")
+class WindowsFileAcquisitionTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.source, self.private, self.dest = (self.root / name for name in ("source", "controller.key", "capture"))
+        self.source.write_bytes(SOURCE)
+        key = Ed25519PrivateKey.generate()
+        self.pin = sha(key.public_key().public_bytes_raw())
+        self.private.write_bytes(key.private_bytes(Encoding.PEM, PrivateFormat.PKCS8, NoEncryption()))
+        self.nonce = os.urandom(32).hex()
+        self.command = [sys.executable, "-B", CLI.with_name("capture-file-ranges.py"), "--source", self.source,
+                        "--signing-key", self.private, "--case-id", "case", "--capture-nonce", self.nonce,
+                        "--target-path", "file.bin", "--output", self.dest]
+
+    def invoke(self, command, code=0, **kwargs):
+        p = subprocess.run(command, capture_output=True, timeout=30, **kwargs)
+        self.assertEqual(p.returncode, code, p.stderr or p.stdout[:500])
+        return p.stdout
+
+    def test_locked_range_short_read_eof_and_source_identity(self):
+        import msvcrt
+        with self.source.open("rb") as control:
+            control.seek(3)
+            msvcrt.locking(control.fileno(), msvcrt.LK_NBLCK, 4)
+            receipt = json.loads(self.invoke([*self.command, "--range", "0+3", "--range", "3+4", "--range", "7+32",
+                                              "--range", "40+1"]))
+        actual = (self.dest / "capture.knblob").read_bytes()
+        envelope = json.loads((self.dest / "scope.knreads").read_bytes())
+        scope, row = reads.verify(envelope, self.pin, self.nonce)
+        self.assertEqual(actual, SOURCE[:3] + SOURCE[7:])
+        self.assertEqual((receipt["artifact_sha256"], row["packed_sha256"], scope[2]), (sha(actual), sha(actual), [[3, 7]]))
+        self.assertEqual(int.from_bytes(bytes.fromhex(row["source"]["file_id"]), "little"), self.source.stat().st_ino)
+        self.assertEqual([(a["transferred"], a["win32_status"]) for a in envelope["body"]["attempts"]],
+                         [(3, 0), (0, 33), (len(SOURCE)-7, 0), (0, 0)])
+        self.assertEqual((row["failed_operations"], row["short_reads"]), (1, 2))
+
+    def test_collision_rejection_and_concurrent_publication(self):
+        linked = self.root / "linked"
+        os.link(self.private, linked)
+        self.invoke([*self.command, "--source", linked, "--range", "0+1"], 2)
+        self.invoke([*self.command, "--range", "2+2", "--range", "3+4"], 2)
+        self.assertFalse(self.dest.exists())
+        command = [*self.command, "--range", "3+5"]
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as one:
+            two = subprocess.run(command, capture_output=True, timeout=30)
+            one.communicate(timeout=30)
+        self.assertEqual(sorted([one.returncode, two.returncode]), [0, 2])
+        self.assertEqual((self.dest/"capture.knblob").read_bytes(), SOURCE[3:8])
+        self.assertFalse(list(self.root.glob(".knbench-*.tmp")))
+        for protected in (self.source, self.private, self.dest/"scope.knreads", self.dest/"capture.knblob"):
+            alias = self.root/"sink"
+            os.link(protected, alias)
+            before = protected.read_bytes()
+            with alias.open("ab", buffering=0) as redirected:
+                p = subprocess.run([*command, "--help"], stdout=redirected, stderr=redirected, timeout=30)
+            self.assertEqual((p.returncode, protected.read_bytes()), (2, before))
+            alias.unlink()
+
+    def test_writer_empty_file_and_interrupted_read(self):
+        command = [*self.command, "--range", "0+8"]
+        with self.source.open("r+b"):
+            self.invoke(command, 2)
+        self.assertFalse(self.dest.exists())
+        spec = importlib.util.spec_from_file_location("file_collector", self.command[2])
+        collector = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(collector)
+        args = SimpleNamespace(ranges=["0+2", "2+2"], source=self.source, signing_key=self.private, output=self.dest,
+                               case_id="case", target_path="file.bin", capture_nonce=self.nonce)
+        with mock.patch.object(collector.DiskReader, "attempt", side_effect=[("read", 0, b"ab"), OSError("interrupted")]):
+            with self.assertRaisesRegex(OSError, "interrupted"):
+                collector.collect(args)
+        self.assertFalse(self.dest.exists() or list(self.root.glob(".knbench-*.tmp")))
+        self.source.write_bytes(b"")
+        result = json.loads(self.invoke(command))
+        scope, witness = reads.verify(json.loads((self.dest/"scope.knreads").read_bytes()), self.pin, self.nonce)
+        self.assertEqual((scope, result["artifact_sha256"], witness["short_reads"]), (("file.bin", 0, []), sha(b""), 1))
+
+    def test_identity_after_same_name_replacement(self):
+        self.invoke([*self.command, "--range", "0+4"])
+        before = json.loads((self.dest/"scope.knreads").read_bytes())["body"]["source"]
+        self.source.rename(self.root/"first-file")
+        self.source.write_bytes(SOURCE)
+        other = self.root/"other"
+        self.invoke([*self.command, "--output", other, "--range", "0+4"])
+        after = json.loads((other/"scope.knreads").read_bytes())["body"]["source"]
+        self.assertEqual(before["opened_path_sha256"], after["opened_path_sha256"])
+        self.assertEqual(before["file_bytes"], after["file_bytes"])
+        self.assertNotEqual(before["file_id"], after["file_id"])
+
+    def test_archive_policy_and_replay_after_source_loss(self):
+        # The offset differs in the actual candidate file. All other bytes remain independently known to the test.
+        changed = bytearray(SOURCE)
+        changed[4] ^= 1
+        self.source.write_bytes(changed)
+        self.invoke([*self.command, "--range", "2+6"])
+        blobs = {}
+        def keep(data):
+            blobs[sha(data)] = data
+            return sha(data)
+        capture = keep((self.dest/"capture.knblob").read_bytes())
+        signed = (self.dest/"scope.knreads").read_bytes()
+        receipt = keep(signed)
+        files = Repository().files()
+        case = dict(id="case", family="file", independence_group="one", partition="development",
+                    task=publisher.TASK, truth="unknown", layer="owned_fixture", unit="case", artifact_sha256=capture,
+                    holes_sha256=receipt, truth_ref_sha256=keep(bundle(files)), publisher_file_sha256=keep(SOURCE),
+                    artifact_layout="packed")
+        def replay(plan_cases, *policy, expected=0):
+            plan = raw(dict(schema="kn.benchmark_corpus.v2", corpus_id="files", cohort_id="one", cases=plan_cases,
+                            environment=dict(target_id="local", snapshot_id="one", os_build=None, architecture="amd64",
+                                             hvci=None, vbs=None, verifier=None)))
+            results = raw(dict(schema="kn.benchmark_results.v1", corpus_sha256=sha(plan), run_id="one", assessments=[],
+                               tool=dict(name="reader", version="1", binary_sha256=sha(b"test reader"), config_sha256=sha(b"test config"))))
+            package = self.root/(sha(plan) + ".knbench")
+            if not package.exists():
+                with tempfile.TemporaryDirectory(dir=self.root) as inputs:
+                    folder = Path(inputs)
+                    (folder/"plan").write_bytes(plan)
+                    (folder/"results").write_bytes(results)
+                    referenced = {c[n] for c in plan_cases for n in ("holes_sha256", "truth_ref_sha256", "artifact_sha256", "publisher_file_sha256")}
+                    paths = []
+                    for pin in referenced:
+                        if pin in blobs:
+                            path = folder/pin
+                            path.write_bytes(blobs[pin])
+                            paths.extend(["--original", path])
+                    self.invoke([sys.executable, "-B", CLI, "--corpus", folder/"plan", "--results", folder/"results",
+                                 "--write-archive", package, "--plan-sha256", sha(plan), *paths])
+            return json.loads(self.invoke([sys.executable, "-B", CLI, "--archive-corpus", package, "--sha256",
+                                           sha(package.read_bytes()), "--plan-sha256", sha(plan), "--trusted-root-sha256",
+                                           sha(files["root"]), "--verification-time", "20240201T000000Z", *policy], expected))
+        self.source.unlink()
+        self.private.unlink()
+        policy_flags = ["--collector-key-sha256", self.pin, "--capture-nonce", self.nonce]
+        report = replay([case], *policy_flags)
+        row = report["coverage"]["cases"][0]
+        self.assertEqual((row["publisher_truth"], row["file_range_comparison"]["first_difference_offset"]), ("negative", 4))
+        self.assertTrue(report["acquisition_scope_authenticated"] and report["ground_truth_authenticated"])
+        self.assertEqual(replay([case], *policy_flags), report)
+        unsigned = keep(raw(dict(schema="kn.benchmark_target_scope.v1", target_path="file.bin", file_bytes=len(SOURCE),
+                                 missing=[[0, 2], [8, len(SOURCE)]])))
+        modified = json.loads(signed)
+        modified["body"]["attempts"][0]["offset"] = 1
+        wrong_scope = keep(raw(modified))
+        for selected, policy, reason in [(case, [], "collector_policy_required"),
+                                         (case, [*policy_flags[:3], "de"*32], "capture_nonce_mismatch"),
+                                         (dict(case, holes_sha256=unsigned), policy_flags, "signed_read_receipt_required"),
+                                         (dict(case, id="second"), policy_flags, "receipt_case_mismatch"),
+                                         (dict(case, artifact_sha256=keep(b"xxxxxx")), policy_flags, "receipt_artifact_mismatch"),
+                                         (dict(case, holes_sha256=wrong_scope), policy_flags, "invalid_collector_signature")]:
+            result = replay([selected], *policy, expected=1)
+            row = result["coverage"]["cases"][0]
+            self.assertEqual((row["publisher_truth"], row["read_acquisition"]["status"]), ("unknown", reason))
+            self.assertFalse(result["acquisition_scope_authenticated"])
 
 
 class PublisherHistoryTests(unittest.TestCase):

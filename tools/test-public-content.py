@@ -863,6 +863,17 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("receipt.txt", data)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Use publisher_file_sha256 to register the reference."))
 
+    def test_private_file_read_receipts(self):
+        samples = (dict(schema="kn.benchmark_windows_reads.v1"), dict(schema="kn.benchmark_read_capture.v1"),
+                   dict(schema="kn.benchmark_publisher_report.v5"), dict(capture_nonce="nonce"),
+                   dict(collector_key_sha256="key"), dict(packed_sha256="bytes"), dict(opened_path_sha256="name"), dict(read_acquisition={}),
+                   dict(authenticated_scopes_per_planned_case={}), dict(volume_serial="volume", file_id="id"),
+                   dict(start_ns=0, end_ns=1, transferred=5))
+        for value in samples:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("saved\n" + json.dumps({"entry": [value]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("fragment.txt", data)})
+
     def test_windows_publisher_policy_and_receipts(self):
         samples = (dict(schema="kn.image_approval_policy.v2"), dict(schema="kn.image_approval_provision.v2"),
                    dict(windows_publisher={}), dict(reference_signature={}, issuer="team"),

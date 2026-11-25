@@ -4053,6 +4053,15 @@ operator supplies the capture layout and hole map. Native policy issuance
 continues to require the complete signed policy file.
 [Publisher file range comparisons](BENCHMARK_CORPUS.md#compare-observed-file-ranges)
 
+For acquisitions made by the Windows file-range collector, the operator can
+require an independently pinned controller key and a per-run challenge.
+The evaluator derives the compared offsets from signed seek and read results,
+checks the case and packed bytes, and reports authenticated acquisitions
+separately from publisher file verdicts. The volume, file ID and opened-name
+hash identify the source handle observed by the controller. Joining that file
+to a loaded image requires additional mapping evidence.
+[Signed read receipts](BENCHMARK_CORPUS.md#record-the-file-offsets-windows-actually-read)
+
 The portable archive below binds the original roots and release roles, source
 policy and issuance receipt to one closed native collection. The operator
 keeps the trust configuration independently. Discovering a newer revision

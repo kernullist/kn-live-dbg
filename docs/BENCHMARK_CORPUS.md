@@ -917,6 +917,81 @@ layout, publisher file and signed hashes. The report counts reuse and cases
 deferred by the budget. Acquisition provenance and the contents of missing
 intervals require other evidence. [Public-file validation](VALIDATION.md#partial-publisher-file-comparisons)
 
+## Record the file offsets Windows actually read
+
+On Windows, `tools/capture-file-ranges.py` reads an ordinary file on a fixed
+local volume and signs the results of the individual calls. Use the Python
+environment from the publisher verification procedure. Before collection,
+the verifier records the case ID, a fresh 32-byte challenge, and the SHA-256
+of the trusted controller's 32 raw Ed25519 public-key bytes. Only the
+controller needs the private key. It reads an access-controlled Ed25519 PEM
+key from `$controllerKey`. Keep the verifier's key pin and challenge independently
+of the capture. [Ed25519 key and signature formats](https://cryptography.io/en/latest/hazmat/primitives/asymmetric/ed25519/)
+
+Set `$candidate` to the local source, `$targetName` to the case-sensitive
+publisher target, `$caseId` to the case being registered and `$captureDir`
+to a new directory under a private, existing parent. The example asks for
+32 bytes at offset zero and 64 at offset 64. Specify 1 through 2,048 ordered,
+disjoint ranges. Each request can read up to 1 MiB within the 8 GiB addressable
+file extent. Requests may extend past the file's own end.
+
+```powershell
+$random = [Security.Cryptography.RandomNumberGenerator]::Create()
+$challenge = New-Object byte[] 32
+try { $random.GetBytes($challenge) } finally { $random.Dispose() }
+$captureNonce = [BitConverter]::ToString($challenge).Replace('-', '').ToLowerInvariant()
+$captureJson = & $python -B tools/capture-file-ranges.py --source $candidate --signing-key $controllerKey `
+    --case-id $caseId --target-path $targetName --capture-nonce $captureNonce --output $captureDir `
+    --range '0+32' --range '64+64'
+if ($LASTEXITCODE -ne 0) { throw 'File acquisition failed' }
+$captureResult = $captureJson | ConvertFrom-Json
+if ($captureResult.collector_key_sha256 -cne $collectorKeySha256) { throw 'Unexpected acquisition key' }
+$capture = Join-Path $captureDir 'capture.knblob'
+$holeMap = Join-Path $captureDir 'scope.knreads'
+```
+
+The collector keeps the source handle open, denies ordinary write and delete
+sharing, and checks its size, volume serial, 128-bit file ID and opened name
+before and after the reads. It hashes the UTF-16LE volume-GUID path returned by
+the handle. The receipt contains the hash, the chosen target name and the local
+acquisition start time. Each request records its original offset, requested
+and transferred lengths, relative monotonic times and Win32 status. A failed
+seek records the seek error. A short read contributes only the returned bytes.
+The packed file and receipt appear together when the new directory is renamed
+into place. An existing destination causes the command to fail.
+[Windows file identity](https://learn.microsoft.com/en-us/windows/win32/api/winbase/ns-winbase-file_id_info)
+[Opened name](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-getfinalpathnamebyhandlew)
+[ReadFile](https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-readfile)
+
+Use these two files in the v2 packed case above, with `id` set to `$caseId`.
+Include them in the archive's original file list alongside the complete publisher
+file and metadata. To require acquisition evidence on replay, add the verifier's
+key pin and challenge to the publisher options. Use the signed metadata's
+verification time for `$trust`.
+
+```powershell
+$readPolicy = @('--collector-key-sha256', $collectorKeySha256, '--capture-nonce', $captureNonce)
+$json = & $python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan @trust @readPolicy
+if ($LASTEXITCODE -eq 2) { throw 'Could not replay the retained acquisition' }
+$report = $json | ConvertFrom-Json
+$report.coverage.cases | Select-Object case_id, publisher_truth, truth_reason, read_acquisition
+$report.authenticated_scopes_per_planned_case
+```
+
+The v5 report derives missing intervals from successful transfers and checks
+the signed packed digest against the retained bytes. An unsigned map, wrong
+key or challenge, altered signature, or receipt for another case withholds the
+file verdict and returns exit 1 under this policy. Missing captured bytes
+remain unknown. A signed receipt also requires an explicit trust policy on
+replay. The legacy unsigned procedure continues to produce its v4 report.
+
+The acquisition count includes a verified receipt for a read that returned
+zero bytes. Whole-file truth still requires a complete match or a difference
+in observed bytes. The signature attests to the trusted controller's reads of
+one file handle. An association with a running image, an independent OS trace
+and a simultaneous snapshot of all file bytes require separate evidence.
+[Windows validation](VALIDATION.md#signed-windows-file-read-receipts)
+
 ## Imported report semantics
 
 `kn.benchmark_report.v1` is UTF-8 JSON on stdout, capped at 16 MiB. A comparison

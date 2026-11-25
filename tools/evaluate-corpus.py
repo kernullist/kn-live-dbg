@@ -360,6 +360,9 @@ def retained_command(args, protected):
         minimum = publisher_truth.root_version_floor(args.minimum_root_version)
         if args.previous_checkpoint_sha256 is not None:
             digest(args.previous_checkpoint_sha256, "previous publisher checkpoint")
+        if args.collector_key_sha256 is not None:
+            digest(args.collector_key_sha256, "acquisition collector public key")
+            digest(args.capture_nonce, "acquisition challenge")
     status = 0
     with ExitStack() as inputs:
         stream = None
@@ -402,7 +405,8 @@ def retained_command(args, protected):
             if args.trusted_root_sha256 is not None:
                 cases, status = publisher_truth.adjudicate(report, stream, originals, cases,
                                                           args.trusted_root_sha256, args.verification_time,
-                                                          decode_document, ratio, minimum, args.previous_checkpoint_sha256)
+                                                          decode_document, ratio, minimum, args.previous_checkpoint_sha256,
+                                                          args.collector_key_sha256, args.capture_nonce)
             report["scopes"] = comparison_scopes(cases, scored)
         if args.trusted_root_sha256 is not None:
             raw = (json.dumps(report, ensure_ascii=True, allow_nan=False, separators=(",", ":")) + "\n").encode("ascii")
@@ -420,7 +424,8 @@ def main():
     paired = any(arg.startswith("--sa") and "--saved-etl-comparison".startswith(arg.split("=", 1)[0])
                  for arg in sys.argv[1:])
     archive_flags = ("--archive-corpus", "--write-archive", "--original", "--get-original", "--destination", "--file-list",
-                     "--trusted-root-sha256", "--verification-time", "--minimum-root-version", "--previous-checkpoint-sha256")
+                     "--trusted-root-sha256", "--verification-time", "--minimum-root-version", "--previous-checkpoint-sha256",
+                     "--collector-key-sha256", "--capture-nonce")
     archived = any(arg.startswith("--") and any(flag.startswith(arg.split("=", 1)[0]) for flag in archive_flags)
                    for arg in sys.argv[1:])
     protected = sys.argv[1:]
@@ -463,13 +468,17 @@ def main():
     parser.add_argument("--trusted-root-sha256", help="independent trust anchor for publisher file comparisons")
     parser.add_argument("--minimum-root-version", help="lowest terminal version accepted from this publisher's retained root history")
     parser.add_argument("--previous-checkpoint-sha256", help="independently retained checkpoint of the previous publisher observation")
+    parser.add_argument("--collector-key-sha256", help="require signed Windows read receipts under this Ed25519 public key hash")
+    parser.add_argument("--capture-nonce", help="independently supplied 32-byte hex challenge for the acquisition run")
     parser.add_argument("--verification-time", help="publisher metadata verification time in UTC, YYYYMMDDTHHMMSSZ")
     parser.add_argument("--sha256", "--s", help="expected SHA-256 retained from acquisition")
     parser.add_argument("--plan-sha256", help="original campaign pin retained before acquisition")
     parser.add_argument("--study-sha256", help="independently retained corpus hash for a partitioned ETL campaign")
     args = parser.parse_args()
+    if (args.collector_key_sha256 is None) != (args.capture_nonce is None):
+        parser.error("--collector-key-sha256 and --capture-nonce belong together")
     if any(value is not None for value in (args.trusted_root_sha256, args.verification_time,
-                                           args.minimum_root_version, args.previous_checkpoint_sha256)):
+                                           args.minimum_root_version, args.previous_checkpoint_sha256, args.collector_key_sha256)):
         if not (args.archive_corpus and args.trusted_root_sha256 and args.verification_time and args.get_original is None):
             parser.error("--trusted-root-sha256 and --verification-time require archive replay together")
     if args.study_sha256 is not None and args.etl_reader_campaign is None:

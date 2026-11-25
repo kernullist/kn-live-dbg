@@ -7,6 +7,29 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Signed Windows file read receipts
+
+On 2026-11-25 a Windows collector made 12 read calls across seven cases using
+local copies of three public files from Sigstore timestamp 842. OpenSSL verified
+each controller signature. A separate comparison used the original bytes and
+the ranges held by another process to predict every returned byte and file
+offset. All seven acquisition receipts verified. One case matched the whole
+publisher file, one disproved equality and five lacked enough bytes to decide.
+[Signed public targets](https://github.com/sigstore/root-signing/blob/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata/targets.json)
+[Delegated npm target](https://github.com/sigstore/root-signing/blob/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata/registry.npmjs.org.json)
+
+The differing capture contained 57 bytes from two reads and differed at 31
+offsets, starting at 63. A short read from the delegated npm file returned
+13 of 24 requested bytes. A locked 16-byte range returned Win32 error 33,
+while an unlocked read starting past EOF succeeded with zero bytes. The two
+cases with zero observed bytes retained all 177 missing bytes. The package
+reproduced the same report twice after the working inputs and private signing
+key were removed. Missing trust, a different key and a different challenge
+each left all seven cases undecided. The earlier 14-case unsigned study also
+reproduced its saved report. These observations cover one Windows host, one
+controller and one historical publisher release.
+[Acquisition and replay](BENCHMARK_CORPUS.md#record-the-file-offsets-windows-actually-read)
+
 ## Partial publisher file comparisons
 
 On 2026-11-25 the evaluator replayed 14 registered cases from one saved

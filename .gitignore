@@ -54,6 +54,7 @@
 *.knsendresult.pending-*
 *.knblob
 *.knblob.pending-*
+*.knreads
 *.knverify
 *.knverify.pending-*
 *.knapprovalarchive
