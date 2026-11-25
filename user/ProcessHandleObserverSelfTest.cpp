@@ -101,14 +101,17 @@ namespace
         record.Evidence = {{L"pid", std::to_wstring(self.Pid)}, {L"image", L"snapshot-only.exe"}};
         snapshot.Records.push_back(record);
         const auto absent = timeline.ReconcileSnapshot(snapshot, {});
-        if (absent.Findings.size() != 1 || absent.Findings.front().Kind != L"snapshot-record-without-event" ||
+        if (absent.Findings.size() != 1 || absent.Findings.front().Kind != L"snapshot-record-unassessed" ||
+            absent.ObserverEvents != rows.size() || absent.ComparedEvents != 0 ||
             !timeline.ReconcileSnapshot(snapshot, observer).Findings.empty()) { return false; }
         TimelineStore imported;
         if (imported.IngestEvents(rows).Added != rows.size() || imported.AllEvents()[0].Evidence.at(L"ingest_origin") != L"supplied_record" ||
             !imported.ReconcileSnapshot(empty, {}).Findings.empty()) { return false; }
         TimelineEvent target;
         target.Source = L"live"; target.Domain = L"process"; target.Action = L"process-create"; target.ProcessId = self.Pid;
-        if (timeline.IngestEvents({target}).Added != 1 || timeline.ReconcileSnapshot(empty, {}).Findings.size() != 1) { return false; }
+        if (timeline.IngestEvents({target}).Added != 1) { return false; }
+        const auto unbound = timeline.ReconcileSnapshot(empty, {});
+        if (unbound.UnboundEvents != 1 || unbound.ComparedEvents != 0 || !unbound.Findings.empty()) { return false; }
         target.Entity = L"target-fixture.exe";
         auto supplied = rows.front();
         supplied.Evidence[L"image"] = L"observer-fixture.exe";

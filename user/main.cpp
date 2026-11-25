@@ -21644,190 +21644,6 @@ static void PrintTimelineIngestResult(const std::wstring& source, const Timeline
     }
 }
 
-static std::wstring TimelineImageSignatureLevelName(uint32_t level)
-{
-    switch (level)
-    {
-    case 0: return L"unchecked";
-    case 1: return L"unsigned";
-    case 2: return L"enterprise";
-    case 4: return L"authenticode";
-    case 6: return L"store";
-    case 7: return L"antimalware";
-    case 8: return L"microsoft";
-    case 12: return L"windows";
-    case 14: return L"windows_tcb";
-    default: return L"level_" + std::to_wstring(level);
-    }
-}
-
-static std::wstring TimelineImageSignatureTypeName(uint32_t type)
-{
-    switch (type)
-    {
-    case 0: return L"none";
-    case 1: return L"embedded";
-    case 2: return L"cache";
-    case 3: return L"catalog_cached";
-    case 4: return L"catalog_uncached";
-    case 5: return L"catalog_hint";
-    case 6: return L"package_catalog";
-    case 7: return L"ppl_mitigated";
-    default: return L"type_" + std::to_wstring(type);
-    }
-}
-
-static std::wstring TimelineLiveEventTypeText(uint32_t type)
-{
-    std::wstring text = L"unknown";
-    if (type == KNDBG_TIMELINE_EVENT_PROCESS_CREATE)
-    {
-        text = L"process-create";
-    }
-    else if (type == KNDBG_TIMELINE_EVENT_PROCESS_EXIT)
-    {
-        text = L"process-exit";
-    }
-    else if (type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
-    {
-        text = L"image-load";
-    }
-    else if (type == KNDBG_TIMELINE_EVENT_THREAD_CREATE)
-    {
-        text = L"thread-create";
-    }
-    else if (type == KNDBG_TIMELINE_EVENT_THREAD_EXIT)
-    {
-        text = L"thread-exit";
-    }
-    return text;
-}
-
-static TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& live)
-{
-    TimelineEvent event = {};
-    event.TimestampFileTime = live.Timestamp100ns;
-    event.Source = L"kernel-live";
-    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
-    {
-        event.Domain = L"image";
-    }
-    else if (live.Type == KNDBG_TIMELINE_EVENT_THREAD_CREATE ||
-             live.Type == KNDBG_TIMELINE_EVENT_THREAD_EXIT)
-    {
-        event.Domain = L"thread";
-    }
-    else
-    {
-        event.Domain = L"process";
-    }
-    event.Action = TimelineLiveEventTypeText(live.Type);
-    event.ProcessId = live.ProcessId;
-    event.ThreadId = live.ThreadId;
-    event.Entity = live.ImagePath;
-    if (event.Entity.empty())
-    {
-        if (event.Domain == L"thread" && live.ThreadId != 0)
-        {
-            event.Entity = L"pid:" + std::to_wstring(live.ProcessId) +
-                L" tid:" + std::to_wstring(live.ThreadId);
-        }
-        else
-        {
-            event.Entity = L"pid:" + std::to_wstring(live.ProcessId);
-        }
-    }
-    event.Summary = event.Action + L" pid=" + std::to_wstring(live.ProcessId);
-    if (live.ThreadId != 0 && event.Domain == L"thread")
-    {
-        event.Summary += L" tid=" + std::to_wstring(live.ThreadId);
-    }
-    if ((event.Domain == L"thread" || event.Domain == L"process") &&
-        live.CreatorProcessId != 0)
-    {
-        event.Summary += L" creator_pid=" + std::to_wstring(live.CreatorProcessId);
-        event.Evidence[L"creator_pid"] = std::to_wstring(live.CreatorProcessId);
-        event.Evidence[L"source_pid"] = std::to_wstring(live.CreatorProcessId);
-        if (live.CreatorThreadId != 0)
-        {
-            event.Summary += L" creator_tid=" + std::to_wstring(live.CreatorThreadId);
-            event.Evidence[L"creator_tid"] = std::to_wstring(live.CreatorThreadId);
-        }
-        if (event.Domain == L"thread" &&
-            live.CreatorProcessId != live.ProcessId)
-        {
-            event.Risk = L"warning";
-            event.Evidence[L"remote_thread"] = L"true";
-            event.Evidence[L"target_pid"] = std::to_wstring(live.ProcessId);
-            event.Evidence[L"cross_process_operation"] = L"createremotethread";
-            event.Evidence[L"analysis_family"] = L"cross-process";
-            event.Evidence[L"timeline_category"] = L"cross-process";
-        }
-    }
-    if (live.ParentProcessId != 0)
-    {
-        event.Summary += L" parent_pid=" + std::to_wstring(live.ParentProcessId);
-        event.Evidence[L"parent_pid"] = std::to_wstring(live.ParentProcessId);
-        if (event.Domain == L"process" && live.CreatorProcessId != 0)
-        {
-            event.Evidence[L"parent_differs_from_creator"] =
-                live.ParentProcessId != live.CreatorProcessId ? L"true" : L"false";
-        }
-    }
-    if (!live.ImagePath.empty())
-    {
-        event.Summary += L" image=" + live.ImagePath;
-        event.Evidence[L"image_path"] = live.ImagePath;
-    }
-    if (live.ImageBase != 0)
-    {
-        event.Evidence[L"image_base"] = HexTextWidth(live.ImageBase, 16, true);
-    }
-    if (live.ImageSize != 0)
-    {
-        event.Evidence[L"image_size"] = HexTextWidth(live.ImageSize, 16, true);
-    }
-    if (live.FileObject != 0)
-    {
-        event.Evidence[L"file_object"] = HexTextWidth(live.FileObject, 16, true);
-    }
-    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
-    {
-        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_SYSTEM_MODE) != 0)
-        {
-            event.Evidence[L"system_mode"] = L"true";
-        }
-        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_PARTIAL_MAP) != 0)
-        {
-            event.Evidence[L"partial_map"] = L"true";
-        }
-        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_EXTENDED) != 0)
-        {
-            event.Evidence[L"extended_info"] = L"true";
-        }
-        const uint32_t sigLevel =
-            (live.Flags & KNDBG_TIMELINE_IMAGE_SIGLEVEL_MASK) >>
-            KNDBG_TIMELINE_IMAGE_SIGLEVEL_SHIFT;
-        const uint32_t sigType =
-            (live.Flags & KNDBG_TIMELINE_IMAGE_SIGTYPE_MASK) >>
-            KNDBG_TIMELINE_IMAGE_SIGTYPE_SHIFT;
-        event.Evidence[L"signature_level"] = TimelineImageSignatureLevelName(sigLevel);
-        event.Evidence[L"signature_type"] = TimelineImageSignatureTypeName(sigType);
-    }
-    if (event.Risk.empty())
-    {
-        event.Risk = L"info";
-    }
-    event.Confidence = L"kernel-callback";
-    event.Evidence[L"sequence"] = std::to_wstring(live.Sequence);
-    event.Evidence[L"type"] = std::to_wstring(live.Type);
-    if (live.ThreadId != 0)
-    {
-        event.Evidence[L"tid"] = std::to_wstring(live.ThreadId);
-    }
-    return event;
-}
-
 static void PrintTimelineLiveStatus(const TimelineLiveStatus& status)
 {
     uint32_t pressure = 0;
@@ -22061,14 +21877,7 @@ private:
                         continue;
                     }
 
-                    std::vector<TimelineEvent> events;
-                    events.reserve(liveEvents.size());
-                    for (const TimelineLiveEvent& item : liveEvents)
-                    {
-                        events.push_back(BuildTimelineEventFromLiveEvent(item));
-                    }
-
-                    TimelineIngestResult result = state->Timeline.IngestEvents(events);
+                    TimelineIngestResult result = state->Timeline.IngestKernelLive(liveEvents);
                     RecordDrain(liveEvents.size(), result.Added);
 
                     busy = liveEvents.size() >= 1024 || drainStatus.Count > 0;
@@ -22226,11 +22035,24 @@ static void PrintTimelineReconcile(const TimelineReconcileResult& result)
 {
     PrintColoredText(L"[timeline.reconcile]", KNDBG_COLOR_TITLE);
     std::wcout << L" snapshot=" << result.SnapshotLabel
+               << L" snapshot_boot_source=" << result.SnapshotBootSource
+               << L" boot_comparison=" << result.BootComparison
                << L" timeline_events=" << result.TimelineEvents
+               << L" snapshot_events=" << result.SnapshotEvents
+               << L" observer_events=" << result.ObserverEvents
+               << L" unbound_events=" << result.UnboundEvents
+               << L" local_target_events=" << result.LocalTargetEvents
+               << L" compared_events=" << result.ComparedEvents
+               << L" generation_matches=" << result.GenerationMatches
+               << L" generation_conflicts=" << result.GenerationConflicts
+               << L" unassessed_generations=" << result.UnassessedGenerations
+               << L" candidate_records=" << result.CandidateRecords
+               << L" unassessed_records=" << result.UnassessedRecords
                << L" snapshot_processes=" << result.SnapshotProcesses
                << L" snapshot_records=" << result.SnapshotRecords
                << L" findings=" << result.Findings.size()
-               << L" live_dropped=" << result.LiveDropped;
+               << L" live_dropped=" << result.LiveDropped
+               << L" timeline_dropped=" << result.TimelineDropped;
     if (result.Truncated)
     {
         std::wcout << L" truncated=true";
@@ -22257,6 +22079,8 @@ static void PrintTimelineReconcile(const TimelineReconcileResult& result)
         {
             std::wcout << L" event_id=" << finding.EventId;
         }
+        const auto reason = finding.Evidence.find(L"reason");
+        if (reason != finding.Evidence.end()) { std::wcout << L" reason=" << reason->second; }
         std::wcout << L" subject=" << finding.Subject
                    << L" summary=" << finding.Summary << L"\n";
     }
@@ -22864,14 +22688,7 @@ static void RefreshTimelineDashboardEvidence(
                         &drainStatus,
                         &liveError))
                 {
-                    std::vector<TimelineEvent> events;
-                    events.reserve(liveEvents.size());
-                    for (const TimelineLiveEvent& item : liveEvents)
-                    {
-                        events.push_back(BuildTimelineEventFromLiveEvent(item));
-                    }
-
-                    TimelineIngestResult liveResult = state.Timeline.IngestEvents(events);
+                    TimelineIngestResult liveResult = state.Timeline.IngestKernelLive(liveEvents);
                     bool liveActive = (drainStatus.Flags & KNDBG_TIMELINE_STATUS_ACTIVE) != 0;
                     if (liveActive ||
                         drainStatus.Count != 0 ||
@@ -25312,13 +25129,7 @@ static void HandleTimelineCommand(
                     }
                     else
                     {
-                        std::vector<TimelineEvent> events;
-                        events.reserve(liveEvents.size());
-                        for (const TimelineLiveEvent& item : liveEvents)
-                        {
-                            events.push_back(BuildTimelineEventFromLiveEvent(item));
-                        }
-                        TimelineIngestResult liveResult = state.Timeline.IngestEvents(events);
+                        TimelineIngestResult liveResult = state.Timeline.IngestKernelLive(liveEvents);
                         PrintTimelineIngestResult(L"kernel-live", liveResult);
                         TimelineLiveStatus live = {};
                         if (QueryTimelineLiveStatus(device, &live, &liveError))
@@ -25619,13 +25430,7 @@ static void HandleTimelineCommand(
                     break;
                 }
 
-                std::vector<TimelineEvent> events;
-                events.reserve(liveEvents.size());
-                for (const TimelineLiveEvent& item : liveEvents)
-                {
-                    events.push_back(BuildTimelineEventFromLiveEvent(item));
-                }
-                TimelineIngestResult result = state.Timeline.IngestEvents(events);
+                TimelineIngestResult result = state.Timeline.IngestKernelLive(liveEvents);
                 PrintTimelineIngestResult(L"kernel-live", result);
                 TimelineLiveStatus live = {};
                 if (QueryTimelineLiveStatus(device, &live, &liveError))

@@ -1,6 +1,8 @@
 #include "TimelineSelfTest.h"
 
 #include "SnapshotDiff.h"
+#include "SnapshotJson.h"
+#include "DeviceClient.h"
 #include "TimelineDashboard.h"
 #include "TimelineStore.h"
 
@@ -179,7 +181,8 @@ namespace
         document.Schema = L"kn-live-dbg.snapshot.v1";
         document.Label = L"timeline-selftest";
         document.TimestampUtc = L"2026-06-30T00:00:00Z";
-        document.BootId = L"boot-selftest";
+        document.BootId = SnapshotCurrentBootId();
+        document.BootSource = SnapshotBootSource::LocalCapture;
 
         SnapshotProcessRecord process = {};
         process.ProcessId = 100;
@@ -253,6 +256,204 @@ namespace
             }
         }
         return found;
+    }
+
+    void CheckReconcileProvenance(SelfTestContext* context)
+    {
+        SnapshotDocument doc = MakeSnapshotFixture();
+        doc.TimestampUtc = SnapshotCurrentUtcTimestamp();
+        FILETIME created = {}, ended = {}, kernel = {}, user = {};
+        if (!GetProcessTimes(GetCurrentProcess(), &created, &ended, &kernel, &user))
+        {
+            Check(context, false, L"reconcile-read-self-creation-time");
+            return;
+        }
+        const uint32_t pid = GetCurrentProcessId();
+        const uint64_t generation = (static_cast<uint64_t>(created.dwHighDateTime) << 32) | created.dwLowDateTime;
+        auto& process = doc.Processes.front();
+        process.ProcessId = pid;
+        process.CreateTime = generation;
+        process.HasCreateTime = true;
+        process.ImageName = L"capture.exe";
+        auto& record = doc.Records.front();
+        record.Evidence = {{L"pid", std::to_wstring(pid)}, {L"image", L"capture.exe"},
+            {L"BOOT-ID", L"record-boot"}, {L"payload.ProcessInstanceID", L"claimed"},
+            {L"record.BOOT-ID", L"original prefix"}};
+
+        TimelineStore store;
+        SnapshotDiffResult diff;
+        SnapshotDiffFinding change;
+        change.Kind = L"added";
+        change.NewRecord = record;
+        diff.Findings.push_back(change);
+        store.IngestSnapshot(doc, L"baseline");
+        store.IngestSnapshotDiff(diff, L"baseline");
+        const auto imported = store.AllEvents();
+        const auto selfOnly = store.ReconcileSnapshot(doc, {});
+        Check(context, imported.size() == 3 && selfOnly.SnapshotEvents == 3 && selfOnly.ComparedEvents == 0 &&
+            selfOnly.UnassessedRecords == 1 && selfOnly.CandidateRecords == 0 &&
+            HasReconcileFinding(selfOnly, L"snapshot-record-unassessed", pid, record.Identity, L"coverage-unknown"),
+            L"reconcile-snapshot-and-diff-cannot-corroborate-themselves");
+        Check(context, imported.size() == 3 && imported[1].Evidence.at(L"record.BOOT-ID") == L"record-boot" &&
+            imported[1].Evidence.at(L"record.record.BOOT-ID") == L"original prefix" &&
+            imported[1].Evidence.at(L"record.payload.ProcessInstanceID") == L"claimed" &&
+            !imported[2].Evidence.count(L"process_instance_id"), L"snapshot-identity-aliases-preserved-as-record-fields");
+
+        TiEventRecord header = {};
+        header.ProcessId = pid;
+        header.ProcessCreateTime = generation;
+        header.ProcessBootId = doc.BootId;
+        header.Timestamp = generation + 1;
+        header.ImagePath = L"C:\\fixture\\capture.exe";
+        header.TargetProcessId = pid + 1;
+        header.TargetImageBase = L"other.exe";
+        header.Sequence = 1;
+        store.IngestThreatIntel({header}, L"all");
+        auto supplied = store.AllEvents().back();
+        Check(context, store.IngestEvents({supplied, supplied}).Added == 1 &&
+            store.AllEvents().back().Origin == TimelineOrigin::Supplied && store.AllEvents().back().HeaderCreateTime == 0,
+            L"reingesting-typed-row-resets-acquisition-and-generation");
+
+        const auto exact = store.ReconcileSnapshot(doc, {});
+        Check(context, exact.LocalTargetEvents == 1 && exact.UnboundEvents == 1 && exact.SnapshotEvents == 3 &&
+            exact.ComparedEvents == 1 && exact.GenerationMatches == 1 && exact.CandidateRecords == 1 &&
+            HasReconcileFinding(exact, L"event-process-generation-match", pid, L"", L"same-boot-generation") &&
+            HasReconcileFinding(exact, L"snapshot-record-candidate", pid, record.Identity, L"candidate-only"),
+            L"typed-header-generation-and-label-candidate-stay-distinct");
+        auto changed = doc;
+        changed.Processes[0].HasExitTime = true;
+        changed.Processes[0].ExitTime = header.Timestamp;
+        const auto atExit = store.ReconcileSnapshot(changed, {});
+        --changed.Processes[0].ExitTime;
+        const auto pastExit = store.ReconcileSnapshot(changed, {});
+        Check(context, atExit.GenerationMatches == 1 && !pastExit.GenerationMatches && pastExit.GenerationConflicts == 1,
+            L"etw-header-must-fit-known-process-exit");
+        changed = doc;
+        ++changed.Processes[0].CreateTime;
+        const auto reused = store.ReconcileSnapshot(changed, {});
+        changed.Processes.push_back(process);
+        const auto competing = store.ReconcileSnapshot(changed, {});
+        changed.Processes[0].HasCreateTime = false;
+        const auto incomplete = store.ReconcileSnapshot(changed, {});
+        Check(context, reused.GenerationConflicts == 1 && !reused.GenerationMatches && competing.GenerationConflicts == 1 &&
+            !competing.GenerationMatches && !incomplete.GenerationMatches && !incomplete.GenerationConflicts && incomplete.UnassessedGenerations == 1,
+            L"reused-competing-and-incomplete-process-generations");
+
+        changed = doc;
+        changed.Records.front().Evidence[L"image"] = L"other.exe";
+        const auto split = store.ReconcileSnapshot(changed, {});
+        changed.Records.front().Evidence = {{L"pid", std::to_wstring(pid + 2)}};
+        const auto pidOnly = store.ReconcileSnapshot(changed, {});
+        changed.Records.front().Evidence.clear();
+        const auto noLabels = store.ReconcileSnapshot(changed, {});
+        changed.Records.front().Evidence[L"pid"] = std::to_wstring(pid) + std::wstring(1, L'\0') + L"extra";
+        const auto invalidLabel = store.ReconcileSnapshot(changed, {});
+        Check(context, split.CandidateRecords == 0 && HasReconcileFinding(split, L"snapshot-record-without-event", pid, L"", L"no-live-event") &&
+            HasReconcileFinding(pidOnly, L"snapshot-record-without-event", pid + 2, L"", L"no-live-event") &&
+            noLabels.UnassessedRecords == 1 && invalidLabel.UnassessedRecords == 1,
+            L"pid-name-must-share-endpoint-and-missing-labels-stay-unknown");
+        changed = doc;
+        changed.BootId[0] = changed.BootId[0] == L'1' ? L'2' : L'1';
+        const auto otherBoot = store.ReconcileSnapshot(changed, {});
+        changed.BootId.assign(32, L'0');
+        const auto noBoot = store.ReconcileSnapshot(changed, {});
+        changed = doc;
+        changed.SameBootOnly = false;
+        const auto disabled = store.ReconcileSnapshot(changed, {});
+        Check(context, otherBoot.BootComparison == L"different_boot" && noBoot.BootComparison == L"boot_unknown" &&
+            disabled.BootComparison == L"comparison_disabled" && !disabled.ComparedEvents && !noBoot.ComparedEvents &&
+            !otherBoot.ComparedEvents && otherBoot.UnassessedRecords == 1, L"mismatched-unknown-and-disabled-boots-withhold-comparison");
+
+        TimelineReconcileOptions filter;
+        filter.Source = L"SNAPSHOT";
+        const auto snapshotOnly = store.ReconcileSnapshot(doc, filter);
+        filter = {};
+        filter.Limit = 1;
+        const auto limited = store.ReconcileSnapshot(doc, filter);
+        Check(context, snapshotOnly.SnapshotEvents == 2 && snapshotOnly.Findings.empty() && !snapshotOnly.ComparedEvents &&
+            limited.Truncated && limited.Findings.size() == 1 && limited.GenerationMatches == exact.GenerationMatches &&
+            limited.CandidateRecords == exact.CandidateRecords && limited.Findings[0].Kind == exact.Findings[0].Kind,
+            L"reconcile-filtered-and-prelimit-denominators");
+
+        TimelineStore ineligible;
+        auto stale = header;
+        stale.Timestamp = generation - 1;
+        auto foreign = header;
+        foreign.ProcessBootId[0] = foreign.ProcessBootId[0] == L'1' ? L'2' : L'1';
+        ineligible.IngestThreatIntel({stale, foreign}, L"all");
+        const auto gaps = ineligible.ReconcileSnapshot(doc, {});
+        Check(context, gaps.UnboundEvents == 2 && !gaps.ComparedEvents && gaps.UnassessedRecords == 1,
+            L"unbound-foreign-and-pre-creation-etw-observations");
+        TimelineStore recent;
+        auto boundary = header;
+        boundary.Sequence = 0;
+        auto missing = boundary;
+        missing.ProcessBootId.clear();
+        const bool firstBoundary = recent.IngestThreatIntel({missing}, L"recent").Added == 1;
+        const bool newBinding = recent.IngestThreatIntel({missing, boundary}, L"recent").Added == 1;
+        const auto repeated = recent.IngestThreatIntel({missing, boundary}, L"recent");
+        Check(context, firstBoundary && newBinding && !repeated.Added && recent.ReconcileSnapshot(doc, {}).GenerationMatches == 1,
+            L"legacy-timestamp-cursor-retains-new-header-binding");
+
+        TimelineStore ring(1024);
+        std::vector<TimelineLiveEvent> batch(1025);
+        for (size_t i = 0; i < batch.size(); ++i)
+        {
+            batch[i].Type = KNDBG_TIMELINE_EVENT_IMAGE_LOAD;
+            batch[i].ProcessId = pid;
+            batch[i].Sequence = i + 1;
+            batch[i].ImagePath = L"capture.exe";
+        }
+        ring.IngestKernelLive(batch);
+        changed = doc;
+        changed.Records.front().Evidence = {{L"pid", std::to_wstring(pid + 2)}};
+        const auto evicted = ring.ReconcileSnapshot(changed, {});
+        Check(context, evicted.TimelineDropped == 1 && evicted.ComparedEvents == 1024 && !evicted.LiveDropped &&
+            HasReconcileFinding(evicted, L"snapshot-record-without-event", pid + 2, record.Identity, L"loss-limited"),
+            L"retained-view-eviction-limits-negative-findings");
+        changed.Records.clear();
+        changed.Processes.front().ImageName = L"other.exe";
+        filter.Limit = 2;
+        const auto tied = ring.ReconcileSnapshot(changed, filter);
+        Check(context, tied.Truncated && tied.Findings.size() == 2 && tied.Findings[0].EventId == 2 &&
+            tied.Findings[1].EventId == 3, L"equal-label-finding-limit-orders-by-retained-event-id");
+
+        wchar_t directory[MAX_PATH] = {}, file[MAX_PATH] = {};
+        const auto length = GetTempPathW(MAX_PATH, directory);
+        if (!length || length >= MAX_PATH || !GetTempFileNameW(directory, L"ktr", 0, file))
+        {
+            Check(context, false, L"reconcile-owned-archive-path");
+            return;
+        }
+        const auto checkSaved = [&]() {
+            SnapshotDocument saved;
+            std::wstring error, text;
+            bool sealed = false;
+            if (!WriteSnapshotJsonFile(file, doc, &error, &sealed) || !sealed || !ReadSnapshotJsonFile(file, &saved, &error) ||
+                saved.BootSource != SnapshotBootSource::LocalReceipt) { return false; }
+            const auto authentic = store.ReconcileSnapshot(saved, {});
+            if (authentic.GenerationMatches != 1 || authentic.SnapshotBootSource != L"local_receipt") { return false; }
+            if (!ReadSnapshotTextFile(file, &text, &error)) { return false; }
+            const auto label = text.find(doc.Label);
+            if (label == std::wstring::npos) { return false; }
+            text[label] = L'X';
+            if (!WriteSnapshotTextFile(file, text, &error) || !ReadSnapshotJsonFile(file, &saved, &error)) { return false; }
+            const auto edited = store.ReconcileSnapshot(saved, {});
+            TimelineStore archive;
+            archive.IngestSnapshot(saved, L"copy");
+            const auto rows = archive.AllEvents();
+            if (rows.size() != 2 || rows[1].Evidence.count(L"boot_id") || rows[1].Evidence.count(L"process_instance_id") ||
+                rows[1].Evidence.at(L"reported_boot_id") != doc.BootId || rows[1].SnapshotBoot != SnapshotBootSource::UnverifiedReceipt ||
+                TimelineEventToJson(rows[1]).find(L"\"snapshotBootSource\":\"receipt_unverified\"") == std::wstring::npos) { return false; }
+            if (!WriteSnapshotTextFile(file, BuildSnapshotJson(doc), &error) || !ReadSnapshotJsonFile(file, &saved, &error)) { return false; }
+            const auto legacy = store.ReconcileSnapshot(saved, {});
+            return edited.SnapshotBootSource == L"receipt_unverified" && legacy.SnapshotBootSource == L"receipt_missing" &&
+                !edited.ComparedEvents && !legacy.GenerationMatches && legacy.UnassessedRecords == 1 &&
+                BuildTimelineReconcileJson(edited).find(L"\"bootComparison\":\"unverified_snapshot\"") != std::wstring::npos;
+        };
+        const bool archiveOk = checkSaved();
+        const bool removed = DeleteFileW(file) != FALSE;
+        Check(context, archiveOk && removed, L"saved-edited-and-unsigned-snapshot-boot-replay");
     }
 
     bool HasAnalysisFinding(
@@ -856,10 +1057,20 @@ int RunTimelineSelfTest()
             L"dashboard-html-self-contained");
 
         SnapshotDocument snapshot = MakeSnapshotFixture();
+        CheckReconcileProvenance(&context);
+        TimelineStore reconcileStore;
+        TimelineLiveEvent clean = {}, ghost = {};
+        clean.Type = KNDBG_TIMELINE_EVENT_PROCESS_CREATE;
+        clean.ProcessId = 100;
+        clean.ImagePath = L"clean.exe";
+        ghost.Type = KNDBG_TIMELINE_EVENT_IMAGE_LOAD;
+        ghost.ProcessId = 200;
+        ghost.ImagePath = L"ghost.dll";
+        reconcileStore.IngestKernelLive({clean, ghost});
         TimelineReconcileOptions reconcileOptions = {};
         reconcileOptions.Limit = 10;
         reconcileOptions.LiveDropped = 7;
-        TimelineReconcileResult reconcile = store.ReconcileSnapshot(snapshot, reconcileOptions);
+        TimelineReconcileResult reconcile = reconcileStore.ReconcileSnapshot(snapshot, reconcileOptions);
 
         Check(
             &context,

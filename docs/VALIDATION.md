@@ -7,6 +7,44 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Timeline reconciliation on one Windows boot
+
+The development regression runs with `KnLiveDbg.exe --self-test timeline`.
+Its fixture reads the test process's creation FILETIME and the local boot
+GUID, writes a snapshot, and runs the production reader on the saved file,
+an edited copy and an unsigned copy. It passes controlled kernel-ring rows
+and ETW header records to the same ingestion paths as the interactive
+command. It checks PID reuse, the recorded exit boundary, ambiguous or
+missing generation data, source and target image roles, a repeated ETW
+timestamp, the finding limit and eviction from a 1,024-row store.
+
+The self-ingestion control imports the snapshot and its diff before
+reconciliation. A separate control resubmits a projected target row through
+generic ingestion. The report counts derived and supplied rows separately
+and retains the original risk record when comparison lacks evidence. The
+tests cover local replay and synthetic provider records. Collecting live
+kernel callbacks, measuring per-CPU loss and corresponding targets across
+hosts require separate validation. [Timeline reconciliation](ARCHITECTURE.md#timeline-reconciliation)
+
+On 2026-11-25 a separate writer recorded its own process and exited. The
+reader at `367212f` reported a missing event for the record in an empty
+timeline. Importing the same snapshot suppressed that finding and reported
+its two identity labels as missing images. The development reader kept one
+unassessed record and counted zero comparable events in all nine combinations
+of original, edited or unsigned files with empty, self-imported or resubmitted
+rows. The original retained its local receipt. The edited and unsigned files
+reported separate receipt states.
+
+The x64 Release binary passed all 42 timeline checks. The command suite
+passed all 3,097 checks with output captured through pipes. With output sent
+directly to regular files, five assertions about usage text in command
+transcripts failed on both `367212f` and the development binary.
+
+One concurrent run of `--self-test mcp-observe` failed four checks after
+the loopback listener restarted. Three isolated runs and a second concurrent
+run each passed all 98 checks on the same binary. The cause of the first
+restart failure remains open.
+
 ## Boot evidence in saved snapshot diffs
 
 On 2026-11-25, two fixture processes ran on one Windows installation under

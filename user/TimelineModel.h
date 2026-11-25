@@ -1,9 +1,12 @@
 #pragma once
+#include "SnapshotModel.h"
 
 #include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
+
+enum class TimelineOrigin { Supplied, KernelRing, EtwHeader, EtwUnbound, Snapshot, SnapshotDiff, Controller };
 
 struct TimelineEvent
 {
@@ -21,6 +24,11 @@ struct TimelineEvent
     std::wstring Risk;
     std::wstring Confidence;
     std::map<std::wstring, std::wstring> Evidence;
+    // The store assigns acquisition information on ingestion, including resubmitted rows.
+    TimelineOrigin Origin = TimelineOrigin::Supplied;
+    SnapshotBootSource SnapshotBoot = SnapshotBootSource::Unspecified;
+    uint64_t HeaderCreateTime = 0;
+    uint32_t AcquiredTargetPid = 0;
 };
 
 struct TimelineQueryOptions
@@ -116,7 +124,12 @@ struct TimelineReconcileFinding
 struct TimelineReconcileResult
 {
     std::wstring SnapshotLabel;
+    std::wstring SnapshotBootSource;
+    std::wstring BootComparison;
     uint64_t TimelineEvents = 0;
+    uint64_t SnapshotEvents = 0, ObserverEvents = 0, UnboundEvents = 0, LocalTargetEvents = 0;
+    uint64_t ComparedEvents = 0, GenerationMatches = 0, GenerationConflicts = 0, UnassessedGenerations = 0;
+    uint64_t CandidateRecords = 0, UnassessedRecords = 0, TimelineDropped = 0;
     uint64_t SnapshotProcesses = 0;
     uint64_t SnapshotRecords = 0;
     uint64_t LiveDropped = 0;
@@ -149,6 +162,7 @@ struct TimelineAnalysisResult
 };
 
 std::wstring TimelineToLower(const std::wstring& value);
+const wchar_t* TimelineOriginName(TimelineOrigin origin);
 std::wstring TimelineEventToJson(const TimelineEvent& event);
 std::wstring BuildTimelineEventsJson(
     const std::vector<TimelineEvent>& events,

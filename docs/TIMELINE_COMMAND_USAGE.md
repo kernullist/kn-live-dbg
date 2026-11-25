@@ -382,6 +382,21 @@ Use advanced reconcile only when you need text findings:
 !timeline reconcile snapshot /domain image /limit 50
 ```
 
+The summary shows the snapshot's boot evidence and how many selected local
+target events could be compared. A saved snapshot needs a verified local
+receipt for the running boot. Importing the snapshot or its diff into the
+timeline leaves those rows visible in queries and adds to `snapshot_events`.
+Only the local kernel ring and qualified ETW headers contribute target events.
+
+A `same-boot-generation` finding identifies an ETW header process by PID
+and creation time. An event past a known exit produces a conflict. A
+`candidate-only` finding reports matching endpoint
+labels. When a snapshot endpoint has both a PID and an image, a single
+observed endpoint must supply both. Image basenames can match across paths.
+An unassessed record reports a coverage gap. A missing candidate applies
+to the selected, retained rows. Check both loss counters and the snapshot's
+domain warnings before interpreting it.
+
 ## Advanced Compatibility
 
 Advanced commands remain available for scripting, text output, and explicit

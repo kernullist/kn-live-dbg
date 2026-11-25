@@ -1978,6 +1978,27 @@ credentials can issue receipts. The snapshot records themselves are plaintext
 JSON. Host compromise, VM cloning and continuous object lifetime require
 separate evidence. [Windows protection descriptors](https://learn.microsoft.com/en-us/windows/win32/seccng/protection-descriptors)
 
+#### Timeline reconciliation
+
+The timeline store stamps each row with its acquisition path. The generic
+ingest path resets this stamp when a caller resubmits a row. A saved
+snapshot carries the boot source established by its reader. A record's
+own boot or process-instance fields survive under `record.` if they collide
+with fields reserved for the timeline. The unverified document boot label
+is available as `reported_boot_id`.
+
+Reconciliation compares local kernel ring events and locally bound ETW
+headers with a snapshot from the same verified boot. Its source counters
+cover the selected rows before the finding limit. Snapshot, diff and
+controller rows remain queryable. ETW header PID and creation time can
+identify a process generation when the structured snapshot process list
+has one consistent creation time. A known exit must also admit the event
+timestamp. Conflicting generations or exit times produce a conflict.
+Missing creation evidence remains unassessed. Endpoint labels support searches
+within the retained rows. A matching basename, an inferred thread image
+or a count of events cannot establish continuous lifetime, simultaneous
+residency or a target process generation.
+
 `!hunt` combines memory, process, driver, policy and event evidence. Name/path
 matches remain distinct from exact hashes and observed effects.
 Exact-only public filenames such as `HwAudKiller.exe` are not suffix-normalized.

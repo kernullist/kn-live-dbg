@@ -1,4 +1,6 @@
 #include "TimelineStore.h"
+#include "DeviceClient.h"
+#include "../shared/KnLiveDbgIoctl.h"
 #include "ObservationWindows.h"
 #include "ProcessLoggingObservation.h"
 
@@ -151,6 +153,8 @@ namespace
 
         AppendEventKeyPart(&key, event.Timestamp);
         AppendEventKeyPart(&key, event.ProcessId);
+        AppendEventKeyPart(&key, event.ProcessBootId);
+        AppendEventKeyPart(&key, event.ProcessCreateTime);
         AppendEventKeyPart(&key, event.ThreadId);
         AppendEventKeyPart(&key, event.TargetProcessId);
         AppendEventKeyPart(&key, static_cast<uint64_t>(event.TaskId));
@@ -258,7 +262,7 @@ namespace
         bool ok = false;
         do
         {
-            if (pid == nullptr || text.empty())
+            if (pid == nullptr || text.empty() || text.find(L'-') != std::wstring::npos)
             {
                 break;
             }
@@ -266,7 +270,7 @@ namespace
             wchar_t* end = nullptr;
             errno = 0;
             unsigned long long value = wcstoull(text.c_str(), &end, 0);
-            if (end == text.c_str() || *end != L'\0' || errno == ERANGE)
+            if (end == text.c_str() || end != text.c_str() + text.size() || errno == ERANGE)
             {
                 break;
             }
@@ -859,6 +863,12 @@ namespace
             if (event->TargetProcessId != 0)
             {
                 AddEvidenceIfMissing(event, L"target_pid", std::to_wstring(event->TargetProcessId));
+            }
+
+            if (event->Origin == TimelineOrigin::SnapshotDiff ||
+                (event->Origin == TimelineOrigin::Snapshot && event->Evidence.count(L"boot_id") == 0))
+            {
+                break;
             }
 
             if (event->ProcessId != 0)
@@ -1610,7 +1620,10 @@ namespace
 
             for (auto it = existingEvents.rbegin(); it != existingEvents.rend(); ++it)
             {
-                if (it->ProcessId != event->ProcessId || TimelineIsObserverRow(*it))
+                if (it->ProcessId != event->ProcessId || TimelineIsObserverRow(*it) ||
+                    it->Origin == TimelineOrigin::Snapshot || it->Origin == TimelineOrigin::SnapshotDiff ||
+                    ((event->Origin == TimelineOrigin::KernelRing || event->Origin == TimelineOrigin::EtwHeader) &&
+                        it->Origin != TimelineOrigin::KernelRing && it->Origin != TimelineOrigin::EtwHeader))
                 {
                     continue;
                 }
@@ -1825,37 +1838,6 @@ namespace
         return ok;
     }
 
-    uint32_t SnapshotRecordAnyPid(const SnapshotRecord& record)
-    {
-        uint32_t pid = 0;
-        static const wchar_t* kKeys[] =
-        {
-            L"pid",
-            L"process_id",
-            L"owner_pid",
-            L"target_pid",
-            L"source_pid"
-        };
-
-        for (const wchar_t* key : kKeys)
-        {
-            if (SnapshotRecordPid(record, key, &pid))
-            {
-                break;
-            }
-        }
-
-        return pid;
-    }
-
-    void AddLowerNonEmpty(std::set<std::wstring>* values, const std::wstring& value)
-    {
-        if (values != nullptr && !value.empty())
-        {
-            values->insert(TimelineToLower(value));
-        }
-    }
-
     void AddLowerImageVariants(std::set<std::wstring>* values, const std::wstring& value)
     {
         if (values != nullptr && !value.empty())
@@ -1871,25 +1853,71 @@ namespace
         }
     }
 
-    void AddSnapshotRecordImages(const SnapshotRecord& record, std::set<std::wstring>* images)
+    struct ReconcileEndpoint
     {
+        uint32_t Pid = 0;
+        std::set<std::wstring> Images;
+        bool HasLabels() const { return Pid != 0 || !Images.empty(); }
+    };
+
+    struct ReconcileRecordEndpoints
+    {
+        ReconcileEndpoint Owner, Target;
+    };
+
+    ReconcileRecordEndpoints SnapshotEndpoints(const SnapshotRecord& record)
+    {
+        ReconcileRecordEndpoints result;
+        for (const auto* key : {L"pid", L"process_id", L"owner_pid", L"source_pid"})
+        {
+            if (SnapshotRecordPid(record, key, &result.Owner.Pid) && result.Owner.Pid != 0) { break; }
+        }
+        SnapshotRecordPid(record, L"target_pid", &result.Target.Pid);
         std::wstring value;
-        if (SnapshotEvidenceValueByKey(record, L"image", &value))
+        for (const auto* key : {L"image", L"image_path", L"path"})
         {
-            AddLowerImageVariants(images, value);
+            if (SnapshotEvidenceValueByKey(record, key, &value)) { AddLowerImageVariants(&result.Owner.Images, value); }
         }
-        if (SnapshotEvidenceValueByKey(record, L"image_path", &value))
+        if (SnapshotEvidenceValueByKey(record, L"target_image", &value)) { AddLowerImageVariants(&result.Target.Images, value); }
+        return result;
+    }
+
+    struct ReconcileLabelIndex
+    {
+        std::map<uint32_t, std::set<std::wstring>> ByPid;
+        std::set<std::wstring> Images;
+
+        void Add(uint32_t pid, const std::set<std::wstring>& names)
         {
-            AddLowerImageVariants(images, value);
+            Images.insert(names.begin(), names.end());
+            if (pid != 0) { ByPid[pid].insert(names.begin(), names.end()); }
         }
-        if (SnapshotEvidenceValueByKey(record, L"target_image", &value))
+
+        bool Matches(const ReconcileEndpoint& endpoint) const
         {
-            AddLowerImageVariants(images, value);
+            const auto* names = &Images;
+            if (endpoint.Pid != 0)
+            {
+                const auto found = ByPid.find(endpoint.Pid);
+                if (found == ByPid.end()) { return false; }
+                if (endpoint.Images.empty()) { return true; }
+                names = &found->second;
+            }
+            for (const auto& image : endpoint.Images) { if (names->count(image)) { return true; } }
+            return false;
         }
-        if (SnapshotEvidenceValueByKey(record, L"path", &value))
+    };
+
+    std::wstring ReconcileBootComparison(const SnapshotDocument& document)
+    {
+        if (!document.SameBootOnly) { return L"comparison_disabled"; }
+        if (document.BootSource != SnapshotBootSource::LocalCapture && document.BootSource != SnapshotBootSource::LocalReceipt)
         {
-            AddLowerImageVariants(images, value);
+            return L"unverified_snapshot";
         }
+        const auto& local = ObservationBootId();
+        if (!SnapshotHasBootGuid(document.BootId) || !SnapshotHasBootGuid(local)) { return L"boot_unknown"; }
+        return document.BootId == local ? L"same_local_boot" : L"different_boot";
     }
 
     bool TimelineEventMatchesReconcile(
@@ -1908,10 +1936,10 @@ namespace
         {
             matched = false;
         }
-        if (matched &&
-            options.HasProcessId &&
-            event.ProcessId != options.ProcessId &&
-            event.TargetProcessId != options.ProcessId)
+        const uint32_t targetPid = event.Origin == TimelineOrigin::KernelRing || event.Origin == TimelineOrigin::EtwHeader ?
+            event.AcquiredTargetPid : event.TargetProcessId;
+        if (matched && options.HasProcessId && (options.ProcessId == 0 ? (event.ProcessId != 0 || targetPid != 0) :
+            (event.ProcessId != options.ProcessId && targetPid != options.ProcessId)))
         {
             matched = false;
         }
@@ -1937,22 +1965,6 @@ namespace
         return rank;
     }
 
-    void AddReconcileFinding(
-        std::vector<TimelineReconcileFinding>* findings,
-        TimelineReconcileFinding finding,
-        uint64_t liveDropped)
-    {
-        if (findings != nullptr)
-        {
-            if (liveDropped != 0 && finding.Confidence != L"event-backed")
-            {
-                finding.Confidence = L"loss-limited";
-                finding.Evidence[L"live_dropped"] = std::to_wstring(liveDropped);
-            }
-            findings->push_back(std::move(finding));
-        }
-    }
-
     bool ReconcileFindingLess(
         const TimelineReconcileFinding& a,
         const TimelineReconcileFinding& b)
@@ -1971,7 +1983,8 @@ namespace
         {
             return a.Domain < b.Domain;
         }
-        return a.Subject < b.Subject;
+        return std::tie(a.Subject, a.EventId, a.ProcessId, a.Risk, a.Confidence, a.Summary, a.Evidence) <
+            std::tie(b.Subject, b.EventId, b.ProcessId, b.Risk, b.Confidence, b.Summary, b.Evidence);
     }
 
     uint32_t TimelineAnalysisRiskRank(const std::wstring& risk)
@@ -2550,6 +2563,190 @@ namespace
     }
 }
 
+static std::wstring TimelineImageSignatureLevelName(uint32_t level)
+{
+    switch (level)
+    {
+    case 0: return L"unchecked";
+    case 1: return L"unsigned";
+    case 2: return L"enterprise";
+    case 4: return L"authenticode";
+    case 6: return L"store";
+    case 7: return L"antimalware";
+    case 8: return L"microsoft";
+    case 12: return L"windows";
+    case 14: return L"windows_tcb";
+    default: return L"level_" + std::to_wstring(level);
+    }
+}
+
+static std::wstring TimelineImageSignatureTypeName(uint32_t type)
+{
+    switch (type)
+    {
+    case 0: return L"none";
+    case 1: return L"embedded";
+    case 2: return L"cache";
+    case 3: return L"catalog_cached";
+    case 4: return L"catalog_uncached";
+    case 5: return L"catalog_hint";
+    case 6: return L"package_catalog";
+    case 7: return L"ppl_mitigated";
+    default: return L"type_" + std::to_wstring(type);
+    }
+}
+
+static std::wstring TimelineLiveEventTypeText(uint32_t type)
+{
+    std::wstring text = L"unknown";
+    if (type == KNDBG_TIMELINE_EVENT_PROCESS_CREATE)
+    {
+        text = L"process-create";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_PROCESS_EXIT)
+    {
+        text = L"process-exit";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
+    {
+        text = L"image-load";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_THREAD_CREATE)
+    {
+        text = L"thread-create";
+    }
+    else if (type == KNDBG_TIMELINE_EVENT_THREAD_EXIT)
+    {
+        text = L"thread-exit";
+    }
+    return text;
+}
+
+TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& live)
+{
+    TimelineEvent event = {};
+    event.TimestampFileTime = live.Timestamp100ns;
+    event.Source = L"kernel-live";
+    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
+    {
+        event.Domain = L"image";
+    }
+    else if (live.Type == KNDBG_TIMELINE_EVENT_THREAD_CREATE ||
+             live.Type == KNDBG_TIMELINE_EVENT_THREAD_EXIT)
+    {
+        event.Domain = L"thread";
+    }
+    else
+    {
+        event.Domain = L"process";
+    }
+    event.Action = TimelineLiveEventTypeText(live.Type);
+    event.ProcessId = live.ProcessId;
+    event.ThreadId = live.ThreadId;
+    event.Entity = live.ImagePath;
+    if (event.Entity.empty())
+    {
+        if (event.Domain == L"thread" && live.ThreadId != 0)
+        {
+            event.Entity = L"pid:" + std::to_wstring(live.ProcessId) +
+                L" tid:" + std::to_wstring(live.ThreadId);
+        }
+        else
+        {
+            event.Entity = L"pid:" + std::to_wstring(live.ProcessId);
+        }
+    }
+    event.Summary = event.Action + L" pid=" + std::to_wstring(live.ProcessId);
+    if (live.ThreadId != 0 && event.Domain == L"thread")
+    {
+        event.Summary += L" tid=" + std::to_wstring(live.ThreadId);
+    }
+    if ((event.Domain == L"thread" || event.Domain == L"process") &&
+        live.CreatorProcessId != 0)
+    {
+        event.Summary += L" creator_pid=" + std::to_wstring(live.CreatorProcessId);
+        event.Evidence[L"creator_pid"] = std::to_wstring(live.CreatorProcessId);
+        event.Evidence[L"source_pid"] = std::to_wstring(live.CreatorProcessId);
+        if (live.CreatorThreadId != 0)
+        {
+            event.Summary += L" creator_tid=" + std::to_wstring(live.CreatorThreadId);
+            event.Evidence[L"creator_tid"] = std::to_wstring(live.CreatorThreadId);
+        }
+        if (event.Domain == L"thread" &&
+            live.CreatorProcessId != live.ProcessId)
+        {
+            event.Risk = L"warning";
+            event.Evidence[L"remote_thread"] = L"true";
+            event.Evidence[L"target_pid"] = std::to_wstring(live.ProcessId);
+            event.Evidence[L"cross_process_operation"] = L"createremotethread";
+            event.Evidence[L"analysis_family"] = L"cross-process";
+            event.Evidence[L"timeline_category"] = L"cross-process";
+        }
+    }
+    if (live.ParentProcessId != 0)
+    {
+        event.Summary += L" parent_pid=" + std::to_wstring(live.ParentProcessId);
+        event.Evidence[L"parent_pid"] = std::to_wstring(live.ParentProcessId);
+        if (event.Domain == L"process" && live.CreatorProcessId != 0)
+        {
+            event.Evidence[L"parent_differs_from_creator"] =
+                live.ParentProcessId != live.CreatorProcessId ? L"true" : L"false";
+        }
+    }
+    if (!live.ImagePath.empty())
+    {
+        event.Summary += L" image=" + live.ImagePath;
+        event.Evidence[L"image_path"] = live.ImagePath;
+    }
+    if (live.ImageBase != 0)
+    {
+        event.Evidence[L"image_base"] = SnapshotHex(live.ImageBase, 16);
+    }
+    if (live.ImageSize != 0)
+    {
+        event.Evidence[L"image_size"] = SnapshotHex(live.ImageSize, 16);
+    }
+    if (live.FileObject != 0)
+    {
+        event.Evidence[L"file_object"] = SnapshotHex(live.FileObject, 16);
+    }
+    if (live.Type == KNDBG_TIMELINE_EVENT_IMAGE_LOAD)
+    {
+        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_SYSTEM_MODE) != 0)
+        {
+            event.Evidence[L"system_mode"] = L"true";
+        }
+        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_PARTIAL_MAP) != 0)
+        {
+            event.Evidence[L"partial_map"] = L"true";
+        }
+        if ((live.Flags & KNDBG_TIMELINE_IMAGE_FLAG_EXTENDED) != 0)
+        {
+            event.Evidence[L"extended_info"] = L"true";
+        }
+        const uint32_t sigLevel =
+            (live.Flags & KNDBG_TIMELINE_IMAGE_SIGLEVEL_MASK) >>
+            KNDBG_TIMELINE_IMAGE_SIGLEVEL_SHIFT;
+        const uint32_t sigType =
+            (live.Flags & KNDBG_TIMELINE_IMAGE_SIGTYPE_MASK) >>
+            KNDBG_TIMELINE_IMAGE_SIGTYPE_SHIFT;
+        event.Evidence[L"signature_level"] = TimelineImageSignatureLevelName(sigLevel);
+        event.Evidence[L"signature_type"] = TimelineImageSignatureTypeName(sigType);
+    }
+    if (event.Risk.empty())
+    {
+        event.Risk = L"info";
+    }
+    event.Confidence = L"kernel-callback";
+    event.Evidence[L"sequence"] = std::to_wstring(live.Sequence);
+    event.Evidence[L"type"] = std::to_wstring(live.Type);
+    if (live.ThreadId != 0)
+    {
+        event.Evidence[L"tid"] = std::to_wstring(live.ThreadId);
+    }
+    return event;
+}
+
 TimelineStore::TimelineStore() :
     TimelineStore(262144)
 {
@@ -2754,7 +2951,9 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
         // TargetProcessId comes from payload interpretation and is a distinct role.
         const ObservationIdentity lifetime{item.ProcessBootId, item.ProcessId, item.ProcessCreateTime};
         const bool qualified = IsRetainedProcessLifetime(lifetime) && item.Timestamp >= lifetime.CreateTime;
-        if (AddEventLocked(std::move(event), qualified ? &lifetime : nullptr))
+        const bool localHeader = qualified && lifetime.BootId == ObservationBootId();
+        if (AddEventLocked(std::move(event), localHeader ? TimelineOrigin::EtwHeader : TimelineOrigin::EtwUnbound,
+                qualified ? &lifetime : nullptr))
         {
             ++result.Added;
         }
@@ -2811,6 +3010,29 @@ TimelineIngestResult TimelineStore::IngestThreatIntel(
     return result;
 }
 
+// Preserve colliding record fields under a separate prefix, including fields
+// that already use that prefix. Only the document reader supplies boot evidence.
+static void CopySnapshotRecordEvidence(TimelineEvent& row, const SnapshotRecord& record)
+{
+    for (const auto& field : record.Evidence)
+    {
+        const auto& key = field.first;
+        auto canonical = TimelineCanonicalEvidenceKey(key);
+        if (canonical.compare(0, 7, L"payload") == 0) { canonical.erase(0, 7); }
+        const bool reserved = key.compare(0, 7, L"record.") == 0 || canonical == L"bootid" || canonical == L"reportedbootid" ||
+            canonical == L"processinstanceid" || canonical == L"processinstanceidbasis" || canonical == L"targetprocessinstanceid";
+        row.Evidence.emplace(reserved ? L"record." + key : key, field.second);
+    }
+}
+
+static void SetSnapshotBootEvidence(TimelineEvent& row, const SnapshotDocument& document)
+{
+    row.SnapshotBoot = document.BootSource;
+    const bool verified = document.SameBootOnly && SnapshotHasBootGuid(document.BootId) &&
+        (document.BootSource == SnapshotBootSource::LocalCapture || document.BootSource == SnapshotBootSource::LocalReceipt);
+    AddEvidenceIfPresent(&row.Evidence, verified ? L"boot_id" : L"reported_boot_id", document.BootId);
+}
+
 TimelineIngestResult TimelineStore::IngestSnapshot(
     const SnapshotDocument& document,
     const std::wstring& sourceName)
@@ -2835,7 +3057,7 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
         event.Confidence = L"snapshot";
         event.Evidence[L"source"] = sourceName;
         AddEvidenceIfPresent(&event.Evidence, L"label", document.Label);
-        AddEvidenceIfPresent(&event.Evidence, L"boot_id", document.BootId);
+        SetSnapshotBootEvidence(event, document);
         AddEvidenceIfPresent(&event.Evidence, L"image", process.ImageName);
         AddEvidenceIfPresent(&event.Evidence, L"identity", process.Identity);
         if (process.Eprocess != 0)
@@ -2855,7 +3077,7 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
             event.Evidence[L"create_time"] = std::to_wstring(process.CreateTime);
         }
 
-        if (AddEventLocked(std::move(event)))
+        if (AddEventLocked(std::move(event), TimelineOrigin::Snapshot))
         {
             ++result.Added;
         }
@@ -2873,10 +3095,10 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
         event.Summary = SnapshotRecordSummary(record);
         event.Risk = record.Risk.empty() ? L"info" : record.Risk;
         event.Confidence = record.Volatile ? L"volatile-snapshot" : L"snapshot";
-        event.Evidence = record.Evidence;
+        CopySnapshotRecordEvidence(event, record);
         event.Evidence[L"source"] = sourceName;
         AddEvidenceIfPresent(&event.Evidence, L"label", document.Label);
-        AddEvidenceIfPresent(&event.Evidence, L"boot_id", document.BootId);
+        SetSnapshotBootEvidence(event, document);
         AddEvidenceIfPresent(&event.Evidence, L"display", record.Display);
         if (!record.Tags.empty())
         {
@@ -2892,7 +3114,7 @@ TimelineIngestResult TimelineStore::IngestSnapshot(
             event.Evidence[L"tags"] = tags;
         }
 
-        if (AddEventLocked(std::move(event)))
+        if (AddEventLocked(std::move(event), TimelineOrigin::Snapshot))
         {
             ++result.Added;
         }
@@ -2940,7 +3162,7 @@ TimelineIngestResult TimelineStore::IngestSnapshotDiff(
         }
         event.Risk = record.Risk.empty() ? L"warning" : record.Risk;
         event.Confidence = L"snapshot-diff";
-        event.Evidence = record.Evidence;
+        CopySnapshotRecordEvidence(event, record);
         event.Evidence[L"source"] = sourceName;
         event.Evidence[L"diff_kind"] = event.Action;
         event.Evidence[L"snapshot_boot_comparison"] = diff.BootBasis;
@@ -2952,7 +3174,7 @@ TimelineIngestResult TimelineStore::IngestSnapshotDiff(
         AddEvidenceIfPresent(&event.Evidence, L"old_risk", finding.OldRecord.Risk);
         AddEvidenceIfPresent(&event.Evidence, L"new_risk", record.Risk);
 
-        if (AddEventLocked(std::move(event)))
+        if (AddEventLocked(std::move(event), TimelineOrigin::SnapshotDiff))
         {
             ++result.Added;
         }
@@ -3023,7 +3245,7 @@ TimelineIngestResult TimelineStore::IngestTiObserverActions(const TiObserverSnap
             {L"returned_utc_filetime", std::to_wstring(action.ReturnedFileTime)}, {L"status_domain", L"win32"},
             {L"status", std::to_wstring(action.Status)}, {L"possible_observer_effect", effect}, {L"effect_verified", L"false"}};
         if (action.Request == TiObserverRequest::EnableProvider) { row.Evidence[L"provider"] = L"Microsoft-Windows-Threat-Intelligence"; }
-        return AddEventLocked(std::move(row), nullptr, true);
+        return AddEventLocked(std::move(row), TimelineOrigin::Controller);
     });
     result.Dropped = DroppedEvents - before;
     return result;
@@ -3085,7 +3307,7 @@ TimelineIngestResult TimelineStore::IngestLiveObserverActions(const TimelineCont
         }
         row.Evidence[L"outcome"] = outcome;
         row.Summary = row.Action + L" " + outcome;
-        return AddEventLocked(std::move(row), nullptr, true);
+        return AddEventLocked(std::move(row), TimelineOrigin::Controller);
     });
     result.Dropped = DroppedEvents - before;
     return result;
@@ -3152,7 +3374,7 @@ TimelineIngestResult TimelineStore::IngestProcessLoggingActions(const ProcessLog
             }
         }
         row.Summary = row.Action + L" " + outcome;
-        return AddEventLocked(std::move(row), nullptr, true);
+        return AddEventLocked(std::move(row), TimelineOrigin::Controller);
     });
     result.Dropped = DroppedEvents - before;
     return result;
@@ -3235,8 +3457,25 @@ TimelineIngestResult TimelineStore::IngestProcessHandleActions(const ProcessHand
         }
         if (item.Call != ProcessHandleCall::Close) { fields[L"inherit_handle"] = L"false"; }
         row.Summary = row.Action + L" " + outcome;
-        return AddEventLocked(std::move(row), nullptr, true);
+        return AddEventLocked(std::move(row), TimelineOrigin::Controller);
     });
+    result.Dropped = DroppedEvents - before;
+    return result;
+}
+
+TimelineIngestResult TimelineStore::IngestKernelLive(const std::vector<TimelineLiveEvent>& events)
+{
+    TimelineIngestResult result = {};
+    result.SourceRecords = events.size();
+    std::vector<TimelineEvent> rows;
+    rows.reserve(events.size());
+    for (const auto& item : events) { rows.push_back(BuildTimelineEventFromLiveEvent(item)); }
+    std::lock_guard<std::mutex> lock(Mutex);
+    const uint64_t before = DroppedEvents;
+    for (auto& row : rows)
+    {
+        if (AddEventLocked(std::move(row), TimelineOrigin::KernelRing)) { ++result.Added; }
+    }
     result.Dropped = DroppedEvents - before;
     return result;
 }
@@ -3252,7 +3491,7 @@ TimelineIngestResult TimelineStore::IngestEvents(
     for (const TimelineEvent& item : events)
     {
         TimelineEvent event = item;
-        if (AddEventLocked(std::move(event)))
+        if (AddEventLocked(std::move(event), TimelineOrigin::Supplied))
         {
             ++result.Added;
         }
@@ -3462,147 +3701,208 @@ TimelineReconcileResult TimelineStore::ReconcileSnapshot(
     result.SnapshotProcesses = document.Processes.size();
     result.SnapshotRecords = document.Records.size();
     result.LiveDropped = options.LiveDropped;
-
-    std::set<uint32_t> snapshotPids;
-    std::set<std::wstring> snapshotImages;
-    for (const SnapshotProcessRecord& process : document.Processes)
+    const auto retainFinding = [&](TimelineReconcileFinding finding)
     {
+        auto& rows = result.Findings;
+        if (options.Limit == 0) { rows.push_back(std::move(finding)); return; }
+        if (rows.size() == options.Limit)
+        {
+            result.Truncated = true;
+            if (!ReconcileFindingLess(finding, rows.front())) { return; }
+            std::pop_heap(rows.begin(), rows.end(), ReconcileFindingLess);
+            rows.pop_back();
+        }
+        rows.push_back(std::move(finding));
+        std::push_heap(rows.begin(), rows.end(), ReconcileFindingLess);
+    };
+
+    result.SnapshotBootSource = SnapshotBootSourceName(document.BootSource);
+    result.BootComparison = ReconcileBootComparison(document);
+    const bool sameBoot = result.BootComparison == L"same_local_boot";
+
+    ReconcileLabelIndex inventory, observed;
+    struct SnapshotGeneration { std::set<uint64_t> Creations, KnownExits; };
+    std::map<uint32_t, SnapshotGeneration> generations;
+    for (const auto& process : document.Processes)
+    {
+        std::set<std::wstring> names;
+        AddLowerImageVariants(&names, process.ImageName);
+        inventory.Add(process.ProcessId, names);
         if (process.ProcessId != 0)
         {
-            snapshotPids.insert(process.ProcessId);
+            auto& lifetime = generations[process.ProcessId];
+            lifetime.Creations.insert(process.HasCreateTime ? process.CreateTime : 0);
+            if (process.HasExitTime && process.ExitTime != 0) { lifetime.KnownExits.insert(process.ExitTime); }
         }
-        AddLowerImageVariants(&snapshotImages, process.ImageName);
     }
-    for (const SnapshotRecord& record : document.Records)
+    for (const auto& record : document.Records)
     {
-        uint32_t pid = SnapshotRecordAnyPid(record);
-        if (pid != 0)
-        {
-            snapshotPids.insert(pid);
-        }
-        AddSnapshotRecordImages(record, &snapshotImages);
+        const auto endpoints = SnapshotEndpoints(record);
+        inventory.Add(endpoints.Owner.Pid, endpoints.Owner.Images);
+        inventory.Add(endpoints.Target.Pid, endpoints.Target.Images);
     }
 
-    std::vector<TimelineEvent> events = AllEvents();
-    result.TimelineEvents = events.size();
-    const bool observerOnly = _wcsicmp(options.Source.c_str(), L"observer") == 0 || _wcsicmp(options.Domain.c_str(), L"observer_action") == 0;
-    if (observerOnly)
+    struct ReconcileEvent
     {
-        result.Warnings.push_back(L"Observer actions describe the controller. Target snapshot comparison requires target events.");
+        uint64_t EventId, TimestampFileTime, HeaderCreateTime;
+        uint32_t ProcessId, AcquiredTargetPid;
+        TimelineOrigin Origin;
+        std::wstring Source, Domain, Action, SourceImage, TargetImage;
+    };
+    std::vector<ReconcileEvent> events;
+    const auto source = TimelineToLower(options.Source);
+    const bool nonTargetFilter = source == L"observer" || source == L"snapshot" || source == L"snapshot-diff" ||
+        TimelineToLower(options.Domain) == L"observer_action";
+    {
+        std::lock_guard<std::mutex> lock(Mutex);
+        result.TimelineEvents = Events.size();
+        result.TimelineDropped = DroppedEvents;
+        for (const auto& event : Events)
+        {
+            if (!TimelineEventMatchesReconcile(event, options)) { continue; }
+            if (event.Origin == TimelineOrigin::Snapshot || event.Origin == TimelineOrigin::SnapshotDiff) { ++result.SnapshotEvents; }
+            else if (event.Origin == TimelineOrigin::Controller || TimelineIsObserverRow(event)) { ++result.ObserverEvents; }
+            else if (event.Origin != TimelineOrigin::KernelRing && event.Origin != TimelineOrigin::EtwHeader) { ++result.UnboundEvents; }
+            else
+            {
+                ++result.LocalTargetEvents;
+                if (!sameBoot) { continue; }
+                const auto image = event.Evidence.find(L"image_path"), target = event.Evidence.find(L"target_image");
+                events.push_back({event.EventId, event.TimestampFileTime, event.HeaderCreateTime, event.ProcessId, event.AcquiredTargetPid,
+                    event.Origin, event.Source, event.Domain, event.Action, image == event.Evidence.end() ? L"" : image->second,
+                    target == event.Evidence.end() ? L"" : target->second});
+            }
+        }
     }
-    std::set<uint32_t> eventPids;
-    std::set<std::wstring> eventImages;
-    for (const TimelineEvent& event : events)
+    result.ComparedEvents = events.size();
+    for (const auto& event : events)
     {
-        if (TimelineIsObserverRow(event) || !TimelineEventMatchesReconcile(event, options))
+        const auto reportEvent = [&](const wchar_t* kind, const wchar_t* confidence, const wchar_t* summary,
+            std::wstring subject, uint32_t pid, const wchar_t* role)
         {
-            continue;
-        }
-        if (event.ProcessId != 0)
-        {
-            eventPids.insert(event.ProcessId);
-        }
-        if (event.TargetProcessId != 0)
-        {
-            eventPids.insert(event.TargetProcessId);
-        }
-        std::vector<TimelineImageRef> images = TimelineEventImageRefs(event);
-        for (const TimelineImageRef& image : images)
-        {
-            AddLowerImageVariants(&eventImages, image.Value);
-        }
-
-        if (event.ProcessId != 0 &&
-            event.Action != L"process-exit" &&
-            snapshotPids.find(event.ProcessId) == snapshotPids.end())
-        {
-            TimelineReconcileFinding finding = {};
-            finding.Kind = L"event-without-snapshot-process";
+            TimelineReconcileFinding finding;
+            finding.Kind = kind;
             finding.Domain = event.Domain;
-            finding.Subject = L"pid:" + std::to_wstring(event.ProcessId);
+            finding.Subject = std::move(subject);
             finding.Risk = event.Action == L"image-load" ? L"medium" : L"low";
-            finding.Confidence = L"event-backed";
-            finding.Summary = L"timeline event has no matching process in snapshot";
+            finding.Confidence = confidence;
+            finding.Summary = summary;
             finding.EventId = event.EventId;
-            finding.ProcessId = event.ProcessId;
-            finding.Evidence[L"action"] = event.Action;
-            finding.Evidence[L"source"] = event.Source;
-            AddEvidenceIfPresent(&finding.Evidence, L"entity", event.Entity);
-            AddReconcileFinding(&result.Findings, std::move(finding), options.LiveDropped);
-        }
-
-        for (const TimelineImageRef& image : images)
-        {
-            if (!image.Value.empty() && snapshotImages.find(TimelineToLower(image.Value)) == snapshotImages.end())
-            {
-                TimelineReconcileFinding finding = {};
-                finding.Kind = L"event-without-snapshot-image";
-                finding.Domain = event.Domain;
-                finding.Subject = image.Value;
-                finding.Risk = event.Action == L"image-load" ? L"medium" : L"low";
-                finding.Confidence = L"event-backed";
-                finding.Summary = L"timeline image evidence has no matching image in snapshot";
-                finding.EventId = event.EventId;
-                finding.ProcessId = event.ProcessId;
-                finding.Evidence[L"action"] = event.Action;
-                finding.Evidence[L"source"] = event.Source;
-                AddReconcileFinding(&result.Findings, std::move(finding), options.LiveDropped);
-            }
-        }
-    }
-
-    for (const SnapshotRecord& record : document.Records)
-    {
-        if (observerOnly) { break; }
-        if (!options.Domain.empty() &&
-            TimelineToLower(record.Domain) != TimelineToLower(options.Domain))
-        {
-            continue;
-        }
-        if (ReconcileRiskRank(record.Risk) < 2)
-        {
-            continue;
-        }
-
-        uint32_t pid = SnapshotRecordAnyPid(record);
-        if (options.HasProcessId && pid != options.ProcessId)
-        {
-            continue;
-        }
-
-        bool pidSeen = pid != 0 && eventPids.find(pid) != eventPids.end();
-        std::set<std::wstring> recordImages;
-        AddSnapshotRecordImages(record, &recordImages);
-        bool imageSeen = recordImages.empty();
-        for (const std::wstring& image : recordImages)
-        {
-            if (eventImages.find(image) != eventImages.end())
-            {
-                imageSeen = true;
-                break;
-            }
-        }
-
-        if (!pidSeen && !imageSeen)
-        {
-            TimelineReconcileFinding finding = {};
-            finding.Kind = L"snapshot-record-without-event";
-            finding.Domain = record.Domain;
-            finding.Subject = record.Identity.empty() ? record.Display : record.Identity;
-            finding.Risk = record.Risk.empty() ? L"medium" : record.Risk;
-            finding.Confidence = L"no-live-event";
-            finding.Summary = L"snapshot state has no matching timeline event";
             finding.ProcessId = pid;
-            AddEvidenceIfPresent(&finding.Evidence, L"display", record.Display);
-            AddEvidenceIfPresent(&finding.Evidence, L"identity", record.Identity);
-            AddReconcileFinding(&result.Findings, std::move(finding), options.LiveDropped);
+            finding.Evidence = {{L"action", event.Action}, {L"source", event.Source},
+                {L"acquisition", TimelineOriginName(event.Origin)}, {L"role", role}};
+            retainFinding(std::move(finding));
+        };
+
+        const auto generation = generations.find(event.ProcessId);
+        if (event.HeaderCreateTime != 0 && generation != generations.end() && !generation->second.Creations.count(0))
+        {
+            const auto& lifetime = generation->second;
+            const bool compatibleExit = lifetime.KnownExits.empty() ||
+                (lifetime.KnownExits.size() == 1 && event.TimestampFileTime <= *lifetime.KnownExits.begin());
+            const bool matched = compatibleExit && lifetime.Creations.size() == 1 && *lifetime.Creations.begin() == event.HeaderCreateTime;
+            if (matched) { ++result.GenerationMatches; } else { ++result.GenerationConflicts; }
+            reportEvent(matched ? L"event-process-generation-match" : L"event-process-generation-conflict",
+                matched ? L"same-boot-generation" : L"conflicting-generation",
+                matched ? L"ETW header PID and creation time match the snapshot process on this boot" :
+                    L"ETW header time or generation conflicts with the recorded process lifetime",
+                L"pid:" + std::to_wstring(event.ProcessId), event.ProcessId, L"header");
         }
+        else if (event.HeaderCreateTime != 0) { ++result.UnassessedGenerations; }
+        if (event.ProcessId != 0 && event.Action != L"process-exit" && !inventory.ByPid.count(event.ProcessId))
+        {
+            reportEvent(L"event-without-snapshot-process", L"event-backed", L"snapshot inventory has no reported PID label for this event",
+                L"pid:" + std::to_wstring(event.ProcessId), event.ProcessId, L"source");
+        }
+        // Only images reported by the acquisition adapter enter the comparison.
+        // A previous timeline row may have supplied display context for a thread.
+        const auto observeEndpoint = [&](uint32_t pid, const std::wstring& image, const wchar_t* role)
+        {
+            std::set<std::wstring> names;
+            if (!image.empty())
+            {
+                AddLowerImageVariants(&names, image);
+                if (!inventory.Matches({0, names}))
+                {
+                    reportEvent(L"event-without-snapshot-image", L"event-backed", L"snapshot inventory has no matching image label",
+                        image, pid, role);
+                }
+            }
+            observed.Add(pid, names);
+        };
+        observeEndpoint(event.ProcessId, event.SourceImage, L"source");
+        observeEndpoint(event.AcquiredTargetPid, event.TargetImage, L"target");
     }
 
-    if (options.LiveDropped != 0)
+    if (nonTargetFilter)
     {
-        result.Warnings.push_back(
-            L"live event ring reported dropped events; absence findings are confidence-limited");
+        result.Warnings.push_back(L"The selected source describes a snapshot or controller action. Select a target event source for comparison.");
+    }
+    if (!sameBoot && !nonTargetFilter)
+    {
+        result.Warnings.push_back(L"The snapshot and local target events have no verified common boot. See bootComparison.");
+    }
+    for (const auto& record : document.Records)
+    {
+        if (nonTargetFilter) { break; }
+        if ((!options.Domain.empty() && TimelineToLower(record.Domain) != TimelineToLower(options.Domain)) ||
+            ReconcileRiskRank(record.Risk) < 2) { continue; }
+        const auto endpoints = SnapshotEndpoints(record);
+        if (options.HasProcessId && (options.ProcessId == 0 ? (endpoints.Owner.Pid != 0 || endpoints.Target.Pid != 0) :
+            (endpoints.Owner.Pid != options.ProcessId && endpoints.Target.Pid != options.ProcessId))) { continue; }
+
+        TimelineReconcileFinding finding;
+        finding.Domain = record.Domain;
+        finding.Subject = record.Identity.empty() ? record.Display : record.Identity;
+        finding.ProcessId = options.HasProcessId ? options.ProcessId :
+            (endpoints.Owner.Pid != 0 ? endpoints.Owner.Pid : endpoints.Target.Pid);
+        finding.Risk = record.Risk;
+        AddEvidenceIfPresent(&finding.Evidence, L"display", record.Display);
+        AddEvidenceIfPresent(&finding.Evidence, L"identity", record.Identity);
+        unsigned endpointsChecked = 0, matching = 0;
+        for (const auto* endpoint : {&endpoints.Owner, &endpoints.Target})
+        {
+            if (endpoint->HasLabels())
+            {
+                ++endpointsChecked;
+                if (observed.Matches(*endpoint)) { ++matching; }
+            }
+        }
+        if (!sameBoot || result.ComparedEvents == 0 || endpointsChecked == 0)
+        {
+            finding.Kind = L"snapshot-record-unassessed";
+            finding.Confidence = L"coverage-unknown";
+            finding.Summary = L"snapshot record has insufficient evidence for target event comparison";
+            finding.Evidence[L"reason"] = !sameBoot ? result.BootComparison :
+                (result.ComparedEvents == 0 ? L"no_comparable_events" : L"no_endpoint_labels");
+            ++result.UnassessedRecords;
+        }
+        else
+        {
+            finding.Evidence[L"endpoints_searched"] = std::to_wstring(endpointsChecked);
+            finding.Evidence[L"endpoints_with_candidate"] = std::to_wstring(matching);
+            if (matching == endpointsChecked)
+            {
+                finding.Kind = L"snapshot-record-candidate";
+                finding.Confidence = L"candidate-only";
+                finding.Summary = L"selected events contain candidate labels for each reported endpoint";
+                ++result.CandidateRecords;
+            }
+            else
+            {
+                finding.Kind = L"snapshot-record-without-event";
+                finding.Confidence = result.LiveDropped || result.TimelineDropped ? L"loss-limited" : L"no-live-event";
+                finding.Summary = L"selected events lack a candidate for one or more reported endpoints";
+                if (result.LiveDropped) { finding.Evidence[L"live_dropped"] = std::to_wstring(result.LiveDropped); }
+                if (result.TimelineDropped) { finding.Evidence[L"timeline_dropped"] = std::to_wstring(result.TimelineDropped); }
+            }
+        }
+        retainFinding(std::move(finding));
+    }
+
+    if (result.LiveDropped || result.TimelineDropped)
+    {
+        result.Warnings.push_back(L"Event loss or timeline eviction limits coverage of the selected records.");
     }
     for (const auto& item : document.DomainWarnings)
     {
@@ -3613,12 +3913,6 @@ TimelineReconcileResult TimelineStore::ReconcileSnapshot(
     }
 
     std::sort(result.Findings.begin(), result.Findings.end(), ReconcileFindingLess);
-    if (options.Limit != 0 && result.Findings.size() > options.Limit)
-    {
-        result.Findings.resize(options.Limit);
-        result.Truncated = true;
-    }
-
     return result;
 }
 
@@ -3978,9 +4272,13 @@ bool TimelineStore::ExportJsonl(const std::wstring& path, std::wstring* error) c
     return WriteSnapshotTextFile(path, BuildTimelineJsonl(events), error);
 }
 
-bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentity* target, bool controllerAction)
+bool TimelineStore::AddEventLocked(TimelineEvent event, TimelineOrigin origin, const ObservationIdentity* target)
 {
-    if (controllerAction)
+    event.Origin = origin;
+    if (origin != TimelineOrigin::Snapshot) { event.SnapshotBoot = SnapshotBootSource::Unspecified; }
+    event.AcquiredTargetPid = origin == TimelineOrigin::EtwHeader || origin == TimelineOrigin::KernelRing ? event.TargetProcessId : 0;
+    event.HeaderCreateTime = origin == TimelineOrigin::EtwHeader && target ? target->CreateTime : 0;
+    if (origin == TimelineOrigin::Controller)
     {
         // The PID belongs to the controller. Target-image enrichment or
         // anomaly inference from an unrelated event would change its meaning.
@@ -4005,6 +4303,9 @@ bool TimelineStore::AddEventLocked(TimelineEvent event, const ObservationIdentit
         NormalizeTimelineEvent(&event);
     }
     auto key = TimelineEventKey(event);
+    AppendEventKeyPart(&key, static_cast<uint64_t>(origin));
+    if (origin == TimelineOrigin::EtwHeader || origin == TimelineOrigin::KernelRing) { AppendEventKeyPart(&key, event.AcquiredTargetPid); }
+    if (origin == TimelineOrigin::Snapshot) { AppendEventKeyPart(&key, static_cast<uint64_t>(event.SnapshotBoot)); }
     if (target)
     {
         // An identical unbound import cannot occupy the trusted row's dedup slot.

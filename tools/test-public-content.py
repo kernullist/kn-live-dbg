@@ -874,6 +874,14 @@ class PublicContentTests(unittest.TestCase):
                 data = ("saved\n" + json.dumps({"entry": [value]})[:-2]).encode(encoding)
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("fragment.txt", data)})
 
+    def test_timeline_reconciliation_evidence(self):
+        for fragment in (dict(schema="kn-live-dbg.timeline-reconcile.v1"), dict(snapshotBootSource="local_receipt"),
+                         dict(comparedEvents=1, localTargetEvents=1), dict(eventId=1, acquisition="local_kernel_ring", source="fixture")):
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("row\n" + json.dumps({"nested": [fragment]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("renamed.txt", data)})
+        self.assertFalse(AUDIT.inspect("example.json", b'{"acquisition":"purchase"}'))
+
     def test_local_snapshot_boot_receipt(self):
         for fragment in (dict(local_boot_receipt=None), dict(local_boot_receipt="ab" * 64),
                          dict(schema="kn.saved_snapshot_diff.v1"), dict(baseline_boot_source="local_receipt"),

@@ -53,6 +53,20 @@ std::wstring TimelineToLower(const std::wstring& value)
     return out;
 }
 
+const wchar_t* TimelineOriginName(TimelineOrigin origin)
+{
+    switch (origin)
+    {
+    case TimelineOrigin::KernelRing: return L"local_kernel_ring";
+    case TimelineOrigin::EtwHeader: return L"local_etw_header";
+    case TimelineOrigin::EtwUnbound: return L"unbound_etw";
+    case TimelineOrigin::Snapshot: return L"snapshot";
+    case TimelineOrigin::SnapshotDiff: return L"snapshot_diff";
+    case TimelineOrigin::Controller: return L"controller";
+    default: return L"supplied_record";
+    }
+}
+
 std::wstring TimelineEventToJson(const TimelineEvent& event)
 {
     std::wstring out = L"{\"eventId\":" + std::to_wstring(event.EventId);
@@ -67,6 +81,11 @@ std::wstring TimelineEventToJson(const TimelineEvent& event)
     }
 
     out += L",\"source\":" + mcpjson::Quote(event.Source);
+    out += L",\"acquisition\":" + mcpjson::Quote(TimelineOriginName(event.Origin));
+    if (event.Origin == TimelineOrigin::Snapshot)
+    {
+        out += L",\"snapshotBootSource\":" + mcpjson::Quote(SnapshotBootSourceName(event.SnapshotBoot));
+    }
     out += L",\"domain\":" + mcpjson::Quote(event.Domain);
     out += L",\"action\":" + mcpjson::Quote(event.Action);
 
@@ -240,6 +259,19 @@ std::wstring BuildTimelineReconcileJson(const TimelineReconcileResult& result)
 {
     std::wstring out = L"{\"schema\":\"kn-live-dbg.timeline-reconcile.v1\"";
     out += L",\"snapshotLabel\":" + mcpjson::Quote(result.SnapshotLabel);
+    out += L",\"snapshotBootSource\":" + mcpjson::Quote(result.SnapshotBootSource);
+    out += L",\"bootComparison\":" + mcpjson::Quote(result.BootComparison);
+    out += L",\"snapshotEvents\":" + std::to_wstring(result.SnapshotEvents);
+    out += L",\"observerEvents\":" + std::to_wstring(result.ObserverEvents);
+    out += L",\"unboundEvents\":" + std::to_wstring(result.UnboundEvents);
+    out += L",\"localTargetEvents\":" + std::to_wstring(result.LocalTargetEvents);
+    out += L",\"comparedEvents\":" + std::to_wstring(result.ComparedEvents);
+    out += L",\"generationMatches\":" + std::to_wstring(result.GenerationMatches);
+    out += L",\"generationConflicts\":" + std::to_wstring(result.GenerationConflicts);
+    out += L",\"unassessedGenerations\":" + std::to_wstring(result.UnassessedGenerations);
+    out += L",\"candidateRecords\":" + std::to_wstring(result.CandidateRecords);
+    out += L",\"unassessedRecords\":" + std::to_wstring(result.UnassessedRecords);
+    out += L",\"timelineDropped\":" + std::to_wstring(result.TimelineDropped);
     out += L",\"timelineEvents\":" + std::to_wstring(result.TimelineEvents);
     out += L",\"snapshotProcesses\":" + std::to_wstring(result.SnapshotProcesses);
     out += L",\"snapshotRecords\":" + std::to_wstring(result.SnapshotRecords);

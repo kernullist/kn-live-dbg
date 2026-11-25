@@ -20,7 +20,10 @@
 #include <vector>
 
 struct SnapshotDiffResult;
+struct TimelineLiveEvent;
 struct ProcessLoggingSnapshot;
+
+TimelineEvent BuildTimelineEventFromLiveEvent(const TimelineLiveEvent& live);
 
 struct TimelineSourceRow
 {
@@ -98,6 +101,7 @@ public:
         const std::wstring& sourceName);
     TimelineIngestResult IngestEvents(
         const std::vector<TimelineEvent>& events);
+    TimelineIngestResult IngestKernelLive(const std::vector<TimelineLiveEvent>& events);
     TimelineIngestResult IngestTiObserverActions(const TiObserverSnapshot& snapshot);
     TimelineIngestResult IngestLiveObserverActions(const TimelineControlSnapshot& snapshot);
     TimelineIngestResult IngestProcessHandleActions(const ProcessHandleSnapshot& snapshot);
@@ -134,7 +138,7 @@ public:
     uint64_t GetTiRecentCursorSequence(bool* initialized) const;
 
 private:
-    bool AddEventLocked(TimelineEvent event, const ObservationIdentity* target = nullptr, bool controllerAction = false);
+    bool AddEventLocked(TimelineEvent event, TimelineOrigin origin, const ObservationIdentity* target = nullptr);
     void DropOldestEventLocked();
     uint64_t NextEventIdLocked();
 

@@ -2503,6 +2503,15 @@ events and snapshots, query evidence families, export JSONL, and reconcile
 same-boot baselines. Collection loss and capacity eviction constrain absence
 claims.
 
+For `!timeline reconcile snapshot [baseline|<path>]`, check `bootComparison`
+and `comparedEvents` in structured output. A saved file from another boot or
+without a verified local receipt yields zero comparable events. Source counts
+distinguish snapshot and diff rows, controller actions, unbound inputs and
+local target events. `generationMatches` counts ETW header events whose source
+process generation matches the snapshot. Several events can match one process.
+`candidateRecords` counts snapshot records with matching endpoint labels.
+Both counts precede the finding limit. [Timeline reconciliation](ARCHITECTURE.md#timeline-reconciliation)
+
 ## Baselines, diffs and dumps
 
 For two saved captures, run `!diff <old.json> <new.json> /summary /memory`.
