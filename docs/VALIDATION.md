@@ -7,6 +7,18 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Symbol and type validation fixtures
+
+On 2026-11-25 the x64 Release validators rebuilt both fixtures for the
+symbol index, schema broker and live type layout with `/NOIMPLIB /NOEXP`.
+These linker options suppress the unused import library and export file.
+All six executables matched their final PDB by CodeView GUID and age. Their
+export names, ordinals and relative virtual addresses matched earlier builds.
+The three suites passed 69, 73 and 116 checks respectively. After the
+compiler objects were removed, the independent symbol-index reader still
+matched four PE exports and two private symbols from the linker MAP.
+[Symbol-index verification script](../tools/symbol-index-oracle.py)
+
 ## Delegated publisher targets
 
 On 2026-11-25 the offline verifier evaluated ten registered file cases

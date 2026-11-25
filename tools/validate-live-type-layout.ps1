@@ -22,7 +22,7 @@ $sources = @('tools\live-type-layout-selftest.cpp', 'user\SymbolEngine.cpp', 'us
 $commands = @('@echo off', ('call "{0}" >nul' -f $environment.VcVarsPath))
 foreach ($item in @(@('a', 1), @('b', 2))) {
     $base = Join-Path $output ('fixture-' + $item[0])
-    $commands += 'cl /nologo /std:c++17 /EHsc /W4 /WX /Z7 /O2 /MD /DFIXTURE_VARIANT={0} "{1}" /Fe:"{2}.exe" /Fo:"{2}.obj" /link /DEBUG:FULL /INCREMENTAL:NO /PDB:"{2}.pdb"' -f
+    $commands += 'cl /nologo /std:c++17 /EHsc /W4 /WX /Z7 /O2 /MD /DFIXTURE_VARIANT={0} "{1}" /Fe:"{2}.exe" /Fo:"{2}.obj" /link /DEBUG:FULL /INCREMENTAL:NO /NOIMPLIB /NOEXP /PDB:"{2}.pdb"' -f
         $item[1], (Join-Path $repo 'tools\live-type-fixture.cpp'), $base
     $commands += 'if errorlevel 1 exit /b %errorlevel%'
 }
