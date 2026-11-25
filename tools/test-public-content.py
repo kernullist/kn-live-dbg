@@ -851,6 +851,18 @@ class PublicContentTests(unittest.TestCase):
                 self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("result.txt", fragment)})
         self.assertFalse(AUDIT.inspect("guide.md", b"Record checkpoint_sha256 after a successful observation."))
 
+    def test_publisher_file_range_evidence(self):
+        samples = (dict(schema="kn.benchmark_corpus.v2"), dict(schema="kn.benchmark_publisher_report.v4"),
+                   dict(publisher_file_sha256="a"), dict(file_range_comparison={}), dict(range_replay={}),
+                   dict(stored_capture_bytes=30), dict(declared_observed_bytes=6), dict(publisher_file_verified=False),
+                   dict(first_difference_offset=0, differing_bytes=2), dict(distinct_comparisons=1, reused_comparisons=2),
+                   dict(cases_decided_from_partial_captures=1))
+        for sample in samples:
+            for encoding in ("utf-8", "utf-16-le", "utf-16-be"):
+                data = ("row\n" + json.dumps({"nested": [sample]})[:-2]).encode(encoding)
+                self.assertIn("private-evidence-bundle", {f["rule"] for f in AUDIT.inspect("receipt.txt", data)})
+        self.assertFalse(AUDIT.inspect("guide.md", b"Use publisher_file_sha256 to register the reference."))
+
     def test_windows_publisher_policy_and_receipts(self):
         samples = (dict(schema="kn.image_approval_policy.v2"), dict(schema="kn.image_approval_provision.v2"),
                    dict(windows_publisher={}), dict(reference_signature={}, issuer="team"),

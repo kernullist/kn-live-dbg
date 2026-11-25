@@ -4044,6 +4044,15 @@ Archive replay recovers the original predecessor pin from the separately
 pinned provisioning receipt and repeats the comparison at issuance time.
 [Publisher observation and recovery rules](BENCHMARK_CORPUS.md#check-a-publisher-update-against-a-previous-observation)
 
+The corpus evaluator can also retain the full publisher file and the observed
+portion of a candidate. It verifies the complete reference against the signed
+target descriptor and compares just the file offsets present in the
+registered acquisition. An observed difference disproves whole-file equality.
+When every observed byte agrees, a hole keeps that conclusion open. The
+operator supplies the capture layout and hole map. Native policy issuance
+continues to require the complete signed policy file.
+[Publisher file range comparisons](BENCHMARK_CORPUS.md#compare-observed-file-ranges)
+
 The portable archive below binds the original roots and release roles, source
 policy and issuance receipt to one closed native collection. The operator
 keeps the trust configuration independently. Discovering a newer revision

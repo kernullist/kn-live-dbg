@@ -88,7 +88,7 @@ def read_document(path):
 
 def validate_corpus(corpus):
     members(corpus, "schema corpus_id cohort_id environment cases", "corpus")
-    require(corpus["schema"] == "kn.benchmark_corpus.v1", "unsupported corpus schema")
+    require(corpus["schema"] in ("kn.benchmark_corpus.v1", "kn.benchmark_corpus.v2"), "unsupported corpus schema")
     identifier(corpus["corpus_id"], "corpus_id")
     identifier(corpus["cohort_id"], "cohort_id")
     env = corpus["environment"]
@@ -105,7 +105,15 @@ def validate_corpus(corpus):
     by_id = {}
     partition_bindings = {}
     for case in cases:
-        members(case, "id family independence_group partition layer task unit artifact_sha256 holes_sha256 truth truth_ref_sha256", "case")
+        fields = "id family independence_group partition layer task unit artifact_sha256 holes_sha256 truth truth_ref_sha256"
+        with_reference_file = (corpus["schema"] == "kn.benchmark_corpus.v2" and type(case) is dict and
+                               "publisher_file_sha256" in case)
+        members(case, fields + (" publisher_file_sha256 artifact_layout" if with_reference_file else ""), "case")
+        if with_reference_file:
+            require(case["task"] == "publisher-target-bytes-match" and case["unit"] == "case",
+                    "a publisher reference file requires a publisher file case")
+            digest(case["publisher_file_sha256"], "publisher_file_sha256")
+            choice(case["artifact_layout"], ("file_offsets", "packed"), "artifact_layout")
         for key in ("id", "family", "independence_group", "task"):
             identifier(case[key], key)
         choice(case["partition"], {"development", "heldout"}, "partition")
@@ -117,10 +125,12 @@ def validate_corpus(corpus):
         digest(case["truth_ref_sha256"], "truth_ref_sha256", nullable=case["truth"] == "unknown")
         require(case["id"] not in by_id, "duplicate case id")
         by_id[case["id"]] = case
-        for key in ("family", "independence_group", "artifact_sha256"):
-            binding = (key, case[key])
+        bindings = [(key, case[key]) for key in ("family", "independence_group", "artifact_sha256")]
+        if with_reference_file:
+            bindings.append(("artifact_sha256", case["publisher_file_sha256"]))
+        for binding in bindings:
             previous = partition_bindings.setdefault(binding, case["partition"])
-            require(previous == case["partition"], f"development/heldout leakage: {key}")
+            require(previous == case["partition"], f"development/heldout leakage: {binding[0]}")
     return by_id
 
 
@@ -370,7 +380,8 @@ def retained_command(args, protected):
         if not args.write_archive:
             require(originals.keys() <= allowed, "unreferenced object in retained corpus")
         if args.write_archive:
-            report = archive.seal(args.write_archive, corpus_raw, results_raw, args.original, allowed)
+            report = archive.seal(args.write_archive, corpus_raw, results_raw, args.original, allowed,
+                                  with_publisher_files=corpus["schema"] == "kn.benchmark_corpus.v2")
         elif args.get_original is not None:
             digest(args.get_original, "original pin")
             require(args.get_original in originals, "requested original was not retained")

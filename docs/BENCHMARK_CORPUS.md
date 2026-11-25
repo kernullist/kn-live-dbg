@@ -462,8 +462,10 @@ ASCII letters/digits or `_.:-`, beginning with a letter/digit. Hashes are exactl
 64 lowercase hexadecimal characters. Null is allowed only where specified.
 Both inputs are read once; the report records their exact SHA-256 hashes.
 
-The corpus root requires `schema="kn.benchmark_corpus.v1"`, `corpus_id`,
-`cohort_id`, `environment` and `cases` (1..4096 entries).
+The corpus root requires `schema`, `corpus_id`, `cohort_id`, `environment`
+and `cases` (1..4096 entries). Use `kn.benchmark_corpus.v1` for the original
+case fields. Version 2 also accepts a separately registered publisher file
+and capture layout for [file range comparisons](#compare-observed-file-ranges).
 
 | Environment field | Meaning |
 | --- | --- |
@@ -577,8 +579,9 @@ The binary format starts with the eight bytes `KNCORP1\0` and three unsigned
 little-endian 32-bit integers giving corpus length, results length and original
 count. The two unchanged UTF-8 documents follow. Each original contains a
 32-byte SHA-256, an unsigned little-endian 64-bit byte count and the bytes
-themselves. Empty originals are valid. The package holds up to 16,386 distinct
-originals and 8 GiB overall. Each JSON input retains its 8 MiB limit. The
+themselves. Empty originals are valid. A v1 plan and its results can name up to
+16,386 distinct originals. With a separate publisher file for each case, v2
+can name up to 20,482. The package limit is 8 GiB. Each JSON input retains its 8 MiB limit. The
 writer's 8 GiB read budget includes duplicate input files. Archive entries
 contain no filesystem paths. [Windows acquisition checks](VALIDATION.md#retained-corpus-originals-on-2026-11-24)
 
@@ -725,8 +728,8 @@ total. Role names may occupy up to 128 UTF-8 bytes.
 [TUF target lookup](https://theupdateframework.github.io/specification/latest/#update-targets)
 
 A positive file matches the signed length and every signed digest. A complete
-file that differs is negative. Missing originals, unsupported digests,
-incomplete acquisition scopes and unlisted targets produce unknown truth.
+file that differs is negative. The digest-only comparison returns unknown for
+missing originals, unsupported digests, incomplete acquisition scopes and unlisted targets.
 The acquisition size and hole map come from the registered case. The
 publisher authenticates the target descriptor. Each decoded role and each
 hole map may occupy up to 1 MiB. The reference envelope may occupy up to
@@ -831,6 +834,88 @@ predecessor pin rejects a bare JSON reference, a first observation or a
 different predecessor. Keep the latest accepted pin in a trusted record.
 Concurrent updates from the same predecessor can produce separate valid
 observations. The operator selects which one to carry forward.
+
+## Compare observed file ranges
+
+A difference at one observed offset disproves whole-file equality even when
+other bytes are missing. To make that comparison, retain the full publisher
+file alongside the capture. The evaluator checks its length and every signed
+SHA-256 or SHA-512 digest under the selected TUF target name. The same root,
+delegation and predecessor checks used for complete files apply here.
+[TUF target verification](https://theupdateframework.github.io/specification/latest/#fetch-target)
+
+Use `kn.benchmark_corpus.v2` for the plan. Set `$capture` to the candidate
+file, `$holeMap` to its v1 target scope, `$publisherMetadata` to the signed
+metadata reference and `$publisherFile` to a separately obtained complete
+copy of that target. The target scope's `file_bytes` is the logical length
+of the file. Its missing intervals use original file offsets.
+
+```powershell
+$case = [ordered]@{
+    id = 'file-range'
+    family = 'saved-file'
+    independence_group = 'one-acquisition'
+    partition = 'development'
+    layer = 'independent_comparison'
+    task = 'publisher-target-bytes-match'
+    unit = 'case'
+    truth = 'unknown'
+    artifact_sha256 = (Get-FileHash -LiteralPath $capture -Algorithm SHA256).Hash.ToLowerInvariant()
+    holes_sha256 = (Get-FileHash -LiteralPath $holeMap -Algorithm SHA256).Hash.ToLowerInvariant()
+    truth_ref_sha256 = (Get-FileHash -LiteralPath $publisherMetadata -Algorithm SHA256).Hash.ToLowerInvariant()
+    publisher_file_sha256 = (Get-FileHash -LiteralPath $publisherFile -Algorithm SHA256).Hash.ToLowerInvariant()
+    artifact_layout = 'packed'
+}
+```
+
+With `packed`, the capture contains the observed bytes in ascending file
+offset order, with every missing interval omitted. With `file_offsets`, the
+capture has the full logical length. Bytes at missing offsets contribute
+to its archive digest and are excluded from the comparison. Both layouts
+require the exact declared size for that representation. Register `$case`
+before producing results and include all four originals in the retention
+file list. A reference file or capture reused across cases stays in one
+development or heldout partition.
+
+Replay the retained package with its independently saved package and plan
+digests. Use the UTC observation time for the signed metadata. Set
+`$previousCheckpointSha256` to the independently saved predecessor for a
+publisher update, or to `$null` for a single release or first observation.
+
+```powershell
+$trust = @('--trusted-root-sha256', $anchor, '--verification-time', $verificationTime)
+if ($previousCheckpointSha256) { $trust += @('--previous-checkpoint-sha256', $previousCheckpointSha256) }
+$json = & $python -B tools/evaluate-corpus.py --archive-corpus $archive --sha256 $pin --plan-sha256 $plan @trust
+if ($LASTEXITCODE -eq 2) { throw 'Range evaluation failed' }
+$report = $json | ConvertFrom-Json
+$report.coverage.cases | Select-Object case_id, publisher_truth, truth_reason, file_range_comparison
+$report.range_replay
+```
+
+The v4 publisher report separates the registered scope's observed and missing
+byte counts from the stored capture size and the bytes actually compared.
+Missing capture bytes or rejected metadata leave the registered scope visible.
+A missing scope leaves its counts null. A verified comparison gives the
+number of differing bytes and the first differing logical offset. An observed difference
+yields negative truth. A complete match yields positive truth, including a
+verified empty file. If every observed byte agrees and any bytes are missing,
+whole-file equality remains unknown. A missing reference, a layout or scope
+length mismatch, and an exhausted comparison budget also leave truth unknown.
+A reference that contradicts the signed descriptor returns exit 1 and
+withholds all difference counts. Changed archive bytes return exit 2.
+
+The publisher authenticates its reference file. For a partial capture,
+placing a differing byte in the candidate file relies on the registered
+offsets. Those cases count toward the adjudicated total and
+`cases_decided_from_partial_captures`. If any verdict depends on such a map,
+`ground_truth_authenticated` stays false even when every case has a verdict.
+
+The budget covers 16 GiB of range-comparison reads per replay. Each distinct
+comparison charges the size of both stored members before reading them.
+Repeated cases can reuse a verified result for the same capture, hole map,
+layout, publisher file and signed hashes. The report counts reuse and cases
+deferred by the budget. Acquisition provenance and the contents of missing
+intervals require other evidence. [Public-file validation](VALIDATION.md#partial-publisher-file-comparisons)
 
 ## Imported report semantics
 

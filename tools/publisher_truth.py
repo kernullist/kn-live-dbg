@@ -1,11 +1,13 @@
 """Adjudicate a retained whole file against an externally pinned TUF publisher."""
 import base64
 from collections import Counter, defaultdict
+from functools import lru_cache
 import hashlib
 import re
 
 import publisher_history
 from publisher_history import verification_time
+from publisher_ranges import RangeReplay
 from retained_corpus import MAX_DOCUMENT, MAX_PACKAGE, visit_original
 
 try:
@@ -59,7 +61,7 @@ def target_name(name):
     return name
 
 
-def file_scope(raw, decode):
+def file_scope(raw, decode, *, keep_ranges=False):
     try:
         scope = decode(raw)
         need(type(scope) is dict and scope.keys() == {"schema", "target_path", "file_bytes", "missing"} and
@@ -72,7 +74,7 @@ def file_scope(raw, decode):
             need(type(span) is list and len(span) == 2 and all(type(x) is int for x in span) and
                  end <= span[0] < span[1] <= length, "invalid_file_scope")
             end = span[1]
-        return (name, length, bool(missing)), None
+        return (name, length, missing if keep_ranges else bool(missing)), None
     except Rejected as exc:
         return None, str(exc)
     except (ValueError, RecursionError):
@@ -519,8 +521,8 @@ def check_reference(raw, decode, trusted_root, instant, minimum_version=None, pr
     return {}, proof
 
 
-def compare_target(scope, pin, original, targets, stream, sha512_cache):
-    name, file_bytes, has_holes = scope
+def compare_target(scope, pin, original, targets, stream, sha512_cache, *, case=None, range_replay=None):
+    name, file_bytes, missing = scope
     details = dict(target_path=name, file_bytes=file_bytes)
     if isinstance(targets, DelegatedTargets):
         target, search = targets.resolve(name)
@@ -531,7 +533,7 @@ def compare_target(scope, pin, original, targets, stream, sha512_cache):
         absent = "target_not_in_top_level"
     if original is None:
         return "unknown", "artifact_missing", details
-    if has_holes or original[1] != file_bytes:
+    if range_replay is None and (missing or original[1] != file_bytes):
         return "unknown", "incomplete_file", details
     if target is None:
         return "unknown", absent, details
@@ -539,6 +541,8 @@ def compare_target(scope, pin, original, targets, stream, sha512_cache):
     if type(target.length) is not int or target.length < 0 or not strong_hashes(hashes):
         return "unknown", "unsupported_target_descriptor", details
     details.update(signed_length=target.length, signed_hashes=hashes)
+    if range_replay is not None:
+        return range_replay.compare(case, scope, target, details)
     observed = {"sha256": pin}
     if "sha512" in hashes:
         if pin not in sha512_cache:
@@ -564,6 +568,15 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
     if not groups:
         raise ValueError("no registered publisher file cases in this corpus")
     references, scope_cache, sha512_cache = [], {}, {}
+    range_replay = RangeReplay(stream, objects)
+    has_range_cases = False
+
+    @lru_cache(maxsize=1)
+    def load_scope(pin, keep_ranges):
+        # A large decoded hole map is needed only while its ranges are being compared.
+        raw, gap = read_small(stream, objects, pin, MAX_SCOPE)
+        return (None, "scope_" + gap) if gap else file_scope(raw, decode, keep_ranges=keep_ranges)
+
     adjudicated = contradictions = confirmed = failed = 0
     for ref, group in groups.items():
         data, gap = read_small(stream, objects, ref, publisher_history.MAX_REFERENCE)
@@ -577,19 +590,34 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
         failed += status not in ("verified", "reference_missing")
         for key in group:
             case = cases[key]
+            ranges = "publisher_file_sha256" in case
+            if ranges:
+                has_range_cases = True
+                coverage[key].update(publisher_file_sha256=case["publisher_file_sha256"], artifact_layout=case["artifact_layout"])
             truth, reason, details = "unknown", status, {}
-            if status == "verified":
+            if status == "verified" or ranges:
                 holes = case["holes_sha256"]
-                if holes not in scope_cache:
-                    data, gap = read_small(stream, objects, holes, MAX_SCOPE)
-                    scope_cache[holes] = (None, "scope_" + gap) if gap else file_scope(data, decode)
-                scope, reason = scope_cache[holes]
-                if scope is not None:
+                if ranges:
+                    scope, scope_error = load_scope(holes, True)
+                else:
+                    if holes not in scope_cache:
+                        scope_cache[holes] = load_scope(holes, False)
+                    scope, scope_error = scope_cache[holes]
+                if status == "verified" and scope is None:
+                    reason = scope_error
+                if status == "verified" and scope is not None:
                     pin = case["artifact_sha256"]
-                    truth, reason, details = compare_target(scope, pin, objects.get(pin), targets, stream, sha512_cache)
+                    truth, reason, details = compare_target(scope, pin, objects.get(pin), targets, stream, sha512_cache,
+                                                           case=case, range_replay=range_replay if ranges else None)
+                    if reason == "publisher_file_not_signed_target":
+                        failed += 1
                     search = details.get("delegation_search")
                     if search and search["status"] not in ("found", "target_not_in_authorized_roles"):
                         failed += 1
+                if ranges and "file_range_comparison" not in details:
+                    details["file_range_comparison"] = range_replay.evidence(case, scope, scope_error)
+                    if scope is not None:
+                        details.update(target_path=scope[0], file_bytes=scope[1])
             derived[key]["truth"] = truth
             coverage[key].update(publisher_truth=truth, truth_reason=reason, truth_ref_sha256=ref,
                                  artifact_sha256=case["artifact_sha256"], **details)
@@ -613,4 +641,11 @@ def adjudicate(report, stream, objects, cases, trusted_root, at, decode, ratio, 
     if previous_checkpoint is not None or any("publisher_history" in ref for ref in references):
         report.update(schema="kn.benchmark_publisher_report.v3", previous_checkpoint_sha256=previous_checkpoint,
                       truth_basis="whole_file_against_signed_tuf_target")
+    if has_range_cases:
+        partial_verdicts = sum(row["truth_reason"] == "observed_bytes_differ" and row["file_range_comparison"]["missing_bytes"] > 0
+                               for row in coverage.values())
+        report.update(schema="kn.benchmark_publisher_report.v4", truth_basis="whole_file_equality_from_signed_target_and_observed_bytes",
+                      acquisition_scope_authenticated=False, cases_decided_from_partial_captures=partial_verdicts,
+                      ground_truth_authenticated=adjudicated == len(cases) and partial_verdicts == 0,
+                      range_replay=range_replay.accounting())
     return derived, int(bool(failed))

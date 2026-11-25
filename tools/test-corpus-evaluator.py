@@ -145,6 +145,27 @@ class CorpusTests(unittest.TestCase):
                 first[field] = second[field]
                 self.reject()
 
+    def test_registered_publisher_file_and_acquisition_layout(self):
+        corpus = copy.deepcopy(self.corpus)
+        corpus["cases"] = corpus["cases"][:2]
+        first, second = corpus["cases"]
+        first.update(task="publisher-target-bytes-match", unit="case", publisher_file_sha256=sha("reference"), artifact_layout="packed")
+        with self.assertRaises(EVALUATOR.InvalidCorpus):
+            EVALUATOR.validate_corpus(corpus)
+        corpus["schema"] = "kn.benchmark_corpus.v2"
+        self.assertEqual(len(EVALUATOR.validate_corpus(corpus)), 2)
+        for change in (dict(artifact_layout="other"), dict(publisher_file_sha256=None), dict(unit="page"), dict(task="other")):
+            with self.subTest(change=change), self.assertRaises(EVALUATOR.InvalidCorpus):
+                EVALUATOR.validate_corpus(dict(corpus, cases=[{**first, **change}]))
+        for omitted in ("publisher_file_sha256", "artifact_layout"):
+            with self.assertRaises(EVALUATOR.InvalidCorpus):
+                EVALUATOR.validate_corpus(dict(corpus, cases=[{k:v for k,v in first.items() if k != omitted}]))
+        first.update(partition="development", family="dev", independence_group="dev")
+        second.update(partition="heldout", artifact_sha256=first["publisher_file_sha256"])
+        for order in ([first, second], [second, first]):
+            with self.assertRaisesRegex(EVALUATOR.InvalidCorpus, "leakage"):
+                EVALUATOR.validate_corpus(dict(corpus, cases=order))
+
     def test_duplicate_and_unknown_cases(self):
         self.corpus["cases"].append(copy.deepcopy(self.corpus["cases"][0]))
         self.reject()
@@ -266,6 +287,15 @@ class CorpusTests(unittest.TestCase):
 
 
 class RetainedCorpusTests(unittest.TestCase):
+    def test_writer_member_ceiling_by_corpus_version(self):
+        import retained_corpus as archive
+        destination = self.root / "oversized.knbench"
+        for extended, count in ((False, 16387), (True, 20483)):
+            with self.assertRaisesRegex(ValueError, "too many original inputs"):
+                archive.seal(destination, b"plan", b"results", [self.root / "unused"] * count, set(),
+                             with_publisher_files=extended)
+        self.assertFalse(destination.exists())
+
     def setUp(self):
         directory = tempfile.TemporaryDirectory(prefix="kn-corpus-originals-")
         self.addCleanup(directory.cleanup)

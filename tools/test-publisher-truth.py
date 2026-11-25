@@ -19,6 +19,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 import publisher_truth as publisher
 import publisher_history as history
+import publisher_ranges
 import retained_corpus as archive
 
 
@@ -342,6 +343,188 @@ class DelegationTests(unittest.TestCase):
                     dict(doc, delegated_roles={"../outside": "AA=="}), dict(doc, delegated_roles={"targets": "AA=="}),
                     dict(doc, root_updates=[doc["root"]] * 33)):
             self.assertNotEqual(publisher.check_reference(raw(bad), corpus.decode_document, self.anchor, TIME)[1]["status"], "verified")
+
+
+class PublisherRangeTests(unittest.TestCase):
+    def replay(self, captured, reference, holes, layout, *, signed=None, length=None):
+        pin, baseline = sha(captured), sha(reference)
+        name = "file.bin"
+        length = len(reference) if length is None else length
+        scope = raw(dict(schema="kn.benchmark_target_scope.v1", target_path=name, file_bytes=length, missing=holes))
+        target = SimpleNamespace(length=len(reference), hashes=signed or dict(sha512=hashlib.sha512(reference).hexdigest()))
+        case = dict(artifact_sha256=pin, holes_sha256=sha(scope), artifact_layout=layout, publisher_file_sha256=baseline)
+        stream = io.BytesIO(b"prefix" + captured + b"padding" + reference)
+        objects = {pin: (6, len(captured)), baseline: (13 + len(captured), len(reference))}
+        rr = publisher_ranges.RangeReplay(stream, objects)
+        def run():
+            parsed, reason = publisher.file_scope(scope, corpus.decode_document, keep_ranges=True)
+            self.assertIsNone(reason)
+            return publisher.compare_target(parsed, pin, objects[pin], {name: target}, stream, {},
+                                            case=case, range_replay=rr)
+        return rr, run
+
+    def test_all_small_hole_maps_against_scalar_file_oracle(self):
+        reference = bytes(range(7))
+        with mock.patch.object(publisher_ranges, "CHUNK", 3):
+            for mask in range(1 << len(reference)):
+                observed = [i for i in range(len(reference)) if not mask & (1 << i)]
+                holes = [[i, i + 1] for i in range(len(reference)) if i not in observed]
+                for corrupt in (set(), {0, 2, 5, 6}):
+                    data = bytes(x ^ (255 if i in corrupt else 0) for i, x in enumerate(reference))
+                    expected = sorted(set(observed) & corrupt)
+                    for layout in ("packed", "file_offsets"):
+                        capture = bytes(data[i] for i in observed) if layout == "packed" else data
+                        _, run = self.replay(capture, reference, holes, layout)
+                        truth, _, details = run()
+                        result = details["file_range_comparison"]
+                        self.assertTrue(result["publisher_file_verified"])
+                        self.assertEqual((truth, result["compared_bytes"], result["differing_bytes"], result["first_difference_offset"]),
+                                         ("negative" if expected else "unknown" if holes else "positive", len(observed),
+                                          len(expected), expected[0] if expected else None), (mask, layout))
+
+    def test_untrusted_reference_and_replaced_archive_members(self):
+        hashes = dict(sha256=sha(SOURCE), sha512="0" * 128)
+        rr, run = self.replay(b"X" + SOURCE[4:], SOURCE, [[1, 4]], "packed", signed=hashes)
+        truth, reason, details = run()
+        evidence = details["file_range_comparison"]
+        self.assertEqual((truth, reason, evidence["publisher_file_verified"], evidence["compared_bytes"],
+                          evidence["differing_bytes"], evidence["first_difference_offset"]),
+                         ("unknown", "publisher_file_not_signed_target", False, 0, None, None))
+        for offset in (6, 13 + len(SOURCE) - 3):
+            rr, run = self.replay(b"X" + SOURCE[4:], SOURCE, [[1, 4]], "packed")
+            rr.stream.seek(offset)
+            rr.stream.write(b"!")
+            with self.assertRaisesRegex(ValueError, "original changed"):
+                run()
+        rr, run = self.replay(b"X" + SOURCE[4:], SOURCE, [[1, 4]], "packed")
+        rr.stream.truncate(len(SOURCE))
+        with self.assertRaisesRegex(ValueError, "truncated original"):
+            run()
+
+    def test_large_fragmented_capture_reads_each_member_once_per_block(self):
+        block = archive.CHUNK
+        ref = bytes(range(256)) * (2*block//256 + 1)
+        holes = [[i, i+1] for i in range(1, 1000, 2)] + [[block-2, block+7], [2*block-1, 2*block+3]]
+        offsets = bytearray(b"\x01") * len(ref)
+        for start, end in holes:
+            offsets[start:end] = bytes(end-start)
+        capture = bytes(value ^ 255 for i, value in enumerate(ref) if offsets[i])
+        rr, run = self.replay(capture, ref, holes, "packed")
+        with mock.patch.object(rr.stream, "read", wraps=rr.stream.read) as reads:
+            _, reason, details = run()
+            self.assertEqual(reason, "observed_bytes_differ")
+            q = details["file_range_comparison"]
+            self.assertEqual((q["differing_bytes"], q["compared_bytes"], q["first_difference_offset"]),
+                             (len(capture), len(capture), 0))
+            self.assertEqual(reads.call_count, 6)
+            self.assertLessEqual(max(c.args[0] for c in reads.call_args_list), block)
+
+    def test_budgets_layout_empty_inputs_and_same_object(self):
+        self.assertEqual(self.replay(b"", b"", [], "packed")[1]()[:2], ("positive", "matches_signed_target"))
+        self.assertEqual(self.replay(b"", SOURCE, [[0, len(SOURCE)]], "packed")[1]()[:2], ("unknown", "no_observed_bytes"))
+        self.assertEqual(self.replay(SOURCE, SOURCE, [[0, 1]], "packed")[1]()[1], "capture_layout_length_mismatch")
+        self.assertEqual(self.replay(SOURCE[1:], SOURCE, [[0, 1]], "file_offsets")[1]()[1], "capture_layout_length_mismatch")
+        self.assertEqual(self.replay(SOURCE, SOURCE, [], "file_offsets", length=len(SOURCE)+1)[1]()[1],
+                         "scope_length_differs_from_signed_target")
+        rr, run = self.replay(SOURCE, SOURCE, [], "file_offsets")
+        rr.limit = 2 * len(SOURCE) - 1
+        self.assertEqual(run()[1], "range_comparison_budget_exhausted")
+        self.assertEqual(rr.read_bytes, 0)
+        rr.limit += 1
+        self.assertEqual(run()[0], "positive")
+        self.assertEqual(run()[0], "positive")
+        self.assertEqual(rr.accounting(), dict(byte_limit=rr.limit, read_bytes=2*len(SOURCE), distinct_comparisons=1,
+                                              reused_comparisons=1, deferred_cases=1))
+        rr, run = self.replay(b"X", SOURCE, [[1, len(SOURCE)]], "packed")
+        del rr.objects[sha(SOURCE)]
+        self.assertEqual(run()[1], "publisher_file_missing")
+
+    def test_pinned_archive_replays_ranges_after_source_removal(self):
+        repo = Repository()
+        files = repo.files()
+        blobs = {}
+        def keep(data):
+            blobs[sha(data)] = data
+            return sha(data)
+        ref = keep(bundle(files))
+        original = keep(SOURCE)
+        cases = []
+        holes = [[1, 4], [8, 10]]
+        changed = bytes([SOURCE[0] ^ 1]) + SOURCE[4:8] + SOURCE[10:]
+        def case(name, data, missing, layout=None, witness=original):
+            scope = keep(raw(dict(schema="kn.benchmark_target_scope.v1", target_path="file.bin", file_bytes=len(SOURCE), missing=missing)))
+            row = dict(id=name, family="one", independence_group="one", partition="development", layer="owned_fixture",
+                       unit="case", task=publisher.TASK, artifact_sha256=keep(data), holes_sha256=scope, truth="unknown", truth_ref_sha256=ref)
+            if layout:
+                row.update(artifact_layout=layout, publisher_file_sha256=witness)
+            cases.append(row)
+        case("old", changed, holes)
+        case("full", SOURCE, [], "file_offsets")
+        case("partial", changed, holes, "packed")
+        case("again", changed, holes, "packed")
+        case("match", SOURCE[:1] + b"xxx" + SOURCE[4:], holes, "file_offsets")
+        case("untrusted", changed, holes, "packed", keep(SOURCE[::-1]))
+        case("absent", changed, holes, "packed", sha(b"not retained"))
+        case("missing-capture", changed, holes, "packed")
+        cases[-1]["artifact_sha256"] = sha(b"absent capture")
+        case("missing-scope", changed, holes, "packed")
+        cases[-1]["holes_sha256"] = sha(b"absent scope")
+        plan = raw(dict(schema="kn.benchmark_corpus.v2", corpus_id="ranges", cohort_id="files", cases=cases,
+                        environment=dict(target_id="test", snapshot_id="one", os_build=None, architecture="unknown",
+                                         hvci=None, vbs=None, verifier=None)))
+        results = raw(dict(schema="kn.benchmark_results.v1", corpus_sha256=sha(plan), run_id="one", assessments=[],
+                           tool=dict(name="reader", version="1", binary_sha256=keep(b"test tool"), config_sha256=keep(b"config"))))
+        def invoke(code, *args):
+            p = subprocess.run([sys.executable, "-B", CLI, *map(str, args)], capture_output=True, timeout=30)
+            self.assertEqual(p.returncode, code, p.stderr or p.stdout[:500])
+            return p.stdout
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            package = root / "saved.knbench"
+            with tempfile.TemporaryDirectory(dir=root) as stage:
+                inputs = Path(stage)
+                (inputs/"plan").write_bytes(plan)
+                (inputs/"results").write_bytes(results)
+                for pin, data in blobs.items():
+                    (inputs/pin).write_bytes(data)
+                (inputs/"list").write_bytes(raw(dict(schema="kn.benchmark_original_files.v1", original_files=sorted(blobs))))
+                receipt = json.loads(invoke(0, "--corpus", inputs/"plan", "--results", inputs/"results", "--plan-sha256", sha(plan),
+                                            "--write-archive", package, "--file-list", inputs/"list"))
+            flags = ["--archive-corpus", package, "--sha256", receipt["package_sha256"], "--plan-sha256", sha(plan)]
+            authority = ["--trusted-root-sha256", sha(files["root"]), "--verification-time", "20240201T000000Z"]
+            data = invoke(1, *flags, *authority)
+            self.assertEqual(invoke(1, *flags, *authority), data)
+            report = json.loads(data)
+            self.assertEqual(report["schema"], "kn.benchmark_publisher_report.v4")
+            self.assertEqual(report["adjudicated_per_planned_case"], corpus.ratio(3, 9))
+            self.assertEqual(report["range_replay"]["reused_comparisons"], 1)
+            self.assertEqual(report["cases_decided_from_partial_captures"], 2)
+            self.assertFalse(report["acquisition_scope_authenticated"])
+            rows = {row["case_id"]: row for row in report["coverage"]["cases"]}
+            self.assertEqual([rows[c["id"]]["truth_reason"] for c in cases], ["incomplete_file", "matches_signed_target",
+                             "observed_bytes_differ", "observed_bytes_differ", "observed_match_with_holes",
+                             "publisher_file_not_signed_target", "publisher_file_missing", "artifact_missing", "scope_missing"])
+            missing_capture = rows["missing-capture"]["file_range_comparison"]
+            self.assertEqual((missing_capture["stored_capture_bytes"], missing_capture["declared_observed_bytes"],
+                              missing_capture["compared_bytes"]), (None, len(SOURCE)-5, 0))
+            missing_scope = rows["missing-scope"]["file_range_comparison"]
+            self.assertEqual((missing_scope["scope_status"], missing_scope["missing_bytes"],
+                              missing_scope["declared_observed_bytes"]), ("scope_missing", None, None))
+            self.assertEqual(rows["absent"]["original_status"]["publisher_file_sha256"], "missing")
+            self.assertEqual(report["coverage"]["case_originals"]["publisher_file_sha256"],
+                             dict(verified=7, missing=1, not_referenced=1))
+            dest = root/"restored"
+            invoke(0, *flags, "--get-original", original, "--destination", dest)
+            self.assertEqual(dest.read_bytes(), SOURCE)
+            with package.open("rb") as stream:
+                _, _, objects = archive.read(stream, receipt["package_sha256"], sha(plan))
+                for case_id, independent in (("partial", False), ("full", True)):
+                    selected = next(c for c in cases if c["id"] == case_id)
+                    one = dict(coverage=dict(cases=[dict(case_id=case_id)]))
+                    publisher.adjudicate(one, stream, objects, {case_id:selected}, sha(files["root"]),
+                                         "20240201T000000Z", corpus.decode_document, corpus.ratio)
+                    self.assertEqual(one["adjudicated_per_planned_case"], corpus.ratio(1, 1))
+                    self.assertEqual(one["ground_truth_authenticated"], independent)
 
 
 class PublisherHistoryTests(unittest.TestCase):

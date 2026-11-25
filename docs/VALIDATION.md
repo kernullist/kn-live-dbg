@@ -7,6 +7,35 @@ validation. Each section identifies its binary and test scope. Documentation
 updates do not renew these observations. Follow the
 [manual checklist](MANUAL_TEST_CHECKLIST.md) to validate another binary or host.
 
+## Partial publisher file comparisons
+
+On 2026-11-25 the evaluator replayed 14 registered cases from one saved
+Sigstore release. Python-TUF verified the full `artifact.pub`, `ctfe.pub`
+and delegated npm key file against timestamp 842 and their signed target
+descriptors. GitHub supplied the three complete files. Sigstore's distribution
+server supplied eight distinct HTTP 206 responses with the requested byte
+interval and total length. A separate byte-by-byte comparison at the original
+file offsets supplied the expected results.
+[Signed top-level targets](https://github.com/sigstore/root-signing/blob/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata/targets.json)
+[Signed npm targets](https://github.com/sigstore/root-signing/blob/c09d62f9397fcff8b98b5bcd2dc9044a4f853cd4/metadata/registry.npmjs.org.json)
+
+In the wrong-file control, 90 bytes read from `ctfe.pub` were compared with
+the 177-byte `artifact.pub`. Both capture layouts found 30 differing bytes,
+the first at offset 63. Reading only their 35 shared header and trailer bytes
+left the other 142 unknown. The npm case matched all 69 observed bytes and
+left 2,052 missing. Supplying the wrong complete reference withheld the
+comparison. The 14 cases yielded two whole-file matches, four confirmed
+differences and eight unknowns, including one repeated comparison. One
+registered truth label contradicted the observed bytes. Replay reproduced the
+same report after the original registration directory was removed.
+These cases share one release and measure file evidence. Acquisition
+provenance, independent sample counts and detection performance remain open.
+[Registration and replay](BENCHMARK_CORPUS.md#compare-observed-file-ranges)
+
+A separate synthetic capacity run opened a v2 archive with 4,096 cases and
+20,482 distinct original files. Recovery returned the exact reference file
+for the last case. An archive header declaring one extra member was rejected.
+
 ## Publisher observation history
 
 On 2026-11-25 the offline verifier followed four retained Sigstore timestamps

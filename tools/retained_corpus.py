@@ -17,7 +17,8 @@ OBJECT = struct.Struct("<32sQ")
 CHUNK = 1 << 20
 MAX_DOCUMENT = 8 << 20
 MAX_PACKAGE = 8 << 30
-MAX_ORIGINALS = 4 * 4096 + 2
+MAX_V1_ORIGINALS = 4 * 4096 + 2
+MAX_ORIGINALS = 5 * 4096 + 2
 
 
 class OutputCollision(ValueError):
@@ -73,6 +74,8 @@ def references(cases, assessments, tool):
     refs = {tool["binary_sha256"], tool["config_sha256"]}
     for case in cases.values():
         refs.update((case["artifact_sha256"], case["holes_sha256"], case["truth_ref_sha256"]))
+        if "publisher_file_sha256" in case:
+            refs.add(case["publisher_file_sha256"])
     refs.update(row["evidence_sha256"] for row in assessments.values())
     refs.discard(None)
     return refs
@@ -87,8 +90,8 @@ def copy_exact(source, size, *consumers):
         size -= len(block)
 
 
-def seal(destination, corpus, results, originals, allowed):
-    check(len(originals) <= MAX_ORIGINALS, "too many original inputs")
+def seal(destination, corpus, results, originals, allowed, *, with_publisher_files=False):
+    check(len(originals) <= (MAX_ORIGINALS if with_publisher_files else MAX_V1_ORIGINALS), "too many original inputs")
     retained = set()
 
     def write(out):
@@ -179,9 +182,12 @@ def evidence(cases, assessments, tool, retained, allowed):
     tool_available = all(value == "verified" for value in tool_roles.values())
     scored, rows = {}, []
     coverage = Counter()
+    case_fields = ["artifact_sha256", "holes_sha256", "truth_ref_sha256"]
+    if any("publisher_file_sha256" in case for case in cases.values()):
+        case_fields.append("publisher_file_sha256")
     for key, case in cases.items():
         assessment = assessments.get(key)
-        roles = {role: status(case[role]) for role in ("artifact_sha256", "holes_sha256", "truth_ref_sha256")}
+        roles = {role: status(case.get(role)) for role in case_fields}
         roles["evidence_sha256"] = status(assessment["evidence_sha256"] if assessment else None)
         complete = tool_available and "missing" not in roles.values() and roles["evidence_sha256"] == "verified"
         if complete:
@@ -191,7 +197,7 @@ def evidence(cases, assessments, tool, retained, allowed):
         rows.append(dict(case_id=key, declared_outcome=assessment["outcome"] if assessment else "missing",
                          original_status=roles, assessment_with_originals=complete))
     totals = {role: {state: coverage[role, state] for state in ("verified", "missing", "not_referenced")}
-              for role in ("artifact_sha256", "holes_sha256", "truth_ref_sha256", "evidence_sha256")}
+              for role in (*case_fields, "evidence_sha256")}
     return scored, dict(referenced_objects=len(allowed), verified_objects=len(retained), missing_sha256=sorted(allowed - retained),
                         tool_originals=tool_roles,
                         case_originals=totals, cases=rows)
